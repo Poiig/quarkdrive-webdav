@@ -1199,53 +1199,63 @@ impl QuarkDrive {
                 .send()
         };
 
-        let res = send_once(body.clone()).await?;
-        match res.error_for_status_ref() {
-            Ok(_) => {
-                if res.status() == StatusCode::NO_CONTENT {
-                    return Ok(None);
+        // OpenList：分片失败退避重试最多 3 次（含首次）。
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..3u32 {
+            let res = match send_once(body.clone()).await {
+                Ok(r) => r,
+                Err(err) => {
+                    last_err = Some(err.into());
+                    time::sleep(Duration::from_secs(1 << attempt)).await;
+                    continue;
                 }
-                let etag = res
-                    .headers()
-                    .get("Etag")
-                    .or_else(|| res.headers().get("ETag"))
-                    .and_then(|v| v.to_str().ok())
-                    .context("OSS 分片响应缺少 ETag")?;
-                Ok(Some(etag.to_string()))
-            }
-            Err(err) => {
-                let err_msg = res.text().await?;
-                debug!(error = %err_msg, url = %url, "up_part failed");
-                match err.status() {
-                    Some(
-                        StatusCode::REQUEST_TIMEOUT
-                        | StatusCode::TOO_MANY_REQUESTS
-                        | StatusCode::INTERNAL_SERVER_ERROR
-                        | StatusCode::BAD_GATEWAY
-                        | StatusCode::SERVICE_UNAVAILABLE
-                        | StatusCode::GATEWAY_TIMEOUT,
-                    ) => {
-                        time::sleep(Duration::from_secs(2)).await;
-                        // 重试必须带上鉴权头和分片正文，否则会空 PUT。
-                        let res = send_once(body).await?.error_for_status()?;
-                        if res.status() == StatusCode::NO_CONTENT {
-                            return Ok(None);
-                        }
-                        let etag = res
-                            .headers()
-                            .get("Etag")
-                            .or_else(|| res.headers().get("ETag"))
-                            .and_then(|v| v.to_str().ok())
-                            .context("OSS 分片重试响应缺少 ETag")?;
-                        Ok(Some(etag.to_string()))
+            };
+            match res.error_for_status_ref() {
+                Ok(_) => {
+                    if res.status() == StatusCode::NO_CONTENT {
+                        return Ok(None);
                     }
-                    _ => {
-                        debug!(error = %err, "up_part unexpected error");
-                        Err(err.into())
+                    let etag = res
+                        .headers()
+                        .get("Etag")
+                        .or_else(|| res.headers().get("ETag"))
+                        .and_then(|v| v.to_str().ok())
+                        .context("OSS 分片响应缺少 ETag")?;
+                    return Ok(Some(etag.to_string()));
+                }
+                Err(err) => {
+                    let status = err.status();
+                    let err_msg = res.text().await.unwrap_or_default();
+                    debug!(
+                        error = %err_msg,
+                        url = %url,
+                        attempt = attempt + 1,
+                        "up_part failed"
+                    );
+                    last_err = Some(anyhow::anyhow!("up_part failed: {err_msg} ({err})"));
+                    match status {
+                        Some(
+                            StatusCode::REQUEST_TIMEOUT
+                            | StatusCode::TOO_MANY_REQUESTS
+                            | StatusCode::INTERNAL_SERVER_ERROR
+                            | StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                            | StatusCode::BAD_REQUEST, // EntityTooSmall / 瞬时错误偶发
+                        ) => {
+                            time::sleep(Duration::from_secs(1 << attempt)).await;
+                            continue;
+                        }
+                        _ if attempt + 1 < 3 => {
+                            time::sleep(Duration::from_secs(1 << attempt)).await;
+                            continue;
+                        }
+                        _ => break,
                     }
                 }
             }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("up_part failed")))
     }
 }
 

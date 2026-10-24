@@ -656,12 +656,17 @@ impl OpenClient {
         for (i, item) in up_urls.data.upload_urls.iter().enumerate() {
             let offset = i as u64 * part_size;
             let this_size = std::cmp::min(part_size, size.saturating_sub(offset));
+            // 空分片会触发 OSS EntityTooSmall；非空文件跳过（对齐 OpenList）。
+            if this_size == 0 {
+                continue;
+            }
             let buf = source
                 .read_at(offset, this_size as usize)
                 .await
                 .with_context(|| format!("读取上传分片 {} 失败", i + 1))?;
+            // OpenList：分片失败退避重试最多 3 次。
             let etag = self
-                .upload_part(client, item, &up_urls.data.common_headers, buf)
+                .upload_part_with_retry(client, item, &up_urls.data.common_headers, buf)
                 .await
                 .with_context(|| format!("上传分片 {} 失败", i + 1))?;
             etags.push(etag);
@@ -696,6 +701,35 @@ impl OpenClient {
         }
         let _ = pre.data.fid;
         Ok(())
+    }
+
+    async fn upload_part_with_retry(
+        &self,
+        client: &ClientWithMiddleware,
+        item: &UploadUrlItem,
+        headers: &CommonOssHeaders,
+        bytes: Vec<u8>,
+    ) -> Result<String> {
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            match self
+                .upload_part(client, item, headers, bytes.clone())
+                .await
+            {
+                Ok(etag) => return Ok(etag),
+                Err(err) => {
+                    warn!(
+                        part = item.part_number,
+                        attempt = attempt + 1,
+                        error = %err,
+                        "open upload part failed, retrying"
+                    );
+                    last_err = Some(err);
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("open upload part failed")))
     }
 
     async fn upload_part(
@@ -1211,9 +1245,9 @@ pub async fn exchange_token_by_nonce(
 }
 
 fn build_part_info(total: u64, part_size: u64) -> Vec<serde_json::Value> {
+    // 对齐 OpenList `_getPartInfo`：0 字节不生成分片，避免 OSS EntityTooSmall。
     let mut parts = Vec::new();
-    if total == 0 {
-        parts.push(json!({ "part_number": 1, "part_size": 0 }));
+    if total == 0 || part_size == 0 {
         return parts;
     }
     let mut left = total;

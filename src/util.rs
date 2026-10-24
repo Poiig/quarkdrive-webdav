@@ -8,6 +8,20 @@ pub fn shanghai_offset() -> FixedOffset {
     FixedOffset::east_opt(8 * 3600).expect("UTC+8")
 }
 
+/// 系统/同步垃圾文件：对齐 OpenList `IsSystemFile`，并补充群晖 Cloud Sync 常见项。
+/// 对这些名字的 PUT/MKCOL 做本地成功、不上云，避免同步任务被系统文件拖死。
+pub fn is_ignored_system_file(name: &str) -> bool {
+    match name {
+        ".DS_Store" | "desktop.ini" | "Thumbs.db" | "@eaDir" | "@tmp" | "#recycle"
+        | "#snapshot" | ".SynologyWorkingDirectory" | "cloudsync_encrypt.info"
+        | "@SynologyCloudSync" | "@sharebin" => true,
+        _ => {
+            // Apple Double / 临时备份前缀
+            name.starts_with("._") || name.starts_with("~.")
+        }
+    }
+}
+
 /// 当前 Asia/Shanghai 时间，不依赖容器 TZ。
 pub fn now_shanghai() -> DateTime<FixedOffset> {
     Utc::now().with_timezone(&shanghai_offset())
@@ -83,6 +97,16 @@ mod tests {
     fn test_shanghai_offset_is_utc8() {
         let now = now_shanghai();
         assert_eq!(now.offset().local_minus_utc(), 8 * 3600);
+    }
+
+    #[test]
+    fn test_ignored_system_files() {
+        assert!(is_ignored_system_file(".DS_Store"));
+        assert!(is_ignored_system_file("@eaDir"));
+        assert!(is_ignored_system_file("._photo.jpg"));
+        assert!(is_ignored_system_file(".SynologyWorkingDirectory"));
+        assert!(!is_ignored_system_file("photo.jpg"));
+        assert!(!is_ignored_system_file("readme.md"));
     }
 
     #[test]

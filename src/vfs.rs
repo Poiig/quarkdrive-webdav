@@ -21,6 +21,7 @@ use crate::{
     cache::Cache,
     drive::{QuarkDrive, QuarkFile, UploadSource},
     oplog::OpLog,
+    util::is_ignored_system_file,
 };
 use bytes::BufMut;
 
@@ -603,8 +604,13 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 return Err(FsError::Exists);
             }
             if let Some(name) = path.file_name() {
-                self.dir_cache.invalidate(parent_path).await;
                 let name = name.to_string_lossy().into_owned();
+                // OpenList IgnoreSystemFiles：系统目录 MKCOL 本地成功即可。
+                if is_ignored_system_file(&name) {
+                    debug!(path = %path.display(), "ignore system dir mkcol");
+                    return Ok(());
+                }
+                self.dir_cache.invalidate(parent_path).await;
                 self.drive
                     .create_folder(&parent_file.fid, &name)
                     .await
@@ -907,6 +913,16 @@ impl QuarkDavFile {
 
     async fn prepare_for_upload(&mut self) -> Result<bool, FsError> {
         if self.upload_state.is_finished {
+            return Ok(false);
+        }
+        // OpenList IgnoreSystemFiles：CloudSync 的 .DS_Store/@eaDir 等本地吞掉，不上云。
+        if is_ignored_system_file(&self.file.file_name) {
+            debug!(file_name = %self.file.file_name, "ignore system file upload");
+            if let Some(ref parent) = self.file.parent_path {
+                self.fs
+                    .remove_uploading_file(parent, &self.file.file_name);
+            }
+            self.upload_state.is_finished = true;
             return Ok(false);
         }
         if !self.upload_state.is_uploading {
