@@ -672,6 +672,54 @@ impl QuarkDrive {
         Ok(res.bytes().await?)
     }
 
+    /// 拉取列表返回的缩略图。浏览器直链常被 CDN 防盗链拦截，故由服务端带 Referer 代拉。
+    pub async fn fetch_thumbnail(&self, url: &str) -> Result<(Bytes, String)> {
+        // 缩略图一般很小；过大多半是误用了原图/下载链。
+        const MAX_THUMB_BYTES: u64 = 8 * 1024 * 1024;
+        let parsed = reqwest::Url::parse(url).with_context(|| format!("非法 thumbnail URL: {url}"))?;
+        let mut req = self.download_client.get(parsed);
+        if !self.is_open_mode() {
+            let cookie = self.resolve_cookies().await;
+            req = req.header("Cookie", &cookie);
+        } else if let Some(open) = self.open.as_ref() {
+            // 部分缩略图 CDN 也认 Open 的 x_pan_* Cookie。
+            let cookie = open.creds.auth_cookie().await;
+            req = req.header("Cookie", &cookie);
+        }
+        let res = req.send().await?;
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("拉取缩略图失败 HTTP {status}: {}", body.chars().take(200).collect::<String>());
+        }
+        let ctype = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        if let Some(len) = res.content_length() {
+            if len > MAX_THUMB_BYTES {
+                anyhow::bail!("缩略图过大 ({len} bytes)，拒绝代理");
+            }
+        }
+        let bytes = res.bytes().await?;
+        if bytes.len() as u64 > MAX_THUMB_BYTES {
+            anyhow::bail!("缩略图过大 ({} bytes)，拒绝代理", bytes.len());
+        }
+        if bytes.len() < 16 {
+            anyhow::bail!("缩略图过小 ({} bytes)", bytes.len());
+        }
+        // 防盗链失败页常是 HTML。
+        if ctype.to_ascii_lowercase().contains("text/html")
+            || bytes.starts_with(b"<!DOCTYPE")
+            || bytes.starts_with(b"<html")
+        {
+            anyhow::bail!("缩略图返回了 HTML，可能被防盗链拦截");
+        }
+        Ok((bytes, ctype))
+    }
+
     /// 解开 Open API 返回的跳转链，得到可 Range 的 CDN 地址（只做一次，供预取复用）。
     async fn resolve_open_cdn_url(&self, api_url: &str) -> Result<String> {
         use reqwest::header::{LOCATION, RANGE};

@@ -126,6 +126,15 @@ impl QuarkDriveWebDav {
             .any(|p| p == "raw=1" || p == "download=1" || p.starts_with("raw=") || p == "raw")
     }
 
+    /// `?thumb=1`：同源代理夸克缩略图（避免浏览器直链 CDN 被防盗链打成「图片加载失败」）。
+    fn wants_thumb(req: &Request<hyper::body::Incoming>) -> bool {
+        req.uri()
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .any(|p| p == "thumb=1" || p.starts_with("thumb=") || p == "thumb")
+    }
+
     fn compute_fs_path(&self, req_path: &str) -> PathBuf {
         let path = if let Some(ref prefix) = self.strip_prefix {
             let prefix = prefix.trim_end_matches('/');
@@ -192,6 +201,11 @@ impl QuarkDriveWebDav {
         let is_head = req.method() == Method::HEAD;
         debug!(req_path = %req_path, fs_path = %fs_path.display(), "browser: checking path");
 
+        // 缩略图代理必须先于目录/预览 HTML，供 <img src="?thumb=1"> 使用。
+        if Self::wants_thumb(req) {
+            return Some(self.proxy_thumbnail(&fs_path, is_head).await);
+        }
+
         // 能列出 → 一定是目录。失败时再查条目类型，避免落到 dav-server 对目录 GET 返回 405
         //（与 OpenList 对目录 HEAD/GET 行为对齐）。
         let cache_key = fs_path.to_string_lossy().into_owned();
@@ -232,19 +246,76 @@ impl QuarkDriveWebDav {
                             .unwrap(),
                     );
                 }
+                let has_thumb = file
+                    .thumbnail_url
+                    .as_deref()
+                    .map(|u| !u.is_empty())
+                    .unwrap_or(false);
                 return Some(html_response(
                     200,
-                    render_image_preview_page(
-                        req_path,
-                        &file.file_name,
-                        file.thumbnail_url.as_deref(),
-                    ),
+                    render_image_preview_page(req_path, &file.file_name, has_thumb),
                 ));
             }
         }
 
         // 其它文件交给 WebDAV 下载。
         None
+    }
+
+    /// 服务端代拉夸克 thumbnail_url，带 pan.quark.cn Referer，绕过浏览器防盗链。
+    async fn proxy_thumbnail(&self, fs_path: &Path, is_head: bool) -> Response<Body> {
+        let Some(file) = self.lookup_entry(fs_path).await else {
+            return Response::builder()
+                .status(404)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(Body::from("file not found"))
+                .unwrap();
+        };
+        let Some(thumb) = file.thumbnail_url.as_deref().filter(|u| !u.is_empty()) else {
+            return Response::builder()
+                .status(404)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(Body::from("no thumbnail"))
+                .unwrap();
+        };
+        match self.fs.drive.fetch_thumbnail(thumb).await {
+            Ok((bytes, ctype)) => {
+                let ctype = if ctype.to_ascii_lowercase().starts_with("image/") {
+                    ctype
+                } else {
+                    "image/jpeg".to_string()
+                };
+                if is_head {
+                    return Response::builder()
+                        .status(200)
+                        .header("Content-Type", ctype)
+                        .header("Content-Length", bytes.len().to_string())
+                        .header("Cache-Control", "private, max-age=300")
+                        .body(Body::from(""))
+                        .unwrap();
+                }
+                Response::builder()
+                    .status(200)
+                    .header("Content-Type", ctype)
+                    .header("Content-Length", bytes.len().to_string())
+                    .header("Cache-Control", "private, max-age=300")
+                    .body(Body::from(bytes))
+                    .unwrap()
+            }
+            Err(err) => {
+                error!(
+                    path = %fs_path.display(),
+                    file_name = %file.file_name,
+                    error = %err,
+                    "proxy thumbnail failed"
+                );
+                Response::builder()
+                    .status(502)
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .body(Body::from(format!("thumbnail fetch failed: {err:#}")))
+                    .unwrap()
+            }
+        }
     }
 
     /// 在父目录缓存中查找当前路径对应条目。
@@ -607,18 +678,21 @@ body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:
     )
 }
 
-/// 浏览器图片预览；HEIC 优先用夸克缩略图，失败再试 heic2any。
-fn render_image_preview_page(
-    req_path: &str,
-    file_name: &str,
-    thumbnail_url: Option<&str>,
-) -> String {
+/// 浏览器图片预览；HEIC 优先同源代理缩略图（`?thumb=1`），失败再试 heic2any。
+fn render_image_preview_page(req_path: &str, file_name: &str, has_thumbnail: bool) -> String {
     let title = html_escape(file_name);
-    let raw_url = html_escape(&format!(
-        "{}{}raw=1",
-        req_path,
-        if req_path.contains('?') { "&" } else { "?" }
-    ));
+    let qsep = if req_path.contains('?') { "&" } else { "?" };
+    let raw_url = html_escape(&format!("{req_path}{qsep}raw=1"));
+    // 同源代理，不把夸克 CDN 地址塞进页面（直链会被防盗链拦成「图片加载失败」）。
+    let thumb_js = if has_thumbnail {
+        format!(
+            "const THUMB_URL = {};",
+            serde_json::to_string(&format!("{req_path}{qsep}thumb=1"))
+                .unwrap_or_else(|_| "null".into())
+        )
+    } else {
+        "const THUMB_URL = null;".to_string()
+    };
     let parent = {
         let p = req_path.trim_end_matches('/');
         match p.rfind('/') {
@@ -627,10 +701,6 @@ fn render_image_preview_page(
         }
     };
     let parent = html_escape(&parent);
-    let thumb_js = match thumbnail_url {
-        Some(u) if !u.is_empty() => format!("const THUMB_URL = {};", serde_json::to_string(u).unwrap_or_else(|_| "null".into())),
-        _ => "const THUMB_URL = null;".to_string(),
-    };
     let heic = is_heic_like(file_name);
     let body_script = if heic {
         r#"
@@ -663,18 +733,27 @@ function loadScript(src) {
   });
 }
 function showImg(url, note) {
-  const img = document.getElementById('preview');
-  const status = document.getElementById('status');
-  img.onload = () => { status.textContent = note || ''; };
-  img.onerror = () => { status.textContent = '图片加载失败'; };
-  img.src = url;
-  img.hidden = false;
+  return new Promise((resolve, reject) => {
+    const img = document.getElementById('preview');
+    const status = document.getElementById('status');
+    img.onload = () => { status.textContent = note || ''; resolve(); };
+    img.onerror = () => { reject(new Error('图片加载失败')); };
+    img.src = url;
+    img.hidden = false;
+  });
 }
 (async () => {
   const status = document.getElementById('status');
-  // 1) 优先夸克缩略图（与 OpenList 一致，Chrome 可直接看）
+  let thumbOk = false;
+  // 1) 同源缩略图代理（服务端带 Referer 拉夸克 CDN）
   if (THUMB_URL) {
-    showImg(THUMB_URL, '当前为云端缩略图预览；可下载原文件查看全图');
+    status.textContent = '正在加载预览…';
+    try {
+      await showImg(THUMB_URL, '当前为云端缩略图预览；可下载原文件查看全图');
+      thumbOk = true;
+    } catch (_) {
+      status.textContent = '缩略图不可用，尝试原图转换…';
+    }
   } else {
     status.textContent = '正在加载转换库…';
   }
@@ -713,13 +792,13 @@ function showImg(url, note) {
         });
         const jpeg = Array.isArray(out) ? out[0] : out;
         if (!jpeg) throw new Error('转换结果为空');
-        showImg(URL.createObjectURL(jpeg), '');
+        await showImg(URL.createObjectURL(jpeg), '');
         return;
       } catch (e) { lastErr = e; }
     }
     throw lastErr || new Error('HEIC 转换失败');
   } catch (e) {
-    if (THUMB_URL) {
+    if (thumbOk) {
       status.textContent = '原图转换失败（' + errText(e) + '），已显示缩略图；可下载原文件或用 Safari 查看全图';
       return;
     }
@@ -1028,17 +1107,16 @@ mod tests {
 
     #[test]
     fn test_heic_preview_page_errtext_and_thumb() {
-        let html = render_image_preview_page(
-            "/photos/a.HEIC",
-            "a.HEIC",
-            Some("https://img.example/thumb.jpg"),
-        );
+        let html = render_image_preview_page("/photos/a.HEIC", "a.HEIC", true);
         assert!(html.contains("function errText"));
         assert!(html.contains("THUMB_URL"));
-        assert!(html.contains("https://img.example/thumb.jpg"));
+        // 同源代理，不内嵌夸克 CDN。
+        assert!(html.contains("thumb=1"));
+        assert!(!html.contains("https://img.example"));
         assert!(html.contains("heic2any"));
         assert!(html.contains("raw=1"));
-        let no_thumb = render_image_preview_page("/x.heic", "x.heic", None);
+        assert!(html.contains("thumbOk"));
+        let no_thumb = render_image_preview_page("/x.heic", "x.heic", false);
         assert!(no_thumb.contains("THUMB_URL = null"));
     }
 
