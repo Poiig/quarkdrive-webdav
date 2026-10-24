@@ -79,8 +79,8 @@ struct Opt {
     /// WebDAV authentication password
     #[arg(short = 'W', long, env = "WEBDAV_AUTH_PASSWORD")]
     auth_password: Option<String>,
-    /// Automatically generate index.html
-    #[arg(short = 'I', long)]
+    /// Automatically generate directory index (dav fallback; browser 已有自研列表)
+    #[arg(short = 'I', long, env = "WEBDAV_AUTO_INDEX", default_value_t = true)]
     auto_index: bool,
     /// Read/download buffer size in bytes, defaults to 10MB
     #[arg(short = 'S', long, default_value = "10485760")]

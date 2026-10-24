@@ -81,16 +81,49 @@ pub struct QuarkDriveWebDav {
 }
 
 impl QuarkDriveWebDav {
+    /// 是否走 HTML 浏览层（目录列表 / 图片预览）。
+    /// 对齐常见浏览器；WebDAV 客户端通常带 Depth，排除之。
+    /// `?raw=1` / `?download=1` 强制走原始下载（预览页拉图用）。
     fn is_browser_request(req: &Request<hyper::body::Incoming>) -> bool {
-        if req.method() != Method::GET {
+        if req.method() != Method::GET && req.method() != Method::HEAD {
+            return false;
+        }
+        if Self::wants_raw_bytes(req) {
+            return false;
+        }
+        // PROPFIND / 网盘客户端常见；不要当成浏览器。
+        if req.headers().contains_key("depth") {
             return false;
         }
         if let Some(accept) = req.headers().get("accept") {
             if let Ok(accept_str) = accept.to_str() {
-                return accept_str.contains("text/html");
+                if accept_str.contains("text/html") {
+                    return true;
+                }
+            }
+        }
+        if let Some(ua) = req.headers().get("user-agent") {
+            if let Ok(ua) = ua.to_str() {
+                let ua = ua.to_ascii_lowercase();
+                if ua.contains("mozilla")
+                    || ua.contains("chrome")
+                    || ua.contains("safari")
+                    || ua.contains("edg/")
+                    || ua.contains("firefox")
+                {
+                    return true;
+                }
             }
         }
         false
+    }
+
+    fn wants_raw_bytes(req: &Request<hyper::body::Incoming>) -> bool {
+        req.uri()
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .any(|p| p == "raw=1" || p == "download=1" || p.starts_with("raw=") || p == "raw")
     }
 
     fn compute_fs_path(&self, req_path: &str) -> PathBuf {
@@ -156,18 +189,74 @@ impl QuarkDriveWebDav {
         }
 
         let fs_path = self.compute_fs_path(req_path);
+        let is_head = req.method() == Method::HEAD;
         debug!(req_path = %req_path, fs_path = %fs_path.display(), "browser: checking path");
 
-        // 仅目录走 HTML 列表；文件或列目录失败时返回 None，交给 WebDAV 处理下载。
-        // 不要把「路径不是目录」误判成授权失效去扫码页。
-        match self.fs.dir_cache.get_or_insert(&fs_path.to_string_lossy()).await {
-            Some(files) => {
-                debug!(req_path = %req_path, count = files.len(), "browser: directory listing");
-                let html = render_directory_html(req_path, &files);
-                Some(html_response(200, html))
+        // 能列出 → 一定是目录。失败时再查条目类型，避免落到 dav-server 对目录 GET 返回 405
+        //（与 OpenList 对目录 HEAD/GET 行为对齐）。
+        let cache_key = fs_path.to_string_lossy().into_owned();
+        if let Some(files) = self.fs.dir_cache.get_or_insert(&cache_key).await {
+            debug!(req_path = %req_path, count = files.len(), "browser: directory listing");
+            if is_head {
+                return Some(
+                    Response::builder()
+                        .status(200)
+                        .header("Content-Type", "text/html; charset=utf-8")
+                        .header("Content-Length", "0")
+                        .body(Body::from(""))
+                        .unwrap(),
+                );
             }
-            None => None,
+            return Some(html_response(200, render_directory_html(req_path, &files)));
         }
+
+        let entry = self.lookup_entry(&fs_path).await;
+        if entry.as_ref().map(|f| f.dir).unwrap_or(fs_path == Path::new("/")) {
+            let html = render_dir_error_page(
+                req_path,
+                "目录加载失败，请刷新重试。若刚授权，稍等片刻再进。",
+            );
+            return Some(html_response(200, html));
+        }
+
+        // 图片：浏览器内预览（含 HEIC，前端 heic2any 转 JPEG）。
+        if let Some(file) = entry {
+            if is_previewable_image(&file.file_name) {
+                if is_head {
+                    return Some(
+                        Response::builder()
+                            .status(200)
+                            .header("Content-Type", "text/html; charset=utf-8")
+                            .header("Content-Length", "0")
+                            .body(Body::from(""))
+                            .unwrap(),
+                    );
+                }
+                return Some(html_response(
+                    200,
+                    render_image_preview_page(req_path, &file.file_name),
+                ));
+            }
+        }
+
+        // 其它文件交给 WebDAV 下载。
+        None
+    }
+
+    /// 在父目录缓存中查找当前路径对应条目。
+    async fn lookup_entry(&self, fs_path: &Path) -> Option<crate::drive::QuarkFile> {
+        if fs_path == Path::new("/") {
+            return Some(crate::drive::QuarkFile::new_root());
+        }
+        let parent = fs_path.parent()?;
+        let name = fs_path.file_name()?.to_str()?;
+        let parent_key = if parent == Path::new("") {
+            "/".to_string()
+        } else {
+            parent.to_string_lossy().into_owned()
+        };
+        let files = self.fs.dir_cache.get_or_insert(&parent_key).await?;
+        files.into_iter().find(|f| f.file_name == name)
     }
 
     async fn handle_quark_auth(&self, req: &Request<hyper::body::Incoming>) -> Response<Body> {
@@ -465,7 +554,8 @@ fn percent_encode_path(s: &str) -> String {
 fn file_icon(name: &str) -> &'static str {
     let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" => "🖼️",
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" | "heic" | "heif"
+        | "avif" => "🖼️",
         "mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" | "webm" | "m4v" | "ts" => "🎬",
         "mp3" | "wav" | "flac" | "aac" | "ogg" | "wma" | "m4a" => "🎵",
         "pdf" => "📕",
@@ -479,6 +569,109 @@ fn file_icon(name: &str) -> &'static str {
         "rs" | "py" | "java" | "c" | "cpp" | "go" | "rb" | "php" | "sh" => "💻",
         _ => "📄",
     }
+}
+
+fn is_previewable_image(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" | "heic" | "heif" | "avif"
+    )
+}
+
+fn is_heic_like(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    matches!(ext.as_str(), "heic" | "heif" | "heics" | "heifs")
+}
+
+fn render_dir_error_page(req_path: &str, message: &str) -> String {
+    let path = html_escape(&percent_decode(req_path));
+    let msg = html_escape(message);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>目录加载失败</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.6}}
+.bad{{color:#c33}} a{{color:#2563eb}}
+</style></head><body>
+<h1>目录加载失败</h1>
+<p class="bad">{msg}</p>
+<p>路径：<code>{path}</code></p>
+<p><a href="javascript:location.reload()">刷新</a> · <a href="../">返回上级</a> · <a href="/">根目录</a></p>
+</body></html>"#
+    )
+}
+
+/// 浏览器图片预览；HEIC/HEIF 用 heic2any 转 JPEG（Chrome/Firefox 原生不支持）。
+fn render_image_preview_page(req_path: &str, file_name: &str) -> String {
+    let title = html_escape(file_name);
+    let raw_url = format!("{}?raw=1", html_escape(req_path));
+    let parent = {
+        let p = req_path.trim_end_matches('/');
+        match p.rfind('/') {
+            Some(0) | None => "/".to_string(),
+            Some(i) => format!("{}/", &p[..i]),
+        }
+    };
+    let parent = html_escape(&parent);
+    let heic = is_heic_like(file_name);
+    let heic_script = if heic {
+        r#"
+<script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
+<script>
+(async () => {
+  const status = document.getElementById('status');
+  const img = document.getElementById('preview');
+  try {
+    status.textContent = '正在转换 HEIC…';
+    const res = await fetch(RAW_URL, { credentials: 'same-origin' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    const out = await heic2any({ blob, toType: 'image/jpeg', quality: 0.92 });
+    const jpeg = Array.isArray(out) ? out[0] : out;
+    img.src = URL.createObjectURL(jpeg);
+    img.hidden = false;
+    status.textContent = '';
+  } catch (e) {
+    status.textContent = 'HEIC 预览失败：' + e + '。可尝试下载原文件，或使用 Safari。';
+  }
+})();
+</script>"#
+    } else {
+        r#"
+<script>
+document.getElementById('preview').src = RAW_URL;
+document.getElementById('preview').hidden = false;
+document.getElementById('status').textContent = '';
+</script>"#
+    };
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{title}</title>
+<style>
+body{{margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif}}
+.bar{{display:flex;gap:12px;align-items:center;padding:10px 16px;background:#1a1a1a;flex-wrap:wrap}}
+.bar a{{color:#8ab4ff;text-decoration:none}}
+.wrap{{display:flex;justify-content:center;align-items:center;min-height:calc(100vh - 48px);padding:16px}}
+img{{max-width:100%;max-height:calc(100vh - 80px);object-fit:contain}}
+#status{{padding:16px;color:#ccc}}
+</style></head><body>
+<div class="bar">
+  <a href="{parent}">← 返回</a>
+  <strong>{title}</strong>
+  <a href="{raw_url}" download>下载原文件</a>
+</div>
+<div class="wrap">
+  <p id="status">加载中…</p>
+  <img id="preview" alt="{title}" hidden/>
+</div>
+<script>const RAW_URL = "{raw_url}";</script>
+{heic_script}
+</body></html>"#
+    )
 }
 
 #[cfg(test)]
@@ -565,6 +758,10 @@ mod tests {
         assert_eq!(file_icon("photo.jpg"), "🖼️");
         assert_eq!(file_icon("photo.PNG"), "🖼️");
         assert_eq!(file_icon("photo.Jpeg"), "🖼️");
+        assert_eq!(file_icon("IMG_001.HEIC"), "🖼️");
+        assert!(is_previewable_image("a.heic"));
+        assert!(is_heic_like("a.heif"));
+        assert!(!is_heic_like("a.jpg"));
     }
 
     #[test]

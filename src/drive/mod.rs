@@ -1258,6 +1258,12 @@ pub(crate) fn get_format_type(file_name: &str) -> &str {
             "jpg" | "jpeg" => "image/jpeg",
             "png" => "image/png",
             "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "heic" => "image/heic",
+            "heif" => "image/heif",
+            "heics" => "image/heic-sequence",
+            "avif" => "image/avif",
             "mp4" => "video/mp4",
             "avi" => "video/x-msvideo",
             "mov" => "video/quicktime",
@@ -1291,6 +1297,9 @@ mod tests {
         assert_eq!(get_format_type("photo.JPG"), "image/jpeg");
         assert_eq!(get_format_type("image.png"), "image/png");
         assert_eq!(get_format_type("anim.gif"), "image/gif");
+        assert_eq!(get_format_type("shot.heic"), "image/heic");
+        assert_eq!(get_format_type("shot.HEIF"), "image/heif");
+        assert_eq!(get_format_type("pic.avif"), "image/avif");
     }
 
     #[test]
