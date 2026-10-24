@@ -1,0 +1,35 @@
+# 夸克 WebDAV：二选一启动
+#   Open（推荐）: docker compose --profile open up -d
+#   Cookie:       docker compose --profile cookie up -d
+
+services:
+  quark-open:
+    profiles: [open]
+    image: ghcr.io/poiig/quarkdrive-webdav:latest
+    container_name: quarkdrive-webdav
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      QUARK_OPEN: "true"
+      QUARK_TOKEN_FILE: /data/quark-token.json
+      WEBDAV_AUTH_USER: admin
+      WEBDAV_AUTH_PASSWORD: admin
+      UPLOAD_MEMORY_LIMIT: 512MB
+      # WECOM_WEBHOOK_KEY: 你的企微机器人key
+    volumes:
+      - ./data:/data
+
+  quark-cookie:
+    profiles: [cookie]
+    image: ghcr.io/poiig/quarkdrive-webdav:latest
+    container_name: quarkdrive-webdav
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      QUARK_COOKIE: 你的cookie
+      WEBDAV_AUTH_USER: admin
+      WEBDAV_AUTH_PASSWORD: admin
+      UPLOAD_MEMORY_LIMIT: 64MB
+      # WECOM_WEBHOOK_KEY: 你的企微机器人key

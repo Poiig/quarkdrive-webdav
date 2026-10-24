@@ -959,9 +959,22 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
         let browser_handler = self.clone();
 
         Box::pin(async move {
-            // Open 扫码回调必须跳过 Basic Auth。
-            if skip_basic || (is_browser && Self::is_quark_auth_path(&req_path)) {
+            // Open 扫码相关路径跳过 Basic Auth。
+            if skip_basic {
                 return Ok(browser_handler.handle_quark_auth(&req).await);
+            }
+
+            // Open 未授权时，浏览器直接进扫码页，不要求 WebDAV 账号。
+            if is_browser
+                && browser_handler.fs.drive.is_open_mode()
+                && !matches!(
+                    browser_handler.fs.drive.check_open_auth().await,
+                    Ok(true)
+                )
+            {
+                if let Some(resp) = browser_handler.handle_browser_request(&req).await {
+                    return Ok(resp);
+                }
             }
 
             let mut resp = if should_auth {

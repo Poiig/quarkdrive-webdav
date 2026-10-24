@@ -9,9 +9,23 @@
 | **Cookie** | 使用网页 Cookie |
 | **Open** | 浏览器打开服务页扫码授权（推荐） |
 
-镜像：`ghcr.io/poiig/quarkdrive-webdav:latest`（push `main` 自动构建）
+镜像：`ghcr.io/poiig/quarkdrive-webdav:latest`
 
-## Cookie 模式
+## Docker Compose（推荐）
+
+仓库自带 [`docker-compose.yml`](docker-compose.yml)，按模式选一个 profile：
+
+```bash
+# Open 模式
+docker compose --profile open up -d
+
+# Cookie 模式（先改 compose 里的 QUARK_COOKIE）
+docker compose --profile cookie up -d
+```
+
+## Docker Run
+
+### Cookie 模式
 
 ```bash
 docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
@@ -19,10 +33,11 @@ docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
   -e WEBDAV_AUTH_USER=admin \
   -e WEBDAV_AUTH_PASSWORD=admin \
   -e UPLOAD_MEMORY_LIMIT=64MB \
+  -e WECOM_WEBHOOK_KEY='企微机器人key' \
   ghcr.io/poiig/quarkdrive-webdav:latest
 ```
 
-## Open 模式
+### Open 模式
 
 ```bash
 docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
