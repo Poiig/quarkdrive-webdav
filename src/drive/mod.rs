@@ -1071,7 +1071,7 @@ impl QuarkDrive {
 
     pub async fn up_part(&self, req: UpPartMethodRequest) -> Result<Option<String>> {
         let oss_url = format!(
-            "https://{}.{}//{}?partNumber={}&uploadId={}",
+            "https://{}.{}/{}?partNumber={}&uploadId={}",
             req.bucket,
             req.upload_url, // 去掉 https://
             req.obj_key,
@@ -1079,55 +1079,64 @@ impl QuarkDrive {
             req.upload_id
         );
         let url = reqwest::Url::parse(&oss_url)?;
-        let res = self
-            .client
-            .put(url.clone())
-            .header("Authorization", req.auth_key.clone())
-            .header("Content-Type", req.mime_type.clone())
-            .header("x-oss-date", req.utc_time.clone())
-            .header("x-oss-user-agent", "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit")
-            .header("Referer", REFERER)
-            .body(req.part_bytes)
-            .send().await?;
+        let body = req.part_bytes;
+        let send_once = |body: Vec<u8>| {
+            self.client
+                .put(url.clone())
+                .header("Authorization", req.auth_key.clone())
+                .header("Content-Type", req.mime_type.clone())
+                .header("x-oss-date", req.utc_time.clone())
+                .header(
+                    "x-oss-user-agent",
+                    "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit",
+                )
+                .header("Referer", REFERER)
+                .body(body)
+                .send()
+        };
 
+        let res = send_once(body.clone()).await?;
         match res.error_for_status_ref() {
             Ok(_) => {
                 if res.status() == StatusCode::NO_CONTENT {
                     return Ok(None);
                 }
-                let etag = res.headers().get("Etag").unwrap().to_str().unwrap();
-                return Ok(Some(etag.to_string()));
+                let etag = res
+                    .headers()
+                    .get("Etag")
+                    .or_else(|| res.headers().get("ETag"))
+                    .and_then(|v| v.to_str().ok())
+                    .context("OSS 分片响应缺少 ETag")?;
+                Ok(Some(etag.to_string()))
             }
             Err(err) => {
                 let err_msg = res.text().await?;
-                debug!(error = %err_msg, url = %url, "request failed");
+                debug!(error = %err_msg, url = %url, "up_part failed");
                 match err.status() {
                     Some(
-                        _status_code
-                        @
-                        (StatusCode::REQUEST_TIMEOUT
+                        StatusCode::REQUEST_TIMEOUT
                         | StatusCode::TOO_MANY_REQUESTS
                         | StatusCode::INTERNAL_SERVER_ERROR
                         | StatusCode::BAD_GATEWAY
                         | StatusCode::SERVICE_UNAVAILABLE
-                        | StatusCode::GATEWAY_TIMEOUT),
+                        | StatusCode::GATEWAY_TIMEOUT,
                     ) => {
                         time::sleep(Duration::from_secs(2)).await;
-                        let res = self
-                            .client
-                            .put(url)
-                            .send()
-                            .await?
-                            .error_for_status()?;
+                        // 重试必须带上鉴权头和分片正文，否则会空 PUT。
+                        let res = send_once(body).await?.error_for_status()?;
                         if res.status() == StatusCode::NO_CONTENT {
                             return Ok(None);
                         }
-                        let etag = res.headers().get("Etag").unwrap().to_str().unwrap();
+                        let etag = res
+                            .headers()
+                            .get("Etag")
+                            .or_else(|| res.headers().get("ETag"))
+                            .and_then(|v| v.to_str().ok())
+                            .context("OSS 分片重试响应缺少 ETag")?;
                         Ok(Some(etag.to_string()))
                     }
-                    // unexpected error
                     _ => {
-                        debug!(error = %err, "request failed");
+                        debug!(error = %err, "up_part unexpected error");
                         Err(err.into())
                     }
                 }

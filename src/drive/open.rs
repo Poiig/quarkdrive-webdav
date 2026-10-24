@@ -993,6 +993,10 @@ impl OpenClient {
         {
             Ok(resp) => {
                 let ok = !resp.data.user_id.is_empty();
+                if ok {
+                    // 上传 proof_seed1 依赖 user_id；探测成功时一并缓存。
+                    *self.creds.user_id.write().await = resp.data.user_id.clone();
+                }
                 *self.auth_ok_until.lock().await = if ok {
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(60))
                 } else {

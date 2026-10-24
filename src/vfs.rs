@@ -441,9 +441,14 @@ impl DavFileSystem for QuarkDriveFileSystem {
             let mut file = self.get_file(path.clone()).await.unwrap_or_else(|_| Option::None);
             if file.is_none() {
                 let parent_path = path.parent().ok_or(FsError::NotFound)?;
-                file = self.list_uploading_files(parent_path.to_str().unwrap())
-                    .first().cloned();
-
+                let want = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                file = self
+                    .list_uploading_files(parent_path.to_str().unwrap_or_default())
+                    .into_iter()
+                    .find(|f| f.file_name == want);
             };
 
             let file = file.ok_or(FsError::NotFound)?;
@@ -833,7 +838,7 @@ impl QuarkDavFile {
                 .unwrap()
                 .as_millis();
             self.upload_state.temp_file_path =
-                format!("/tmp/{}_{}", timestamp, self.file.file_name);
+                format!("/tmp/{}_{}", timestamp, sanitize_temp_name(&self.file.file_name));
             // 内存池可用则先走内存；limit=0 或预留失败时仍可稍后在写入时落盘。
             self.upload_state.use_memory = self.fs.upload_memory.limit() > 0;
         }
@@ -966,17 +971,25 @@ impl QuarkDavFile {
                 return Ok(());
             }
             // 内容不同：先删旧文件再上传（不用 OpenList same_path_reuse）。
+            // 删除失败必须中止，否则同名冲突 / 脏数据。
             if let Err(err) = self.fs.drive
                 .remove_file(&self.file.fid, !self.fs.no_trash).await
             {
                 error!(file_name = %self.file.file_name, error = %err,
                        "delete file before upload failed");
+                return Err(FsError::GeneralFailure);
             }
+            self.file.fid.clear();
         }
 
         // Open API 上传链路与 Cookie 分片鉴权不同，整段交给 drive 完成。
         if self.fs.drive.is_open_mode() {
             return self.do_flush_open(&md5, &sha1, size).await;
+        }
+
+        // 空文件走专用路径，避免 chunk_count=0。
+        if size == 0 {
+            return self.upload_mini_byte_file().await;
         }
 
         // up_pre
@@ -1015,6 +1028,10 @@ impl QuarkDavFile {
         self.file.fid = res.data.fid.clone();
 
         self.upload_state.chunk_size = res.metadata.part_size;
+        if res.metadata.part_size == 0 {
+            error!(file_name = %self.file.file_name, "up_pre returned part_size=0");
+            return Err(FsError::GeneralFailure);
+        }
         let chunk_count =
             size / res.metadata.part_size + if size % res.metadata.part_size != 0 { 1 } else { 0 };
         self.upload_state.chunk_count = chunk_count;
@@ -1060,107 +1077,127 @@ impl QuarkDavFile {
                 pool: fs.upload_memory.clone(),
                 reserved: memory_reserved,
             };
-            // upload chunks
-            let chunk_size = upload_state.chunk_size as usize;
             let temp_path = upload_state.temp_file_path.clone();
-            let chunk_count = upload_state.chunk_count;
-            let mut etags = vec![String::new(); chunk_count as usize];
+            let result = async {
+                let chunk_size = upload_state.chunk_size as usize;
+                let chunk_count = upload_state.chunk_count;
+                let mut etags = vec![String::new(); chunk_count as usize];
 
-            let mime_type = &upload_state.mime_type;
-            let obj_key = &upload_state.obj_key;
-            let bucket = &upload_state.bucket;
-            let task_id = &upload_state.task_id;
-            let upload_id = &upload_state.upload_id;
-            let upload_url = &upload_state.upload_url;
+                let mime_type = &upload_state.mime_type;
+                let obj_key = &upload_state.obj_key;
+                let bucket = &upload_state.bucket;
+                let task_id = &upload_state.task_id;
+                let upload_id = &upload_state.upload_id;
+                let upload_url = &upload_state.upload_url;
 
-            for chunk_idx in 1..=chunk_count {
-                let bytes_to_read = if chunk_idx == chunk_count {
-                    let remaining_bytes = upload_state.size as usize - ((chunk_idx - 1) as usize * chunk_size);
-                    std::cmp::min(remaining_bytes, chunk_size)
-                } else {
-                    chunk_size
-                };
-                let offset = (chunk_idx - 1) * chunk_size as u64;
-                let buf = read_upload_slice(&source, offset, bytes_to_read)
-                    .await
-                    .map_err(|e| {
-                        error!(file_name = %file_name, error = %e, "read upload slice failed");
+                for chunk_idx in 1..=chunk_count {
+                    let bytes_to_read = if chunk_idx == chunk_count {
+                        let remaining_bytes =
+                            upload_state.size as usize - ((chunk_idx - 1) as usize * chunk_size);
+                        std::cmp::min(remaining_bytes, chunk_size)
+                    } else {
+                        chunk_size
+                    };
+                    let offset = (chunk_idx - 1) * chunk_size as u64;
+                    let buf = read_upload_slice(&source, offset, bytes_to_read)
+                        .await
+                        .map_err(|e| {
+                            error!(file_name = %file_name, error = %e, "read upload slice failed");
+                            FsError::GeneralFailure
+                        })?;
+                    let now: chrono::DateTime<chrono::Utc> = chrono::Utc::now();
+                    let utc_time = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                    let auth_meta = drive
+                        .up_part_auth_meta(
+                            mime_type,
+                            &utc_time,
+                            bucket,
+                            obj_key,
+                            chunk_idx as u32,
+                            upload_id,
+                        )
+                        .await
+                        .map_err(|err| {
+                            error!(file_name = %file_name, error = %err, "get upload part auth meta failed");
+                            FsError::GeneralFailure
+                        })?;
+                    let auth_info = &upload_state.auth_info;
+                    let auth_res = drive.auth(auth_info, &auth_meta, task_id).await.map_err(|err| {
+                        error!(file_name = %file_name, error = %err, "auth upload part failed");
                         FsError::GeneralFailure
                     })?;
-                let now: chrono::DateTime<chrono::Utc> = chrono::Utc::now();
-                let utc_time = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-                let auth_meta = drive.up_part_auth_meta(mime_type, &utc_time, bucket, obj_key, chunk_idx as u32, upload_id).await.map_err(|err| {
-                    error!(file_name = %file_name, error = %err, "get upload part auth meta failed");
-                    FsError::GeneralFailure
-                })?;
-                let auth_info = &upload_state.auth_info;
-                let auth_res = drive.auth(auth_info, &auth_meta, task_id).await.map_err(|err| {
-                    error!(file_name = %file_name, error = %err, "auth upload part failed");
-                    FsError::GeneralFailure
-                })?;
-                let up_req = UpPartMethodRequest {
-                    auth_key: auth_res.data.auth_key,
-                    mime_type: upload_state.mime_type.clone(),
-                    utc_time,
-                    bucket: bucket.clone(),
-                    upload_url: upload_url.clone(),
-                    obj_key: obj_key.clone(),
-                    part_number: chunk_idx as u32,
-                    upload_id: upload_id.to_string(),
-                    part_bytes: buf,
-                };
-                let res = drive.up_part(up_req).await.map_err(|err| {
-                    error!(file_name = %file_name, error = %err, "upload chunk failed");
-                    FsError::GeneralFailure
-                })?;
-                let etag_from_up_part = res.unwrap();
-                if etag_from_up_part == "finish" {
-                    if !temp_path.is_empty() && tokio::fs::metadata(&temp_path).await.is_ok() {
-                        let _ = tokio::fs::remove_file(&temp_path).await;
+                    let up_req = UpPartMethodRequest {
+                        auth_key: auth_res.data.auth_key,
+                        mime_type: upload_state.mime_type.clone(),
+                        utc_time,
+                        bucket: bucket.clone(),
+                        upload_url: upload_url.clone(),
+                        obj_key: obj_key.clone(),
+                        part_number: chunk_idx as u32,
+                        upload_id: upload_id.to_string(),
+                        part_bytes: buf,
+                    };
+                    let res = drive.up_part(up_req).await.map_err(|err| {
+                        error!(file_name = %file_name, error = %err, "upload chunk failed");
+                        FsError::GeneralFailure
+                    })?;
+                    let etag_from_up_part = res.ok_or_else(|| {
+                        error!(file_name = %file_name, "upload chunk returned empty etag");
+                        FsError::GeneralFailure
+                    })?;
+                    if etag_from_up_part == "finish" {
+                        return Ok(true);
                     }
-                    fs.remove_uploading_file(&parent_path, &file_name);
+                    etags[(chunk_idx - 1) as usize] = etag_from_up_part;
+                }
+
+                let callback = upload_state.callback.clone().ok_or_else(|| {
+                    error!(file_name = %file_name, "missing upload callback");
+                    FsError::GeneralFailure
+                })?;
+                let commit_req = UpAuthAndCommitRequest {
+                    md5s: etags,
+                    callback,
+                    bucket: bucket.clone(),
+                    obj_key: obj_key.clone(),
+                    upload_id: upload_id.clone(),
+                    auth_info: upload_state.auth_info.clone(),
+                    task_id: task_id.clone(),
+                    upload_url: upload_url.clone(),
+                };
+                drive.up_auth_and_commit(commit_req).await.map_err(|err| {
+                    error!(file_name = %file_name, error = %err, "commit upload failed");
+                    FsError::GeneralFailure
+                })?;
+                drive.finish(obj_key, task_id).await.map_err(|err| {
+                    error!(file_name = %file_name, error = %err, "finish upload failed");
+                    FsError::GeneralFailure
+                })?;
+                Ok(false)
+            }
+            .await;
+
+            if !temp_path.is_empty() {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+            }
+            fs.remove_uploading_file(&parent_path, &file_name);
+
+            match result {
+                Ok(_) => {
                     fs.oplog
                         .log_upload(&log_path, log_size, log_mode, "ok")
                         .await;
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     fs.dir_cache.invalidate(parent_dir.as_path()).await;
-                    return Ok(());
+                    Ok::<(), FsError>(())
                 }
-                etags[(chunk_idx - 1) as usize] = etag_from_up_part;
+                Err(err) => {
+                    fs.oplog
+                        .log_upload(&log_path, log_size, log_mode, "error")
+                        .await;
+                    Err(err)
+                }
             }
-
-            // commit
-            let callback = upload_state.callback.clone().unwrap();
-            let commit_req = UpAuthAndCommitRequest {
-                md5s: etags,
-                callback,
-                bucket: bucket.clone(),
-                obj_key: obj_key.clone(),
-                upload_id: upload_id.clone(),
-                auth_info: upload_state.auth_info.clone(),
-                task_id: task_id.clone(),
-                upload_url: upload_url.clone(),
-            };
-            drive.up_auth_and_commit(commit_req).await.map_err(|err| {
-                error!(file_name = %file_name, error = %err, "commit upload failed");
-                FsError::GeneralFailure
-            })?;
-            drive.finish(obj_key, task_id).await.map_err(|err| {
-                error!(file_name = %file_name, error = %err, "finish upload failed");
-                FsError::GeneralFailure
-            })?;
-            fs.oplog
-                .log_upload(&log_path, log_size, log_mode, "ok")
-                .await;
-
-            if !temp_path.is_empty() && tokio::fs::metadata(&temp_path).await.is_ok() {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-            }
-            fs.remove_uploading_file(&parent_path, &file_name);
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            fs.dir_cache.invalidate(parent_dir.as_path()).await;
-
-            Ok::<(), FsError>(())
         });
 
         // Wait for upload to complete, but return early if upload_wait_timeout is reached
@@ -1210,7 +1247,11 @@ impl QuarkDavFile {
                     .unwrap()
                     .as_millis();
                 let path = if temp_path.is_empty() {
-                    format!("/tmp/{}_{}", timestamp, self.file.file_name)
+                    format!(
+                        "/tmp/{}_{}",
+                        timestamp,
+                        sanitize_temp_name(&self.file.file_name)
+                    )
                 } else {
                     temp_path
                 };
@@ -1247,7 +1288,7 @@ impl QuarkDavFile {
                 pool: fs.upload_memory.clone(),
                 reserved: memory_reserved,
             };
-            match drive
+            let result = drive
                 .upload_open_file(
                     &file_name,
                     size,
@@ -1256,28 +1297,28 @@ impl QuarkDavFile {
                     &sha1,
                     &source,
                 )
-                .await
-            {
+                .await;
+            if !temp_path.is_empty() {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+            }
+            fs.remove_uploading_file(&parent_path, &file_name);
+            match result {
                 Ok(()) => {
                     fs.oplog
                         .log_upload(&log_path, size, log_mode, "ok")
                         .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    fs.dir_cache.invalidate(parent_dir.as_path()).await;
+                    Ok::<(), FsError>(())
                 }
                 Err(err) => {
                     error!(file_name = %file_name, error = %err, "open upload failed");
                     fs.oplog
                         .log_upload(&log_path, size, log_mode, &format!("error:{err:#}"))
                         .await;
-                    return Err(FsError::GeneralFailure);
+                    Err(FsError::GeneralFailure)
                 }
             }
-            if !temp_path.is_empty() && tokio::fs::metadata(&temp_path).await.is_ok() {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-            }
-            fs.remove_uploading_file(&parent_path, &file_name);
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            fs.dir_cache.invalidate(parent_dir.as_path()).await;
-            Ok::<(), FsError>(())
         });
 
         let upload_wait_timeout = self.fs.upload_wait_timeout;
@@ -1331,13 +1372,14 @@ impl QuarkDavFile {
                            "failed to get cloud file md5, proceeding with upload");
                 }
             }
-            // Content is different, now delete old file before uploading
             if let Err(err) = self.fs.drive
                 .remove_file(&self.file.fid, !self.fs.no_trash).await
             {
                 error!(file_name = %self.file.file_name, error = %err,
                        "delete file before upload failed");
+                return Err(FsError::GeneralFailure);
             }
+            self.file.fid.clear();
         }
 
         if self.fs.drive.is_open_mode() {
@@ -1401,32 +1443,13 @@ impl QuarkDavFile {
             self.after_flush().await?;
             return Ok(());
         }
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        self.upload_state.temp_file_path = format!("./temp/{}_{}", timestamp, self.file.file_name);
-
-        // 创建一个空白文件txt
-        let empty_file_content = b"";
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&self.upload_state.temp_file_path)
-            .await
-            .map_err(|e| {
-                error!(file_name = %self.file.file_name, error = %e, "failed to create temp file");
-                FsError::GeneralFailure
-            })?;
-        file.write_all(empty_file_content).await.map_err(|e| {
-            error!(file_name = %self.file.file_name, error = %e, "write to temp file failed");
-            FsError::GeneralFailure
-        })?;
-        file.flush().await.map_err(|e| {
-            error!(file_name = %self.file.file_name, error = %e, "flush temp file failed");
-            FsError::GeneralFailure
-        })?;
+        // 空文件优先走内存源，避免额外落盘。
+        self.upload_state.use_memory = true;
+        self.upload_state.memory_data.clear();
+        self.upload_state.size = 0;
+        self.upload_state.temp_file_path.clear();
         self.upload_chunk().await?;
+        self.log_upload_result(0, "ok").await;
         self.after_flush().await?;
 
         Ok(())
@@ -1438,8 +1461,8 @@ impl QuarkDavFile {
         let mut sha1_ctx = self.sha1_ctx.clone();
         let bytes = self.upload_state.buffer.split().freeze().to_vec();
         let add = bytes.len() as u64;
-        self.upload_state.size = self.upload_state.size + add;
 
+        // 先落盘/入内存成功后再累加 size，避免失败后 size 虚高导致读切片越界。
         if self.upload_state.use_memory {
             // 并行合计超限则溢出到临时文件。
             if self.fs.upload_memory.try_reserve(add) {
@@ -1475,6 +1498,7 @@ impl QuarkDavFile {
             })?;
         }
 
+        self.upload_state.size = self.upload_state.size + add;
         md5_ctx.consume(&bytes);
         sha1_ctx.update(&bytes);
         self.md5_ctx = md5_ctx;
@@ -1545,13 +1569,19 @@ impl QuarkDavFile {
                 error!(file_name = %self.file.file_name, error = %err, "upload chunk failed");
                 FsError::GeneralFailure
             })?;
-            let etag_from_up_part = res.unwrap();
+            let etag_from_up_part = res.ok_or_else(|| {
+                error!(file_name = %self.file.file_name, "upload chunk returned empty etag");
+                FsError::GeneralFailure
+            })?;
             if etag_from_up_part == "finish" {
                 return Ok(());
             }
             etags[(chunk_idx - 1) as usize] = etag_from_up_part;
         }
-        let callback = self.upload_state.callback.clone().unwrap();
+        let callback = self.upload_state.callback.clone().ok_or_else(|| {
+            error!(file_name = %self.file.file_name, "missing upload callback");
+            FsError::GeneralFailure
+        })?;
 
         let auth_info = &self.upload_state.auth_info;
         let commit_req = UpAuthAndCommitRequest{
@@ -1792,25 +1822,30 @@ impl DavFile for QuarkDavFile {
     fn flush(&mut self) -> FsFuture<()> {
         debug!(file_id = %self.file.fid, file_name = %self.file.file_name, "file: flush");
         async move {
-            // if self.upload_state.flush_count >=1 {
-            //     // maybe zero byte file, try to upload again
-            //     // TODO :
-            //     // How to judge if a file is zero byte?
-            //     // now it is not working
-            //     // self.upload_mini_byte_file().await?;
-            //     // return Ok(());
-            // }
-
-            if !self.upload_state.is_uploading {
-                debug!(file_id = %self.file.fid, file_name = %self.file.file_name, "file: flush - no temp file path");
-                self.upload_state.flush_count = self.upload_state.flush_count + 1;
-                return Ok(());
-            }
-
             if self.upload_state.is_finished {
                 debug!(file_id = %self.file.fid, file_name = %self.file.file_name, "file: flush - already finished");
                 return Ok(());
             }
+
+            // 无任何 write 的 flush = 0 字节上传（WebDAV 常见）。
+            if !self.upload_state.is_uploading {
+                debug!(
+                    file_id = %self.file.fid,
+                    file_name = %self.file.file_name,
+                    "file: flush - empty upload"
+                );
+                if !self.prepare_for_upload().await? {
+                    return Ok(());
+                }
+                let res = self.upload_mini_byte_file().await;
+                if let Err(err) = res {
+                    error!(file_id = %self.file.fid, file_name = %self.file.file_name, error = %err, "empty flush failed");
+                    self.after_flush().await?;
+                    return Err(err);
+                }
+                return Ok(());
+            }
+
             let res = self.do_flush().await;
             if let Err(err) = res {
                 error!(file_id = %self.file.fid, file_name = %self.file.file_name, error = %err, "file: flush failed");
@@ -1824,9 +1859,23 @@ impl DavFile for QuarkDavFile {
 }
 
 impl Drop for QuarkDavFile {
-    /// 客户端中断上传时归还内存配额，避免并行额度泄漏。
+    /// 客户端中断上传时归还内存配额，并尽量清掉临时文件 / uploading 幽灵项。
     fn drop(&mut self) {
         self.release_upload_memory();
+        if self.upload_state.is_uploading && !self.upload_state.is_finished {
+            let temp = self.upload_state.temp_file_path.clone();
+            let parent = self.file.parent_path.clone();
+            let name = self.file.file_name.clone();
+            let fs = self.fs.clone();
+            if let Some(parent) = parent {
+                tokio::spawn(async move {
+                    if !temp.is_empty() {
+                        let _ = tokio::fs::remove_file(&temp).await;
+                    }
+                    fs.remove_uploading_file(&parent, &name);
+                });
+            }
+        }
     }
 }
 
@@ -1871,6 +1920,15 @@ async fn read_upload_slice(
             Ok(buf)
         }
     }
+}
+
+fn sanitize_temp_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            _ => c,
+        })
+        .collect()
 }
 
 fn is_url_expired(url: &str) -> bool {
