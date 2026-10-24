@@ -1,108 +1,136 @@
 # quarkdrive-webdav
-夸克网盘 WebDAV 服务
 
-[![Docker Image](https://img.shields.io/badge/version-latest-blue)](https://ghcr.io/chenqimiao/quarkdrive-webdav)
-[![Crates.io](https://img.shields.io/crates/v/quarkdrive-webdav.svg)](https://crates.io/crates/quarkdrive-webdav)
+夸克网盘 WebDAV 服务（本仓库 fork）。支持两种接入方式：
 
- 
- ## 核心特性
-- 🐳 Docker 容器化部署 - 快速启动，零环境依赖，无需繁琐配置即可完成部署
-- 📦 二进制包 + 命令行启动 - 支持直接下载二进制包，通过命令行快速启动，部署方式灵活多样
-- 🌱 极致轻量级运行 - 仅需约 10MB 内存占用，低资源消耗特性使其可流畅运行在低配置环境中
-- 🔄 NAS 与云盘双向同步 - 支持 NAS 与云盘间文件基于WebDAV协议的备份、下载、上传操作
-- 🎬 云盘影音无缝播放 - 完美适配  [Infuse](https://firecore.com/infuse)、[nPlayer](https://nplayer.com) 等支持 WebDAV 协议的客户端 App直接播放云盘内容
+- **Cookie 模式**：沿用网页 Cookie（`QUARK_COOKIE`）
+- **Open 模式**：对齐 [OpenList `quark_open`](https://github.com/OpenListTeam/OpenList/tree/main/drivers/quark_open)，用 AppId / SignKey + Refresh Token 调 `open-api-drive.quark.cn`
 
+另含滑动窗口预取（合并上游 [PR #53](https://github.com/chenqimiao/quarkdrive-webdav/pull/53)）：多连接并发拉分块，改善 Infuse / nPlayer 播大文件卡顿。
 
+## 功能
 
-如果项目对你有帮助，欢迎 Star 或者赞助我，以支持本项目的继续开发
+- Docker / 二进制 / Cargo 安装
+- WebDAV 读写（列表、下载、上传、重命名、移动、删除、建目录）
+- 目录缓存、分块预取缓存
+- Open 模式自动刷新 access_token（在线 API + 飞牛本地回退）
 
-## 支付码
+## 安装
 
-<p align="center">
-  <img src="https://github.com/chenqimiao/chenqimiao/raw/main/pic/alipay.JPG" alt="alipay" width="400" height="400" style="margin-right: 40px;"/>
-  <img src="https://github.com/chenqimiao/chenqimiao/raw/main/pic/wechat_pay.JPG" alt="wechat_pay" width="400" height="400"/>
-</p>
-
-## 💖 鸣谢捐赠
-
-衷心感谢以下朋友的支持，正是你们的鼓励让本项目得以持续迭代 🙏
-
-| 日期 | 渠道 | 捐赠者 | 金额 |
-| :---: | :---: | :---: | :---: |
-| 2026-09-22 | WeChat | 5*m | ¥10.00 |
-| 2026-06-06 | WeChat | J\*o | ¥100.00 |
-| 2026-03-26 | WeChat | M\*u | ¥50.00 |
-| 2026-03-25 | WeChat | \*途 | ¥10.00 |
-| 2025-08-06 | WeChat | \*平 | ¥18.50 |
-| 2025-05-04 | WeChat | L\*s | ¥100.00 |
-| 2025-01-07 | WeChat | \*良 | ¥25.00 |
-| **合计** |  | **6 位** | **¥313.50** |
-
-
-> **Note**
->
-> 本项目作者没有上传需求, 所以上传实现较为简单，测试场景不能全部覆盖，后续会慢慢优化
-
-## 二进制安装
-
-### 从 GitHub Releases 下载
-
-可以从 [GitHub Releases](https://github.com/chenqimiao/quarkdrive-webdav/releases) 页面下载预先构建的二进制包，支持 Linux、macOS、Windows 多平台。
-
-### 通过 Cargo 安装
-
-如果已安装 [Rust](https://www.rust-lang.org/tools/install) 工具链，可以直接通过 Cargo 安装：
+### 从源码编译
 
 ```bash
-cargo install quarkdrive-webdav
+cargo build --release
+# 产物：target/release/quarkdrive-webdav
 ```
 
-## 命令行启动
+### Cargo 安装
 
 ```bash
-quarkdrive-webdav --quark-cookie '你的cookie' -U '用户名' -W '密码' -p 8080
+cargo install --git https://github.com/Poiig/quarkdrive-webdav --locked
 ```
 
+## Cookie 模式（原方式）
 
-## Docker 
+```bash
+quarkdrive-webdav \
+  --quark-cookie '你的cookie' \
+  -U '用户名' -W '密码' -p 8080
+```
 
-### docker run
+Docker（需先按 `docker/Dockerfile` 自行构建镜像）：
+
 ```bash
 docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
   -e QUARK_COOKIE='your quark cookie' \
   -e WEBDAV_AUTH_USER=admin \
   -e WEBDAV_AUTH_PASSWORD=admin \
-  ghcr.io/chenqimiao/quarkdrive-webdav:latest
+  quarkdrive-webdav:local
 ```
 
-### docker compose
+## Open 模式（推荐，对齐 OpenList）
+
+需要三样东西：
+
+| 字段 | 说明 |
+|------|------|
+| `QUARK_APP_ID` | 应用 AppId（`x-pan-client-id`） |
+| `QUARK_SIGN_KEY` | 签名私钥 SignKey |
+| `QUARK_REFRESH_TOKEN` | 刷新令牌（授权后拿到） |
+
+AppId / SignKey 是应用凭证；**Refresh Token 是账号授权结果**，必须扫码/登录一次才能拿到。
+
+### 还要不要去 api.oplist.org？
+
+**不必须。** OpenList 去 [api.oplist.org](https://api.oplist.org/) 选「夸克 Open」扫码，只是拿 Refresh Token 的一种途径。本仓库提供等价的本地流程（背后同样走飞牛 OAuth）：
+
+```bash
+# 1. 打印授权链接，浏览器打开并登录夸克
+quarkdrive-webdav open login
+
+# 2. 从回调 URL 取出 nonce，换 token（可写入文件）
+quarkdrive-webdav open exchange --nonce '<nonce>' --token-file ./quark-token.json
+```
+
+也可以继续用 OpenList / oplist 页面授权，把拿到的 Refresh Token 填进来即可。
+
+运行时 token 刷新默认走 `https://api.oplist.org/quarkyun/renewapi`（可用 `QUARK_RENEW_API` 改）；失败会回退飞牛 `refreshToken`。建议配 `QUARK_TOKEN_FILE`，刷新后写回磁盘，重启不用重扫。
+
+### 启动示例
+
+```bash
+quarkdrive-webdav \
+  --quark-open \
+  --quark-app-id '你的AppId' \
+  --quark-sign-key '你的SignKey' \
+  --quark-refresh-token '你的RefreshToken' \
+  --quark-token-file ./quark-token.json \
+  -U admin -W admin -p 8080
+```
+
+Docker Compose：
 
 ```yaml
-version: '3.8'
 services:
   quarkdrive-webdav:
-    image: ghcr.io/chenqimiao/quarkdrive-webdav:latest
+    image: quarkdrive-webdav:local
     container_name: quarkdrive-webdav
     restart: unless-stopped
     ports:
       - "8080:8080"
+    volumes:
+      - ./data:/data
     environment:
-      - QUARK_COOKIE=your quark cookie
+      - QUARK_OPEN=true
+      - QUARK_APP_ID=你的AppId
+      - QUARK_SIGN_KEY=你的SignKey
+      - QUARK_REFRESH_TOKEN=你的RefreshToken
+      - QUARK_TOKEN_FILE=/data/quark-token.json
+      - QUARK_USE_ONLINE_API=true
       - WEBDAV_AUTH_USER=admin
       - WEBDAV_AUTH_PASSWORD=admin
+      - CHUNK_CACHE_MB=128
 ```
 
-其中，`QUARK_COOKIE` 环境变量为你的夸克云盘 `cookie`，`WEBDAV_AUTH_USER`
-和 `WEBDAV_AUTH_PASSWORD` 为连接 WebDAV 服务的用户名和密码。
+启动后用 WebDAV 客户端或浏览器访问 `http://主机:8080`。
 
+## 常用参数
 
+| 参数 / 环境变量 | 说明 | 默认 |
+|-----------------|------|------|
+| `--quark-cookie` / `QUARK_COOKIE` | Cookie 模式凭证 | — |
+| `--quark-open` / `QUARK_OPEN` | 启用 Open 模式 | `false` |
+| `--quark-app-id` / `QUARK_APP_ID` | Open AppId | — |
+| `--quark-sign-key` / `QUARK_SIGN_KEY` | Open SignKey | — |
+| `--quark-refresh-token` / `QUARK_REFRESH_TOKEN` | Open Refresh Token | — |
+| `--quark-access-token` / `QUARK_ACCESS_TOKEN` | Open Access Token（可空，会刷新） | 空 |
+| `--quark-token-file` / `QUARK_TOKEN_FILE` | token 落盘路径 | — |
+| `--quark-use-online-api` / `QUARK_USE_ONLINE_API` | 用在线 API 刷新 token | `true` |
+| `--quark-renew-api` / `QUARK_RENEW_API` | 在线刷新地址 | `https://api.oplist.org/quarkyun/renewapi` |
+| `--chunk-cache-mb` / `CHUNK_CACHE_MB` | 预取块缓存（MB），`0` 关闭 | `128` |
+| `-U` / `WEBDAV_AUTH_USER` | WebDAV 用户名 | — |
+| `-W` / `WEBDAV_AUTH_PASSWORD` | WebDAV 密码 | — |
+| `-p` / `PORT` | 监听端口 | `8080` |
 
-启动后，用webdav客户端或者浏览器连接http://nas地址:8080 即可
+## 免责声明
 
-
-## 🚨 免责声明
-
-本项目仅供学习和研究目的，不得用于任何商业活动。用户在使用本项目时应遵守所在地区的法律法规，对于违法使用所导致的后果，本项目及作者不承担任何责任。
-本项目可能存在未知的缺陷和风险（包括但不限于设备损坏和账号封禁等），使用者应自行承担使用本项目所产生的所有风险及责任。
-作者不保证本项目的准确性、完整性、及时性、可靠性，也不承担任何因使用本项目而产生的任何损失或损害责任。
-使用本项目即表示您已阅读并同意本免责声明的全部内容。
+仅供学习研究，请遵守当地法规与夸克服务条款。使用风险自负（含账号限制等）。
