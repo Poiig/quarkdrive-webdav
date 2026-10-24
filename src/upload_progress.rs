@@ -1,7 +1,7 @@
 //! 上传进度表：供 Web 控制台展示「正在传 / 刚结束」的文件、百分比与速度。
 //!
 //! 与 `uploading` 占位（给 CloudSync PROPFIND）分开：这里面向人看的进度，
-//! 含接收字节、传到夸克的字节，以及按时间窗口估算的速率。
+//! 含接收字节、传到夸克的字节，以及按实际上传耗时估算的上行速率。
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,7 +22,9 @@ pub struct ProgressEntry {
     pub detail: String,
     pub updated_ms: u64,
     pub started_ms: u64,
-    /// 近窗口瞬时速度（字节/秒）；上传阶段为实际上传速度。
+    /// 进入向网盘上传阶段的时间（用于均速，不含接收耗时）。
+    pub upload_started_ms: u64,
+    /// 近窗口瞬时上行速度（字节/秒）；优先按单次 PUT 耗时计算。
     pub speed_bps: u64,
     /// small | fast | slow：智能调度车道（仅大文件区分快/慢）。
     pub lane: String,
@@ -42,6 +44,7 @@ impl ProgressEntry {
             detail: String::new(),
             updated_ms: now,
             started_ms: now,
+            upload_started_ms: 0,
             speed_bps: 0,
             lane: String::new(),
             sample_bytes: 0,
@@ -49,12 +52,12 @@ impl ProgressEntry {
         }
     }
 
-    /// 当前阶段已完成字节：接收期看 received，上传期看 uploaded（至少不低于 received）。
-    pub fn done_bytes(&self) -> u64 {
+    /// 速度采样用的字节：接收期看 received，上传期只看 uploaded（不能混入已接收量）。
+    pub fn speed_bytes(&self) -> u64 {
         if self.status == "receiving" {
             self.received
         } else {
-            self.uploaded.max(self.received)
+            self.uploaded
         }
     }
 
@@ -71,20 +74,31 @@ impl ProgressEntry {
         let recv = self.received.min(half);
         let up = self.uploaded.min(half);
         // (recv + up) / (2 * size) → 接收满 50%，上传满再 50%
-        (((recv + up).saturating_mul(100)) / (half.saturating_mul(2)))
-            .min(100) as u8
+        (((recv + up).saturating_mul(100)) / (half.saturating_mul(2))).min(100) as u8
     }
 
-    /// 自开始以来的平均速度（字节/秒）。
+    /// 平均速度：上传阶段按实际上传字节 / 上传耗时；接收阶段按接收字节 / 总耗时。
     pub fn avg_speed_bps(&self) -> u64 {
+        if self.status == "uploading"
+            || (self.uploaded > 0 && matches!(self.status.as_str(), "ok" | "skip" | "error"))
+        {
+            let start = if self.upload_started_ms > 0 {
+                self.upload_started_ms
+            } else {
+                self.started_ms
+            };
+            let elapsed = self.updated_ms.saturating_sub(start).max(1);
+            return self.uploaded.saturating_mul(1000) / elapsed;
+        }
         let elapsed = self.updated_ms.saturating_sub(self.started_ms).max(1);
-        self.done_bytes().saturating_mul(1000) / elapsed
+        self.received.saturating_mul(1000) / elapsed
     }
 
     /// 按字节差与时间差刷新瞬时速度（至少间隔 400ms，避免抖动）。
+    /// 仅用于接收阶段；上传阶段改走 [`note_upload_transfer`]。
     fn note_progress(&mut self, now: u64) {
         self.updated_ms = now;
-        let done = self.done_bytes();
+        let done = self.speed_bytes();
         let dt = now.saturating_sub(self.sample_ms);
         if dt >= 400 {
             let db = done.saturating_sub(self.sample_bytes);
@@ -92,6 +106,21 @@ impl ProgressEntry {
             self.sample_bytes = done;
             self.sample_ms = now;
         }
+    }
+
+    /// 按单次实际上传耗时刷新瞬时上行速度（不含慢传 sleep）。
+    fn note_upload_transfer(&mut self, delta: u64, elapsed_ms: u64, now: u64) {
+        self.updated_ms = now;
+        self.sample_bytes = self.uploaded;
+        self.sample_ms = now;
+        let dt = elapsed_ms.max(1);
+        let instant = delta.saturating_mul(1000) / dt;
+        // 轻微平滑，避免分片间跳变过大，但仍以本次 PUT 为主。
+        self.speed_bps = if self.speed_bps == 0 {
+            instant
+        } else {
+            self.speed_bps.saturating_mul(2).saturating_add(instant) / 3
+        };
     }
 
     /// 一行可读摘要：百分比、体积、速度分项写清，避免混成「一个百分比」。
@@ -180,7 +209,8 @@ impl UploadTracker {
                     // 进入上传阶段时接收侧已结束，按满值计入进度前半段。
                     e.received = e.received.max(size);
                 }
-                // 切换阶段时重置采样窗口，速度反映 OSS 上传而非接收。
+                // 切换阶段时重置采样窗口，速度只跟 OSS 上传走。
+                e.upload_started_ms = now;
                 e.sample_bytes = e.uploaded;
                 e.sample_ms = now;
                 e.speed_bps = 0;
@@ -189,6 +219,7 @@ impl UploadTracker {
             .or_insert_with(|| {
                 let mut e = ProgressEntry::new(path.to_string(), size, "uploading");
                 e.received = size;
+                e.upload_started_ms = now;
                 e
             });
     }
@@ -201,18 +232,19 @@ impl UploadTracker {
         }
     }
 
-    /// 累加已成功 PUT 到 OSS 的字节。
-    pub fn add_uploaded(&self, path: &str, delta: u64) {
+    /// 累加已成功 PUT 到 OSS 的字节；`elapsed_ms` 为该次实际上传耗时（不含限速 sleep）。
+    pub fn add_uploaded(&self, path: &str, delta: u64, elapsed_ms: u64) {
         if delta == 0 {
             return;
         }
         let now = now_ms();
         if let Some(mut e) = self.inner.get_mut(path) {
-            e.uploaded = e.uploaded.saturating_add(delta);
-            if e.status == "receiving" {
+            if e.status == "receiving" || e.upload_started_ms == 0 {
                 e.status = "uploading".into();
+                e.upload_started_ms = now.saturating_sub(elapsed_ms.max(1));
             }
-            e.note_progress(now);
+            e.uploaded = e.uploaded.saturating_add(delta);
+            e.note_upload_transfer(delta, elapsed_ms, now);
         }
     }
 
@@ -275,9 +307,23 @@ mod tests {
         assert_eq!(e.status, "receiving");
 
         t.mark_uploading("/a.bin", 1000);
-        t.add_uploaded("/a.bin", 500);
+        // 500 字节用 500ms → 1000 B/s，不能被「已接收 1000」污染成假高速。
+        t.add_uploaded("/a.bin", 500, 500);
         let e = t.list().into_iter().next().unwrap();
-        // 收满 + 上传一半 → 75%
         assert_eq!(e.percent(), 75);
+        assert_eq!(e.speed_bps, 1000);
+        assert!(e.uploaded == 500);
+    }
+
+    #[test]
+    fn upload_speed_ignores_receive_bytes() {
+        let t = UploadTracker::new();
+        t.start_receiving("/b.bin", 10_000);
+        t.set_received("/b.bin", 10_000, 10_000);
+        t.mark_uploading("/b.bin", 10_000);
+        t.add_uploaded("/b.bin", 2_000, 1_000); // 2KB / 1s
+        let e = t.list().into_iter().next().unwrap();
+        assert_eq!(e.speed_bps, 2_000);
+        assert!(e.speed_bps < 50_000, "must not treat full received size as one sample");
     }
 }

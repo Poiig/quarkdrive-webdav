@@ -637,7 +637,8 @@ impl OpenClient {
         if pre.data.finish {
             debug!(file_name = %file_name, "open upload finished by rapid upload");
             if let Some((tracker, path)) = progress {
-                tracker.add_uploaded(path, size);
+                // 秒传无实际上传耗时，记 1ms 避免除零，速度展示为瞬时完成。
+                tracker.add_uploaded(path, size, 1);
             }
             return Ok(());
         }
@@ -690,13 +691,7 @@ impl OpenClient {
                 }
                 let offset = idx as u64 * part_size;
                 // 流式 PUT：单片可到数百 MB，整段进内存会在低配机器 OOM。
-                // 慢传车道在分片前限速，把带宽让给 FIFO 快车道任务。
-                if let Some(smart) = smart {
-                    smart.pace(this_size).await;
-                    if let Some((tracker, path)) = progress {
-                        tracker.set_lane(path, smart.lane().as_str());
-                    }
-                }
+                let put_started = std::time::Instant::now();
                 let etag = self
                     .upload_part_with_retry(
                         put_client,
@@ -708,9 +703,18 @@ impl OpenClient {
                     )
                     .await
                     .with_context(|| format!("上传分片 {} 失败", item.part_number))?;
+                let put_ms = put_started.elapsed().as_millis() as u64;
                 etags[idx] = Some(etag);
                 if let Some((tracker, path)) = progress {
-                    tracker.add_uploaded(path, this_size);
+                    // 用实际上传耗时算上行速度，不含后面的慢传 sleep。
+                    tracker.add_uploaded(path, this_size, put_ms);
+                }
+                // 慢传限速放在 PUT 之后，避免把 sleep 算进速度。
+                if let Some(smart) = smart {
+                    if let Some((tracker, path)) = progress {
+                        tracker.set_lane(path, smart.lane().as_str());
+                    }
+                    smart.pace(this_size).await;
                 }
             }
         }

@@ -1257,8 +1257,6 @@ impl QuarkDavFile {
                         chunk_size
                     };
                     let offset = (chunk_idx - 1) * chunk_size as u64;
-                    smart.pace(bytes_to_read as u64).await;
-                    tracker.set_lane(&progress_path, smart.lane().as_str());
                     let buf = read_upload_slice(&source, offset, bytes_to_read)
                         .await
                         .map_err(|e| {
@@ -1297,10 +1295,12 @@ impl QuarkDavFile {
                         upload_id: upload_id.to_string(),
                         part_bytes: buf,
                     };
+                    let put_started = std::time::Instant::now();
                     let res = drive.up_part(up_req).await.map_err(|err| {
                         error!(file_name = %file_name, error = %err, "upload chunk failed");
                         FsError::GeneralFailure
                     })?;
+                    let put_ms = put_started.elapsed().as_millis() as u64;
                     let etag_from_up_part = res.ok_or_else(|| {
                         error!(file_name = %file_name, "upload chunk returned empty etag");
                         FsError::GeneralFailure
@@ -1309,7 +1309,10 @@ impl QuarkDavFile {
                         return Ok(true);
                     }
                     etags[(chunk_idx - 1) as usize] = etag_from_up_part;
-                    tracker.add_uploaded(&progress_path, bytes_to_read as u64);
+                    tracker.add_uploaded(&progress_path, bytes_to_read as u64, put_ms);
+                    // 慢传 sleep 放在计量之后，速度反映实际上行。
+                    tracker.set_lane(&progress_path, smart.lane().as_str());
+                    smart.pace(bytes_to_read as u64).await;
                 }
 
                 let callback = upload_state.callback.clone().ok_or_else(|| {
