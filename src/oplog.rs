@@ -6,10 +6,23 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, NaiveDate};
 use tokio::fs::{self, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 
 use crate::util::{format_bytes, now_shanghai};
+
+/// 解析后的一条操作日志，供 Web 历史页展示。
+#[derive(Debug, Clone)]
+pub struct OpLogEntry {
+    pub time: String,
+    pub kind: String,
+    pub result: String,
+    pub mode: String,
+    pub size: String,
+    pub path: String,
+    pub raw: String,
+    pub file: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct OpLog {
@@ -122,6 +135,183 @@ impl OpLog {
             }
         }
     }
+
+    /// 读取近期操作日志（新→旧），供 Web 历史页筛选。
+    pub async fn list_entries(
+        &self,
+        limit: usize,
+        kind_filter: Option<&str>,
+        result_filter: Option<&str>,
+        path_query: Option<&str>,
+    ) -> Vec<OpLogEntry> {
+        let limit = limit.clamp(1, 2000);
+        let mut files = list_op_log_files(&self.dir).await;
+        // 新日期在前。
+        files.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut out = Vec::new();
+        for (path, _date, name) in files {
+            let Ok(file) = fs::File::open(&path).await else {
+                continue;
+            };
+            let mut lines = Vec::new();
+            let mut reader = BufReader::new(file).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                lines.push(line);
+            }
+            for line in lines.into_iter().rev() {
+                let Some(entry) = parse_op_line(&line, &name) else {
+                    continue;
+                };
+                if let Some(k) = kind_filter {
+                    if k != "all" && entry.kind != k {
+                        continue;
+                    }
+                }
+                if let Some(r) = result_filter {
+                    if r != "all" {
+                        let okish = entry.result == "ok"
+                            || entry.result.starts_with("ok:")
+                            || entry.result == "skip";
+                        match r {
+                            "ok" if !okish => continue,
+                            "error" if okish => continue,
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(q) = path_query {
+                    let q = q.trim();
+                    if !q.is_empty()
+                        && !entry.path.to_ascii_lowercase().contains(&q.to_ascii_lowercase())
+                    {
+                        continue;
+                    }
+                }
+                out.push(entry);
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
+    /// 清除日志：`date=YYYY-MM-DD` 删单日，否则删目录下全部 op-*.log。
+    pub async fn clear(&self, date: Option<&str>) -> Result<usize, String> {
+        if let Some(d) = date {
+            let d = d.trim();
+            if NaiveDate::parse_from_str(d, "%Y-%m-%d").is_err() {
+                return Err("日期格式应为 YYYY-MM-DD".into());
+            }
+            let path = self.dir.join(format!("op-{d}.log"));
+            return match fs::remove_file(&path).await {
+                Ok(()) => Ok(1),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(err) => Err(err.to_string()),
+            };
+        }
+        let files = list_op_log_files(&self.dir).await;
+        let mut n = 0usize;
+        for (path, _, _) in files {
+            match fs::remove_file(&path).await {
+                Ok(()) => n += 1,
+                Err(err) => warn!(error = %err, file = %path.display(), "clear op log failed"),
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// 枚举 `op-YYYY-MM-DD.log`。
+async fn list_op_log_files(dir: &Path) -> Vec<(PathBuf, NaiveDate, String)> {
+    let Ok(mut entries) = fs::read_dir(dir).await else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(date_str) = name
+            .strip_prefix("op-")
+            .and_then(|s| s.strip_suffix(".log"))
+        else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") else {
+            continue;
+        };
+        files.push((entry.path(), date, name));
+    }
+    files
+}
+
+/// 解析一行控制台/文件日志。格式：`时间 upload|delete ...`
+fn parse_op_line(line: &str, file: &str) -> Option<OpLogEntry> {
+    // `2026-10-24 14:22:15 +0800 upload result=ok mode=open size=1.8 MB path=/a/b`
+    let rest = line.trim();
+    let (time, body) = if let Some(i) = rest.find(" upload ") {
+        (&rest[..i], &rest[i + 1..])
+    } else if let Some(i) = rest.find(" delete ") {
+        (&rest[..i], &rest[i + 1..])
+    } else {
+        return None;
+    };
+    let kind = if body.starts_with("upload ") {
+        "upload"
+    } else if body.starts_with("delete ") {
+        "delete"
+    } else {
+        return None;
+    };
+    let fields = body.split_whitespace().collect::<Vec<_>>();
+    let mut result = String::new();
+    let mut mode = String::new();
+    let mut size = String::new();
+    let mut path = String::new();
+    for f in fields.iter().skip(1) {
+        if let Some(v) = f.strip_prefix("result=") {
+            result = v.to_string();
+        } else if let Some(v) = f.strip_prefix("mode=") {
+            mode = v.to_string();
+        } else if let Some(v) = f.strip_prefix("size=") {
+            size = v.to_string();
+        } else if let Some(v) = f.strip_prefix("path=") {
+            path = v.to_string();
+        } else if result.starts_with("error:") && f.contains('/') {
+            // result=error:msg 可能被空格拆开；path= 优先。
+        }
+    }
+    // size 可能是 `size=1.8` + 下一 token `MB`
+    if let Some(i) = fields.iter().position(|f| f.starts_with("size=")) {
+        let v = fields[i].strip_prefix("size=").unwrap_or("");
+        if i + 1 < fields.len()
+            && !fields[i + 1].contains('=')
+            && matches!(fields[i + 1], "B" | "KB" | "MB" | "GB" | "TB")
+        {
+            size = format!("{v} {}", fields[i + 1]);
+        } else {
+            size = v.to_string();
+        }
+    }
+    // path 从 path= 起吃到行尾（路径可含空格的极少，这里按无空格处理；若被截断用 raw）。
+    if let Some(idx) = body.find("path=") {
+        path = body[idx + 5..].trim().to_string();
+    }
+    if result.is_empty() {
+        return None;
+    }
+    Some(OpLogEntry {
+        time: time.trim().to_string(),
+        kind: kind.into(),
+        result,
+        mode,
+        size,
+        path,
+        raw: line.to_string(),
+        file: file.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -132,5 +322,15 @@ mod tests {
     fn retention_zero_becomes_seven() {
         let log = OpLog::new("/tmp/oplog-test", 0);
         assert_eq!(log.retention_days(), 7);
+    }
+
+    #[test]
+    fn parse_upload_line_with_size_unit() {
+        let line = "2026-10-24 14:22:15 +0800 upload result=ok mode=open size=1.8 MB path=/我的备份/a.HEIC";
+        let e = parse_op_line(line, "op-2026-10-24.log").unwrap();
+        assert_eq!(e.kind, "upload");
+        assert_eq!(e.result, "ok");
+        assert_eq!(e.size, "1.8 MB");
+        assert_eq!(e.path, "/我的备份/a.HEIC");
     }
 }

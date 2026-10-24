@@ -595,6 +595,7 @@ impl OpenClient {
         md5: &str,
         sha1: &str,
         source: &UploadSource,
+        progress: Option<(&crate::upload_progress::UploadTracker, &str)>,
     ) -> Result<()> {
         let pathname = "/open/v1/file/upload_pre";
         let (tm, x_pan_token, req_id) =
@@ -634,6 +635,9 @@ impl OpenClient {
             .await?;
         if pre.data.finish {
             debug!(file_name = %file_name, "open upload finished by rapid upload");
+            if let Some((tracker, path)) = progress {
+                tracker.add_uploaded(path, size);
+            }
             return Ok(());
         }
         if pre.data.task_id.is_empty() {
@@ -697,6 +701,9 @@ impl OpenClient {
                     .await
                     .with_context(|| format!("上传分片 {} 失败", item.part_number))?;
                 etags[idx] = Some(etag);
+                if let Some((tracker, path)) = progress {
+                    tracker.add_uploaded(path, this_size);
+                }
             }
         }
 

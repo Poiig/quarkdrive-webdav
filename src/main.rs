@@ -28,6 +28,7 @@ mod drive;
 mod oplog;
 mod prefetch;
 mod upload_limit;
+mod upload_progress;
 mod util;
 mod vfs;
 mod webdav;

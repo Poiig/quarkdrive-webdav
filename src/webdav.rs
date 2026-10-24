@@ -171,7 +171,7 @@ impl QuarkDriveWebDav {
         }
     }
 
-    /// Open 授权相关路径不走 Basic Auth（OAuth 回调无浏览器凭证）。
+    /// Open 授权相关浏览器路径（状态页 / 扫码入口）。
     fn is_quark_auth_path(path: &str) -> bool {
         path == "/__quark_auth"
             || path.starts_with("/__quark_auth/")
@@ -179,16 +179,32 @@ impl QuarkDriveWebDav {
             || path == "/__quark_auth/callback"
     }
 
+    /// 仅 OAuth 回调可跳过 Basic（夸克重定向不会带 WebDAV 账号）。
+    fn is_quark_auth_callback(path: &str) -> bool {
+        path == "/__quark_auth/callback"
+    }
+
+    /// 控制台：上传进度 / 历史。
+    fn is_console_path(path: &str) -> bool {
+        path == "/__uploads"
+            || path == "/__uploads.json"
+            || path == "/__history"
+            || path.starts_with("/__history/")
+    }
+
     async fn handle_browser_request(
         &self,
         req: &Request<hyper::body::Incoming>,
     ) -> Option<Response<Body>> {
         let req_path = req.uri().path();
+        if Self::is_console_path(req_path) {
+            return Some(self.handle_console(req).await);
+        }
         if Self::is_quark_auth_path(req_path) {
             return Some(self.handle_quark_auth(req).await);
         }
 
-        // Open 模式：授权失效时引导扫码，而不是空白目录。
+        // Open 模式：授权失效时引导扫码（调用方须已通过 Basic Auth）。
         if self.fs.drive.is_open_mode() {
             match self.fs.drive.check_open_auth().await {
                 Ok(true) => {}
@@ -419,6 +435,104 @@ impl QuarkDriveWebDav {
             }
         }
     }
+
+    /// Web 控制台：上传进度与操作历史（须已通过 Basic Auth）。
+    async fn handle_console(&self, req: &Request<hyper::body::Incoming>) -> Response<Body> {
+        let path = req.uri().path();
+        let query = req.uri().query().unwrap_or("");
+        if path == "/__uploads.json" {
+            let items = self.fs.upload_tracker().list();
+            let list: Vec<serde_json::Value> = items
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "path": e.path,
+                        "size": e.size,
+                        "received": e.received,
+                        "uploaded": e.uploaded,
+                        "status": e.status,
+                        "detail": e.detail,
+                        "percent": e.percent(),
+                        "speed_bps": e.speed_bps,
+                        "avg_speed_bps": e.avg_speed_bps(),
+                        "summary": e.summary(),
+                        "updated_ms": e.updated_ms,
+                    })
+                })
+                .collect();
+            let body = serde_json::to_string(&serde_json::json!({ "items": list }))
+                .unwrap_or_else(|_| r#"{"items":[]}"#.into());
+            return Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .header("Cache-Control", "no-store")
+                .body(Body::from(body))
+                .unwrap();
+        }
+        if path == "/__uploads" {
+            return html_response(200, render_uploads_page(&self.fs.upload_tracker().list()));
+        }
+        if path == "/__history" {
+            let params = parse_query(query);
+            if req.method() == Method::POST
+                || params.get("clear").map(|v| v == "1" || v == "true").unwrap_or(false)
+            {
+                let date = params.get("date").map(|s| s.as_str()).filter(|s| !s.is_empty());
+                match self.fs.oplog().clear(date).await {
+                    Ok(n) => {
+                        return Response::builder()
+                            .status(302)
+                            .header(
+                                "Location",
+                                format!("/__history?cleared={n}&kind=all&result=all"),
+                            )
+                            .body(Body::from("cleared"))
+                            .unwrap();
+                    }
+                    Err(err) => {
+                        return html_response(
+                            400,
+                            render_history_page(vec![], &params, Some(&err)),
+                        );
+                    }
+                }
+            }
+            let kind = params.get("kind").map(|s| s.as_str()).unwrap_or("upload");
+            let result = params.get("result").map(|s| s.as_str()).unwrap_or("all");
+            let q = params.get("q").map(|s| s.as_str());
+            let limit = params
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(200usize);
+            let entries = self
+                .fs
+                .oplog()
+                .list_entries(
+                    limit,
+                    Some(kind),
+                    Some(result),
+                    q.filter(|s| !s.is_empty()),
+                )
+                .await;
+            return html_response(200, render_history_page(entries, &params, None));
+        }
+        html_response(404, "<p>not found</p>".into())
+    }
+}
+
+/// 解析 `a=1&b=2` 查询串。
+fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    for part in query.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        let mut it = part.splitn(2, '=');
+        let k = it.next().unwrap_or("");
+        let v = it.next().unwrap_or("");
+        m.insert(percent_decode(k), percent_decode(v));
+    }
+    m
 }
 
 fn html_response(status: u16, html: String) -> Response<Body> {
@@ -450,12 +564,190 @@ fn render_open_login_page(ok: bool, error: Option<&str>) -> String {
 body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.6}}
 .ok{{color:#0a7}} .bad{{color:#c33}} .err{{background:#f6f6f6;padding:12px;overflow:auto}}
 .btn{{display:inline-block;background:#1677ff;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none}}
+.nav a{{margin-right:12px;color:#2563eb}}
 </style></head><body>
+<p class="nav"><a href="/">目录</a><a href="/__uploads">上传进度</a><a href="/__history">上传历史</a><a href="/__quark_auth">授权</a></p>
 <h1>夸克 Open 授权</h1>
 {status}
 {err}
 <p><a href="/__quark_auth">刷新状态</a></p>
 </body></html>"#
+    )
+}
+
+/// 上传进度页：每 2 秒刷新，展示文件、百分比与速度。
+fn render_uploads_page(items: &[crate::upload_progress::ProgressEntry]) -> String {
+    let mut rows = String::new();
+    if items.is_empty() {
+        rows.push_str(r#"<tr><td colspan="5" class="empty">当前没有进行中的上传</td></tr>"#);
+    }
+    for e in items {
+        let pct = e.percent();
+        let status_class = match e.status.as_str() {
+            "ok" | "skip" => "ok",
+            "error" => "bad",
+            "uploading" | "receiving" => "run",
+            _ => "",
+        };
+        let speed = format!(
+            "{}/s<br/><span class=\"avg\">均 {}/s</span>",
+            html_escape(&crate::util::format_bytes(e.speed_bps)),
+            html_escape(&crate::util::format_bytes(e.avg_speed_bps()))
+        );
+        rows.push_str(&format!(
+            r#"<tr>
+<td class="path">{path}</td>
+<td class="status {status_class}">{status}</td>
+<td class="pct"><div class="bar"><i style="width:{pct}%"></i></div>{pct}% · 收 {recv} / 传 {up} / 共 {total}</td>
+<td class="speed">{speed}</td>
+<td class="detail">{detail}</td>
+</tr>"#,
+            path = html_escape(&e.path),
+            status = html_escape(&e.status),
+            status_class = status_class,
+            pct = pct,
+            recv = html_escape(&crate::util::format_bytes(e.received)),
+            up = html_escape(&crate::util::format_bytes(e.uploaded)),
+            total = html_escape(&crate::util::format_bytes(e.size)),
+            speed = speed,
+            detail = html_escape(&e.detail),
+        ));
+    }
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta http-equiv="refresh" content="2"/>
+<title>上传进度</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:1100px;margin:24px auto;padding:0 16px;color:#222;background:#f7f7f5}}
+.nav a{{margin-right:14px;color:#1d4ed8;text-decoration:none}}
+h1{{font-size:1.25rem;margin:12px 0 16px}}
+table{{width:100%;border-collapse:collapse;background:#fff}}
+th,td{{padding:10px 12px;border-bottom:1px solid #eee;text-align:left;font-size:14px;vertical-align:top}}
+th{{color:#666;font-weight:600}}
+.path{{word-break:break-all;max-width:320px}}
+.status.ok{{color:#0a7}} .status.bad{{color:#c33}} .status.run{{color:#b45309}}
+.bar{{height:8px;background:#eee;margin-bottom:4px;overflow:hidden}}
+.bar i{{display:block;height:100%;background:#2563eb}}
+.speed{{white-space:nowrap;font-variant-numeric:tabular-nums}}
+.speed .avg{{color:#888;font-size:12px}}
+.empty{{color:#888;text-align:center}}
+.detail{{color:#666;font-size:12px;max-width:200px;word-break:break-all}}
+</style></head><body>
+<p class="nav"><a href="/">目录</a><a href="/__uploads">上传进度</a><a href="/__history">上传历史</a><a href="/__quark_auth">授权</a></p>
+<h1>上传进度 <span style="font-size:13px;color:#888;font-weight:400">每 2 秒刷新 · 含瞬时/平均速度</span></h1>
+<table>
+<thead><tr><th>文件</th><th>状态</th><th>进度</th><th>速度</th><th>备注</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</body></html>"#
+    )
+}
+
+/// 操作历史页：支持 kind/result/path 筛选与清除。
+fn render_history_page(
+    entries: Vec<crate::oplog::OpLogEntry>,
+    params: &std::collections::HashMap<String, String>,
+    error: Option<&str>,
+) -> String {
+    let kind = params.get("kind").map(|s| s.as_str()).unwrap_or("upload");
+    let result = params.get("result").map(|s| s.as_str()).unwrap_or("all");
+    let q = params.get("q").cloned().unwrap_or_default();
+    let cleared = params.get("cleared").cloned().unwrap_or_default();
+    let err = error
+        .map(|e| format!(r#"<p class="bad">{}</p>"#, html_escape(e)))
+        .unwrap_or_default();
+    let notice = if !cleared.is_empty() {
+        format!(r#"<p class="ok">已清除 {cleared} 个日志文件</p>"#)
+    } else {
+        String::new()
+    };
+    let mut rows = String::new();
+    if entries.is_empty() {
+        rows.push_str(r#"<tr><td colspan="5" class="empty">没有匹配的记录</td></tr>"#);
+    }
+    for e in &entries {
+        let rc = if e.result.starts_with("error") {
+            "bad"
+        } else {
+            "ok"
+        };
+        rows.push_str(&format!(
+            r#"<tr>
+<td class="time">{time}</td>
+<td>{kind}</td>
+<td class="{rc}">{result}</td>
+<td>{size}</td>
+<td class="path">{path}</td>
+</tr>"#,
+            time = html_escape(&e.time),
+            kind = html_escape(&e.kind),
+            rc = rc,
+            result = html_escape(&e.result),
+            size = html_escape(&e.size),
+            path = html_escape(&e.path),
+        ));
+    }
+    let sel = |cur: &str, want: &str| if cur == want { " selected" } else { "" };
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>上传历史</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:1100px;margin:24px auto;padding:0 16px;color:#222;background:#f7f7f5}}
+.nav a{{margin-right:14px;color:#1d4ed8;text-decoration:none}}
+h1{{font-size:1.25rem;margin:12px 0}}
+form.filters{{display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin:12px 0 16px;background:#fff;padding:12px}}
+form.filters label{{display:flex;flex-direction:column;font-size:12px;color:#666;gap:4px}}
+form.filters input,form.filters select{{padding:6px 8px;font-size:14px}}
+form.filters button,.btn{{padding:7px 12px;font-size:14px;border:1px solid #ccc;background:#fff;cursor:pointer}}
+form.filters button.primary{{background:#2563eb;color:#fff;border-color:#2563eb}}
+table{{width:100%;border-collapse:collapse;background:#fff}}
+th,td{{padding:8px 10px;border-bottom:1px solid #eee;text-align:left;font-size:13px}}
+th{{color:#666}}
+.path{{word-break:break-all}}
+.ok{{color:#0a7}} .bad{{color:#c33}} .empty{{color:#888;text-align:center}}
+.danger{{color:#b91c1c}}
+</style></head><body>
+<p class="nav"><a href="/">目录</a><a href="/__uploads">上传进度</a><a href="/__history">上传历史</a><a href="/__quark_auth">授权</a></p>
+<h1>操作历史</h1>
+{err}{notice}
+<form class="filters" method="get" action="/__history">
+  <label>类型<select name="kind">
+    <option value="all"{k_all}>全部</option>
+    <option value="upload"{k_up}>上传</option>
+    <option value="delete"{k_del}>删除</option>
+  </select></label>
+  <label>结果<select name="result">
+    <option value="all"{r_all}>全部</option>
+    <option value="ok"{r_ok}>成功/跳过</option>
+    <option value="error"{r_err}>失败</option>
+  </select></label>
+  <label>路径包含<input name="q" value="{q}" placeholder="关键词"/></label>
+  <button class="primary" type="submit">筛选</button>
+</form>
+<form class="filters" method="get" action="/__history" onsubmit="return confirm('确认清除？不可恢复');">
+  <input type="hidden" name="clear" value="1"/>
+  <label>清除日期（空=全部）<input name="date" placeholder="YYYY-MM-DD"/></label>
+  <button class="danger" type="submit">清除日志</button>
+</form>
+<table>
+<thead><tr><th>时间</th><th>类型</th><th>结果</th><th>大小</th><th>路径</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</body></html>"#,
+        err = err,
+        notice = notice,
+        k_all = sel(kind, "all"),
+        k_up = sel(kind, "upload"),
+        k_del = sel(kind, "delete"),
+        r_all = sel(result, "all"),
+        r_ok = sel(result, "ok"),
+        r_err = sel(result, "error"),
+        q = html_escape(&q),
+        rows = rows,
     )
 }
 
@@ -613,6 +905,7 @@ tr.dir:hover {{ background: #f0f7ff; }}
   <div class="header">
     <h1><a href="https://github.com/chenqimiao/quarkdrive-webdav" target="_blank" style="color:inherit;text-decoration:none;">QuarkDrive WebDAV</a></h1>
     <div class="breadcrumb">{breadcrumbs}</div>
+    <div style="margin-top:8px;font-size:13px"><a href="/__uploads" style="color:#2563eb;margin-right:12px">上传进度</a><a href="/__history" style="color:#2563eb;margin-right:12px">上传历史</a><a href="/__quark_auth" style="color:#2563eb">授权</a></div>
   </div>
   <div class="content">
     <table>
@@ -1332,7 +1625,8 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
         let auth_pwd = self.auth_password.clone();
         let is_browser = Self::is_browser_request(&req);
         let req_path = req.uri().path().to_string();
-        let skip_basic = Self::is_quark_auth_path(&req_path);
+        // 仅 OAuth 回调跳过 Basic；扫码页/控制台必须先过账号密码。
+        let skip_basic = Self::is_quark_auth_callback(&req_path);
         let req_method = req.method().clone();
         let want_digest = req
             .headers()
@@ -1341,22 +1635,8 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
         let browser_handler = self.clone();
 
         Box::pin(async move {
-            // Open 扫码相关路径跳过 Basic Auth。
             if skip_basic {
                 return Ok(browser_handler.handle_quark_auth(&req).await);
-            }
-
-            // Open 未授权时，浏览器直接进扫码页，不要求 WebDAV 账号。
-            if is_browser
-                && browser_handler.fs.drive.is_open_mode()
-                && !matches!(
-                    browser_handler.fs.drive.check_open_auth().await,
-                    Ok(true)
-                )
-            {
-                if let Some(resp) = browser_handler.handle_browser_request(&req).await {
-                    return Ok(resp);
-                }
             }
 
             let mut resp = if should_auth {

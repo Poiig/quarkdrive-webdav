@@ -21,6 +21,7 @@ use crate::{
     cache::Cache,
     drive::{QuarkDrive, QuarkFile, UploadSource},
     oplog::OpLog,
+    upload_progress::UploadTracker,
     util::is_ignored_system_file,
 };
 use bytes::BufMut;
@@ -123,6 +124,8 @@ pub struct QuarkDriveFileSystem {
     prefer_http_download: bool,
     upload_wait_timeout: u64,
     oplog: Arc<OpLog>,
+    /// Web 控制台上传进度（与 CloudSync uploading stub 独立）。
+    upload_tracker: UploadTracker,
 }
 
 impl QuarkDriveFileSystem {
@@ -156,7 +159,18 @@ impl QuarkDriveFileSystem {
             prefer_http_download: false,
             upload_wait_timeout: 0,
             oplog: Arc::new(OpLog::new("./logs", 7)),
+            upload_tracker: UploadTracker::new(),
         })
+    }
+
+    /// 供 Web 页读取上传进度。
+    pub fn upload_tracker(&self) -> &UploadTracker {
+        &self.upload_tracker
+    }
+
+    /// 供 Web 页读取操作日志。
+    pub fn oplog(&self) -> &Arc<OpLog> {
+        &self.oplog
     }
 
     /// 分块预取缓存上限（字节）。0 = 关闭缓存。用 setter 避免改动 `new` 公开签名。
@@ -939,6 +953,9 @@ impl QuarkDavFile {
                 format!("/tmp/{}_{}", timestamp, sanitize_temp_name(&self.file.file_name));
             // 内存池可用则先走内存；limit=0 或预留失败时仍可稍后在写入时落盘。
             self.upload_state.use_memory = self.fs.upload_memory.limit() > 0;
+            self.fs
+                .upload_tracker
+                .start_receiving(&self.upload_log_path(), self.upload_state.size);
         }
         Ok(true)
     }
@@ -1038,9 +1055,18 @@ impl QuarkDavFile {
     }
 
     async fn log_upload_result(&self, size: u64, result: &str) {
+        let path = self.upload_log_path();
+        let status = if result.starts_with("error") {
+            "error"
+        } else if result.starts_with("skip") {
+            "skip"
+        } else {
+            "ok"
+        };
+        self.fs.upload_tracker.finish(&path, status, result);
         self.fs
             .oplog
-            .log_upload(&self.upload_log_path(), size, self.fs.drive_mode(), result)
+            .log_upload(&path, size, self.fs.drive_mode(), result)
             .await;
     }
 
@@ -1196,6 +1222,9 @@ impl QuarkDavFile {
         let log_mode = self.fs.drive_mode();
         // 后台任务拥有临时文件生命周期；避免客户端断连时 Drop 删掉还在读的文件。
         self.upload_state.handed_off = true;
+        self.fs.upload_tracker.mark_uploading(&log_path, size);
+        let tracker = self.fs.upload_tracker.clone();
+        let progress_path = log_path.clone();
 
         let handle = tokio::spawn(async move {
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
@@ -1275,6 +1304,7 @@ impl QuarkDavFile {
                         return Ok(true);
                     }
                     etags[(chunk_idx - 1) as usize] = etag_from_up_part;
+                    tracker.add_uploaded(&progress_path, bytes_to_read as u64);
                 }
 
                 let callback = upload_state.callback.clone().ok_or_else(|| {
@@ -1309,6 +1339,7 @@ impl QuarkDavFile {
 
             match result {
                 Ok(_) => {
+                    tracker.finish(&progress_path, "ok", "");
                     fs.oplog
                         .log_upload(&log_path, log_size, log_mode, "ok")
                         .await;
@@ -1323,6 +1354,7 @@ impl QuarkDavFile {
                     Ok::<(), FsError>(())
                 }
                 Err(err) => {
+                    tracker.finish(&progress_path, "error", &format!("{err:?}"));
                     fs.remove_uploading_file(&parent_path, &file_name);
                     fs.oplog
                         .log_upload(&log_path, log_size, log_mode, "error")
@@ -1417,6 +1449,9 @@ impl QuarkDavFile {
         let log_mode = self.fs.drive_mode();
         // 后台任务拥有临时文件生命周期；避免客户端断连时 Drop 删掉还在读的文件。
         self.upload_state.handed_off = true;
+        self.fs.upload_tracker.mark_uploading(&log_path, size);
+        let tracker = self.fs.upload_tracker.clone();
+        let progress_path = log_path.clone();
 
         let handle = tokio::spawn(async move {
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
@@ -1432,6 +1467,7 @@ impl QuarkDavFile {
                     &md5,
                     &sha1,
                     &source,
+                    Some((&tracker, progress_path.as_str())),
                 )
                 .await;
             if !temp_path.is_empty() {
@@ -1439,6 +1475,7 @@ impl QuarkDavFile {
             }
             match result {
                 Ok(()) => {
+                    tracker.finish(&progress_path, "ok", "");
                     fs.oplog
                         .log_upload(&log_path, size, log_mode, "ok")
                         .await;
@@ -1453,6 +1490,7 @@ impl QuarkDavFile {
                 }
                 Err(err) => {
                     error!(file_name = %file_name, error = %err, "open upload failed");
+                    tracker.finish(&progress_path, "error", &format!("{err:#}"));
                     fs.remove_uploading_file(&parent_path, &file_name);
                     fs.oplog
                         .log_upload(&log_path, size, log_mode, &format!("error:{err:#}"))
@@ -1644,6 +1682,11 @@ impl QuarkDavFile {
         self.upload_state.size += add;
         self.md5_ctx.consume(&bytes);
         self.sha1_ctx.update(&bytes);
+        self.fs.upload_tracker.set_received(
+            &self.upload_log_path(),
+            self.upload_state.size,
+            self.upload_state.size,
+        );
         Ok(())
     }
 
