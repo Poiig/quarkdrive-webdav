@@ -61,8 +61,7 @@ impl ProgressEntry {
         }
     }
 
-    /// 给页面用的综合进度 0–100。
-    /// 接收与上传各占一半，避免「收完就 100%」但 OSS 还在传。
+    /// 给页面用的上传进度 0–100：只看传到网盘的字节，接收阶段恒为 0。
     pub fn percent(&self) -> u8 {
         if matches!(self.status.as_str(), "ok" | "skip") {
             return 100;
@@ -70,11 +69,8 @@ impl ProgressEntry {
         if self.size == 0 {
             return 0;
         }
-        let half = self.size;
-        let recv = self.received.min(half);
-        let up = self.uploaded.min(half);
-        // (recv + up) / (2 * size) → 接收满 50%，上传满再 50%
-        (((recv + up).saturating_mul(100)) / (half.saturating_mul(2))).min(100) as u8
+        // 面板展示的是「上传到盘」进度，WebDAV 接收不计入。
+        ((self.uploaded.min(self.size).saturating_mul(100)) / self.size).min(100) as u8
     }
 
     /// 平均速度：上传阶段按实际上传字节 / 上传耗时；接收阶段按接收字节 / 总耗时。
@@ -352,17 +348,18 @@ mod tests {
     fn test_percent_and_speed_sample() {
         let t = UploadTracker::new();
         t.start_receiving("/a.bin", 1000);
-        t.set_received("/a.bin", 500, 1000);
+        t.set_received("/a.bin", 1000, 1000);
         let e = t.list().into_iter().next().unwrap();
-        // 接收一半 → 总进度 25%（接收阶段最多 50%）
-        assert_eq!(e.percent(), 25);
+        // 接收再满也是 0%：进度只反映上传到盘。
+        assert_eq!(e.percent(), 0);
         assert_eq!(e.status, "receiving");
 
         t.mark_uploading("/a.bin", 1000);
+        assert_eq!(t.list()[0].percent(), 0);
         // 500 字节用 500ms → 1000 B/s，不能被「已接收 1000」污染成假高速。
         t.add_uploaded("/a.bin", 500, 500);
         let e = t.list().into_iter().next().unwrap();
-        assert_eq!(e.percent(), 75);
+        assert_eq!(e.percent(), 50);
         assert_eq!(e.speed_bps, 1000);
         assert!(e.uploaded == 500);
     }

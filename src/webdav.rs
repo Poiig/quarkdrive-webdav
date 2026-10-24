@@ -949,15 +949,18 @@ fn console_float_html() -> &'static str {
     const barCls=unknown?"qd-bar indeterminate":"qd-bar";
     let speed="—";
     if(it.status==="uploading") speed=fmt(it.speed_bps)+"/s";
-    else if(it.status==="receiving") speed="接收中";
+    else if(it.status==="receiving") speed="等待上传";
     else if(it.avg_speed_bps) speed="均 "+fmt(it.avg_speed_bps)+"/s";
     const name=it.name||String(it.path||"").split("/").filter(Boolean).pop()||it.path;
     const lane=LANE[it.lane]||"";
     const laneCls=it.lane==="fast"||it.lane==="slow"?it.lane:"";
     const laneHtml=lane?`<span class="lane ${laneCls}">${lane}</span>`:"";
+    // 接收阶段进度条保持 0，不显示假的一半进度。
+    const barPct=it.status==="receiving"?0:(unknown?40:pct);
+    const pctText=it.status==="receiving"?"0%":(unknown?"…":pct+"%");
     return `<div class="r1"><span class="name">${esc(name)}</span><span class="size">${esc(fmt(it.size))}</span></div>
-      <div class="${barCls}"><i style="width:${unknown?40:pct}%"></i></div>
-      <div class="r2"><span class="pct">${unknown?"…":pct+"%"} · ${esc(st)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>`;
+      <div class="${barCls}"><i style="width:${barPct}%"></i></div>
+      <div class="r2"><span class="pct">${pctText} · ${esc(st)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>`;
   }
   function isActive(it){ return it.status==="receiving"||it.status==="uploading"; }
   function renderUploads(items, maxItems){

@@ -131,13 +131,12 @@ impl SmartUploadPermit {
         self.ticket.is_none() || self.is_fast.load(Ordering::Acquire)
     }
 
-    /// 每传完一段字节调用：慢传则按目标速率休眠；并尝试晋升为快车道。
+    /// 每传完一段字节调用：慢传则按目标速率休眠；快车道一空闲立刻被唤醒晋升。
     pub async fn pace(&self, bytes: u64) {
         if bytes == 0 {
             return;
         }
-        self.try_promote();
-        if self.is_fast() {
+        if self.try_promote() || self.is_fast() {
             return;
         }
         let sleep_for = {
@@ -160,30 +159,54 @@ impl SmartUploadPermit {
                 Duration::ZERO
             }
         };
-        if sleep_for > Duration::ZERO {
-            tokio::time::sleep(sleep_for).await;
-            self.try_promote();
+        if sleep_for == Duration::ZERO {
+            let _ = self.try_promote();
+            return;
         }
+        // 可中断等待：快车道释放时 notify，不必睡满整段限速。
+        let deadline = Instant::now() + sleep_for;
+        while Instant::now() < deadline {
+            if self.try_promote() || self.is_fast() {
+                // 已晋升全速：清掉剩余债务，后续不再白睡。
+                if let Ok(mut st) = self.pace_lock.lock() {
+                    st.debt_ns = 0;
+                    st.last = Instant::now();
+                }
+                return;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            // 最长 80ms 切片，兼顾唤醒延迟与 CPU。
+            let slice = left.min(Duration::from_millis(80));
+            tokio::select! {
+                _ = tokio::time::sleep(slice) => {}
+                _ = self.sched.notify.notified() => {}
+            }
+        }
+        let _ = self.try_promote();
     }
 
-    /// 队首且快车道空闲时晋升为全速。
-    fn try_promote(&self) {
+    /// 队首且快车道空闲时晋升为全速；成功返回 true。
+    fn try_promote(&self) -> bool {
         let Some(ticket) = self.ticket else {
-            return;
+            return false;
         };
         if self.is_fast.load(Ordering::Acquire) {
-            return;
+            return true;
         }
         let mut st = self.sched.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.fast_holder.is_some() {
-            return;
+            return false;
         }
         if st.order.front().copied() != Some(ticket) {
-            return;
+            return false;
         }
         st.fast_holder = Some(ticket);
         self.is_fast.store(true, Ordering::Release);
         debug!(ticket, "upload promoted to fast lane");
+        true
     }
 }
 
@@ -199,6 +222,7 @@ impl Drop for SmartUploadPermit {
                 st.fast_holder = None;
             }
         }
+        // 立刻叫醒正在限速 sleep 的队首任务。
         self.sched.notify.notify_waiters();
         debug!(ticket, "upload left smart schedule");
     }
