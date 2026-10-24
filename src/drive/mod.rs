@@ -303,6 +303,7 @@ impl QuarkDrive {
         sha1: &str,
         source: &open::UploadSource,
         progress: Option<(&crate::upload_progress::UploadTracker, &str)>,
+        smart: Option<&crate::upload_schedule::SmartUploadPermit>,
     ) -> Result<()> {
         let open = self
             .open
@@ -318,6 +319,7 @@ impl QuarkDrive {
             sha1,
             source,
             progress,
+            smart,
         )
         .await
     }

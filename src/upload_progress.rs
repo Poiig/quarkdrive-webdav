@@ -22,8 +22,10 @@ pub struct ProgressEntry {
     pub detail: String,
     pub updated_ms: u64,
     pub started_ms: u64,
-    /// 近窗口瞬时速度（字节/秒）。
+    /// 近窗口瞬时速度（字节/秒）；上传阶段为实际上传速度。
     pub speed_bps: u64,
+    /// small | fast | slow：智能调度车道（仅大文件区分快/慢）。
+    pub lane: String,
     sample_bytes: u64,
     sample_ms: u64,
 }
@@ -41,6 +43,7 @@ impl ProgressEntry {
             updated_ms: now,
             started_ms: now,
             speed_bps: 0,
+            lane: String::new(),
             sample_bytes: 0,
             sample_ms: now,
         }
@@ -188,6 +191,14 @@ impl UploadTracker {
                 e.received = size;
                 e
             });
+    }
+
+    /// 更新智能调度车道标签（fast/slow/small）。
+    pub fn set_lane(&self, path: &str, lane: &str) {
+        if let Some(mut e) = self.inner.get_mut(path) {
+            e.lane = lane.into();
+            e.updated_ms = now_ms();
+        }
     }
 
     /// 累加已成功 PUT 到 OSS 的字节。

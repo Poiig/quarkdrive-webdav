@@ -594,6 +594,7 @@ impl QuarkDriveWebDav {
                 .map(|e| {
                     serde_json::json!({
                         "path": e.path,
+                        "name": e.path.rsplit('/').next().unwrap_or(e.path.as_str()),
                         "size": e.size,
                         "received": e.received,
                         "uploaded": e.uploaded,
@@ -602,6 +603,7 @@ impl QuarkDriveWebDav {
                         "percent": e.percent(),
                         "speed_bps": e.speed_bps,
                         "avg_speed_bps": e.avg_speed_bps(),
+                        "lane": e.lane,
                         "updated_ms": e.updated_ms,
                     })
                 })
@@ -753,13 +755,26 @@ fn console_float_css() -> &'static str {
 .qd-float-bd{display:none;max-height:min(52vh,420px);overflow:auto;padding:8px 10px 12px}
 .qd-float.open .qd-float-bd{display:block}
 .qd-empty{padding:18px 10px;text-align:center;color:var(--muted);font-size:13px}
-.qd-item{padding:10px;border:1px solid var(--line);background:#f8fbfc;margin-bottom:8px}
-.qd-item:last-child{margin-bottom:0}
-.qd-item .name{font-size:13px;font-weight:600;word-break:break-all;margin:0 0 8px}
-.qd-item .meta{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted);margin-top:6px}
-.qd-item .st{font-weight:600}
-.qd-item .st.run{color:var(--run)} .qd-item .st.ok{color:var(--ok)} .qd-item .st.bad{color:var(--bad)}
-.qd-bar{height:8px;background:#e2e8f0;overflow:hidden;position:relative}
+.qd-item{padding:12px 12px 10px;border-bottom:1px solid var(--line)}
+.qd-item:last-child{border-bottom:0}
+.qd-item .r1,.qd-item .r2{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+}
+.qd-item .name{
+  font-size:13px;font-weight:600;color:var(--ink);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1;
+}
+.qd-item .size,.qd-item .speed,.qd-item .pct{
+  font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;
+}
+.qd-item .pct{font-weight:700;color:var(--ink)}
+.qd-item .speed{color:var(--accent);font-weight:600}
+.qd-item .lane{
+  font-size:11px;padding:1px 6px;border:1px solid var(--line);color:var(--muted);white-space:nowrap;
+}
+.qd-item .lane.fast{color:var(--ok);border-color:#99f6e4;background:#f0fdfa}
+.qd-item .lane.slow{color:var(--run);border-color:#fde68a;background:#fffbeb}
+.qd-bar{height:6px;background:#e2e8f0;overflow:hidden;margin:8px 0 6px;position:relative}
 .qd-bar>i{
   display:block;height:100%;width:0;background:linear-gradient(90deg,#0e7490,#14b8a6);
   transition:width .35s ease;
@@ -768,8 +783,6 @@ fn console_float_css() -> &'static str {
   width:40%!important;animation:qd-slide 1.1s ease-in-out infinite;
 }
 @keyframes qd-slide{0%{transform:translateX(-120%)}100%{transform:translateX(280%)}}
-.qd-pct{font-variant-numeric:tabular-nums;font-weight:700;color:var(--ink)}
-.qd-speed{font-variant-numeric:tabular-nums;white-space:nowrap}
 .qd-modal{
   position:fixed;inset:0;z-index:50;display:none;align-items:center;justify-content:center;
   background:rgba(15,23,32,.45);padding:16px;
@@ -846,6 +859,7 @@ fn console_float_html() -> &'static str {
   const badge=document.getElementById("qdBadge");
   document.getElementById("qdFloatToggle").addEventListener("click",()=>floatEl.classList.toggle("open"));
 
+  const LANE={fast:"全速",slow:"慢传",small:""};
   function renderUploads(items){
     const active=items.filter(i=>i.status==="receiving"||i.status==="uploading").length;
     badge.textContent=String(active);
@@ -854,19 +868,21 @@ fn console_float_html() -> &'static str {
     body.innerHTML=items.map(it=>{
       const pct=Math.max(0,Math.min(100,Number(it.percent)||0));
       const st=STATUS[it.status]||it.status;
-      const stc=(it.status==="ok"||it.status==="skip")?"ok":it.status==="error"?"bad":"run";
       const unknown=!it.size && (it.status==="receiving"||it.status==="uploading");
       const barCls=unknown?"qd-bar indeterminate":"qd-bar";
-      const speed=(it.status==="receiving"||it.status==="uploading")
-        ? (fmt(it.speed_bps)+"/s · 均 "+fmt(it.avg_speed_bps)+"/s")
-        : ("均 "+fmt(it.avg_speed_bps)+"/s");
-      const sizeLine="收 "+fmt(it.received)+" · 传 "+fmt(it.uploaded)+" · 共 "+fmt(it.size);
-      const name=String(it.path||"").split("/").filter(Boolean).pop()||it.path;
-      return `<div class="qd-item" data-path="${esc(it.path)}">
-        <div class="name">${esc(name)}</div>
+      // 实际上传速度：仅 uploading 阶段展示瞬时速度；接收中不冒充上传速。
+      let speed="—";
+      if(it.status==="uploading") speed=fmt(it.speed_bps)+"/s";
+      else if(it.status==="receiving") speed="接收中";
+      else if(it.avg_speed_bps) speed="均 "+fmt(it.avg_speed_bps)+"/s";
+      const name=it.name||String(it.path||"").split("/").filter(Boolean).pop()||it.path;
+      const lane=LANE[it.lane]||"";
+      const laneCls=it.lane==="fast"||it.lane==="slow"?it.lane:"";
+      const laneHtml=lane?`<span class="lane ${laneCls}">${lane}</span>`:"";
+      return `<div class="qd-item" data-path="${esc(it.path)}" title="${esc(it.path)}">
+        <div class="r1"><span class="name">${esc(name)}</span><span class="size">${esc(fmt(it.size))}</span></div>
         <div class="${barCls}"><i style="width:${unknown?40:pct}%"></i></div>
-        <div class="meta"><span class="qd-pct">${unknown?"…":pct+"%"} · <span class="st ${stc}">${esc(st)}</span></span><span class="qd-speed">${esc(speed)}</span></div>
-        <div class="meta"><span>${esc(sizeLine)}</span><span>${esc(it.detail||"")}</span></div>
+        <div class="r2"><span class="pct">${unknown?"…":pct+"%"} · ${esc(st)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>
       </div>`;
     }).join("");
   }

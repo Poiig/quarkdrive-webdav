@@ -596,6 +596,7 @@ impl OpenClient {
         sha1: &str,
         source: &UploadSource,
         progress: Option<(&crate::upload_progress::UploadTracker, &str)>,
+        smart: Option<&crate::upload_schedule::SmartUploadPermit>,
     ) -> Result<()> {
         let pathname = "/open/v1/file/upload_pre";
         let (tm, x_pan_token, req_id) =
@@ -689,6 +690,13 @@ impl OpenClient {
                 }
                 let offset = idx as u64 * part_size;
                 // 流式 PUT：单片可到数百 MB，整段进内存会在低配机器 OOM。
+                // 慢传车道在分片前限速，把带宽让给 FIFO 快车道任务。
+                if let Some(smart) = smart {
+                    smart.pace(this_size).await;
+                    if let Some((tracker, path)) = progress {
+                        tracker.set_lane(path, smart.lane().as_str());
+                    }
+                }
                 let etag = self
                     .upload_part_with_retry(
                         put_client,

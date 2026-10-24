@@ -1228,6 +1228,9 @@ impl QuarkDavFile {
 
         let handle = tokio::spawn(async move {
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
+            // 大文件 FIFO 快车道：队首全速，其余限速慢传且不可插队。
+            let smart = crate::upload_schedule::join(size).await;
+            tracker.set_lane(&progress_path, smart.lane().as_str());
             let _memory_guard = UploadMemoryGuard {
                 pool: fs.upload_memory.clone(),
                 reserved: memory_reserved,
@@ -1254,6 +1257,8 @@ impl QuarkDavFile {
                         chunk_size
                     };
                     let offset = (chunk_idx - 1) * chunk_size as u64;
+                    smart.pace(bytes_to_read as u64).await;
+                    tracker.set_lane(&progress_path, smart.lane().as_str());
                     let buf = read_upload_slice(&source, offset, bytes_to_read)
                         .await
                         .map_err(|e| {
@@ -1455,6 +1460,8 @@ impl QuarkDavFile {
 
         let handle = tokio::spawn(async move {
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
+            let smart = crate::upload_schedule::join(size).await;
+            tracker.set_lane(&progress_path, smart.lane().as_str());
             let _memory_guard = UploadMemoryGuard {
                 pool: fs.upload_memory.clone(),
                 reserved: memory_reserved,
@@ -1468,6 +1475,7 @@ impl QuarkDavFile {
                     &sha1,
                     &source,
                     Some((&tracker, progress_path.as_str())),
+                    Some(&smart),
                 )
                 .await;
             if !temp_path.is_empty() {

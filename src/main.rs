@@ -29,6 +29,7 @@ mod oplog;
 mod prefetch;
 mod upload_limit;
 mod upload_progress;
+mod upload_schedule;
 mod util;
 mod vfs;
 mod webdav;
@@ -119,6 +120,12 @@ struct Opt {
     /// 同时进行的后台上传上限，防止多客户端打满内存/连接
     #[arg(long, env = "UPLOAD_MAX_CONCURRENT", default_value_t = 4)]
     upload_max_concurrent: usize,
+    /// 智能调度：大于此大小的文件走 FIFO 快车道（支持 32MB / 1GB）
+    #[arg(long, env = "UPLOAD_LARGE_THRESHOLD", default_value = "32MB")]
+    upload_large_threshold: String,
+    /// 非快车道大文件的慢传速率（支持 512KB / 1MB）
+    #[arg(long, env = "UPLOAD_SLOW_BPS", default_value = "512KB")]
+    upload_slow_bps: String,
     /// Root directory path
     #[arg(long, env = "WEBDAV_ROOT", default_value = "/")]
     root: String,
@@ -272,6 +279,9 @@ async fn main() -> anyhow::Result<()> {
         },
     );
     upload_limit::init_upload_concurrency(opt.upload_max_concurrent, stream_budget);
+    let large_threshold = parse_byte_size(&opt.upload_large_threshold)?;
+    let slow_bps = parse_byte_size(&opt.upload_slow_bps)?.max(64 * 1024);
+    upload_schedule::init(large_threshold, slow_bps);
 
     let drive_config = build_drive_config(&opt, alert)?;
     let auth_user = opt.auth_user;

@@ -58,8 +58,9 @@ docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
 启动后浏览器打开 `http://主机:8080`（若配置了 `WEBDAV_AUTH_*`，会进入 **`/__login` 登录页**，不再弹浏览器 Basic 对话框）：
 
 1. 在登录页输入 WebDAV 账号密码后：若夸克已授权 → 浏览网盘；未授权/过期 → 再进入扫码页  
-2. 目录页**右上角**：上传进度面板（默认展开，约 0.5s 轮询动态进度条/速度）、「历史」弹窗（筛选/清除）；另有授权 / 退出  
-3. WebDAV 客户端仍走协议 Basic；OAuth 回调 `/__quark_auth/callback` 仍跳过鉴权（夸克重定向不会带账号）
+2. 目录页**右上角**：上传进度面板（默认展开；文件名/大小/进度条/实际上传速度，约 0.5s 刷新）、「历史」弹窗；另有授权 / 退出  
+3. **智能上传**：大于 `UPLOAD_LARGE_THRESHOLD` 的文件 FIFO 排队——队首全速，其余按 `UPLOAD_SLOW_BPS` 慢传，新任务只能排到队尾  
+4. WebDAV 客户端仍走协议 Basic；OAuth 回调 `/__quark_auth/callback` 仍跳过鉴权
 
 Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录必须对容器可写，否则扫码成功也无法落盘，重启后需重新登录。
 
@@ -73,6 +74,8 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录�
 | `QUARK_REFRESH_TOKEN` | 可选，已有 refresh token 时可直接填 | 空 |
 | `UPLOAD_MEMORY_LIMIT` | **仅**限制「接收上传内容」的内存池（并行合计，超限落盘）；**不是**容器/进程 RSS 上限；`0`=始终落盘 | `64MB` |
 | `UPLOAD_MAX_CONCURRENT` | 同时后台上传数上限 | `4` |
+| `UPLOAD_LARGE_THRESHOLD` | 智能调度大文件阈值（FIFO 快车道） | `32MB` |
+| `UPLOAD_SLOW_BPS` | 非快车道大文件慢传速率 | `512KB` |
 | `DIR_CACHE_SIZE` | 目录缓存最多目录数 | `1000` |
 | `DIR_CACHE_BYTES` | 目录缓存字节上限，如 `64MB` | `64MB` |
 | `CHUNK_CACHE_MB` | 播放预取块缓存（MB），`0` 关闭 | `128` |
