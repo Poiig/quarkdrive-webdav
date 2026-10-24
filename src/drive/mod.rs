@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::time;
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 
 use base64::{Engine as _, engine::{self, general_purpose}, alphabet};
 
@@ -28,6 +28,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use headers::Cookie;
 use moka::future::FutureExt;
+
+use crate::alert::Alert;
 
 pub mod model;
 pub mod open;
@@ -46,6 +48,7 @@ pub struct DriveConfig {
     pub cookie: Arc<DashMap<String, String>>,
     /// 存在则走夸克 Open API，不再依赖网页 Cookie。
     pub open: Option<OpenCredentials>,
+    pub alert: Alert,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +58,7 @@ pub struct QuarkDrive {
     download_client: ClientWithMiddleware,
     md5_cache: Arc<DashMap<String, String>>,
     open: Option<OpenClient>,
+    alert: Alert,
 }
 
 impl DavMetaData for QuarkFile {
@@ -132,13 +136,18 @@ impl QuarkDrive {
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 
-        let open = config.open.clone().map(OpenClient::new);
+        let alert = config.alert.clone();
+        let open = config
+            .open
+            .clone()
+            .map(|creds| OpenClient::new(creds, alert.clone()));
         let drive = Self {
             config,
             client,
             download_client,
             md5_cache: Arc::new(DashMap::new()),
             open,
+            alert,
         };
 
         Ok(drive)
@@ -149,12 +158,82 @@ impl QuarkDrive {
         self.open.is_some()
     }
 
-    /// Open 模式启动时拉取 user_id，供上传 proof 使用。
+    pub fn alert(&self) -> &Alert {
+        &self.alert
+    }
+
+    /// Open 模式启动时拉取 user_id；无 token 时不硬失败，留给 Web 扫码。
     pub async fn init_open(&self) -> Result<()> {
-        if let Some(ref open) = self.open {
-            open.init(&self.client).await?;
+        let Some(ref open) = self.open else {
+            return Ok(());
+        };
+        if !open.creds.has_refresh_token().await
+            && open.creds.access_token.read().await.is_empty()
+        {
+            info!("Open 模式尚未授权，请打开 Web 页扫码登录");
+            return Ok(());
         }
+        match open.init(&self.client).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let msg = format!("{err:#}");
+                self.alert
+                    .notify("Open 授权无效", &msg)
+                    .await;
+                warn!(error = %err, "Open 初始化失败，可在 Web 页重新扫码");
+                Ok(())
+            }
+        }
+    }
+
+    /// 探测 Open 授权是否有效。
+    pub async fn check_open_auth(&self) -> Result<bool> {
+        let Some(ref open) = self.open else {
+            return Ok(true);
+        };
+        open.check_auth(&self.client).await
+    }
+
+    /// 生成扫码授权 URL（redirect 指向本服务回调）。
+    pub async fn open_auth_url(&self, redirect_frontend: &str) -> Result<String> {
+        open::fetch_auth_url(&self.client, redirect_frontend).await
+    }
+
+    /// 扫码回调：nonce 换 token 并持久化。
+    pub async fn complete_open_login(&self, nonce: &str) -> Result<()> {
+        let open = self
+            .open
+            .as_ref()
+            .context("仅 Open 模式支持扫码登录")?;
+        open.complete_login_with_nonce(&self.client, nonce)
+            .await
+            .map_err(|err| {
+                let msg = format!("{err:#}");
+                let alert = self.alert.clone();
+                tokio::spawn(async move {
+                    alert.notify("Open 扫码换票失败", &msg).await;
+                });
+                err
+            })?;
+        info!("Open 扫码授权成功");
         Ok(())
+    }
+
+    /// Cookie 模式探测：拉根目录，失败则告警。
+    pub async fn check_cookie_auth(&self) -> Result<bool> {
+        if self.is_open_mode() {
+            return Ok(true);
+        }
+        match self.get_files_by_pdir_fid("0", 1, 1).await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                let msg = format!("{err:#}");
+                self.alert
+                    .notify("Cookie 凭证可能已失效", &msg)
+                    .await;
+                Ok(false)
+            }
+        }
     }
 
     /// Open 上传入口：VFS 在 Open 模式下走完整 pre→分片→finish，不复用 Cookie 分片鉴权。
@@ -228,6 +307,17 @@ impl QuarkDrive {
             Err(err) => {
                 let err_msg = res.text().await?;
                 debug!(error = %err_msg, url = %url, "request failed");
+                if matches!(
+                    err.status(),
+                    Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                ) {
+                    self.alert
+                        .notify(
+                            "Cookie API 鉴权失败",
+                            &format!("HTTP {:?} url={url} body={err_msg}", err.status()),
+                        )
+                        .await;
+                }
                 match err.status() {
                     Some(
                         _status_code
@@ -1031,6 +1121,7 @@ mod tests {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie,
             open: None,
+            alert: Alert::new(None),
         };
         let drive = QuarkDrive::new(config).unwrap();
 
@@ -1071,6 +1162,7 @@ mod tests {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie: cookie,
             open: None,
+            alert: Alert::new(None),
         };
         let drive = QuarkDrive::new(config).unwrap();
         let (files, _total) = drive.get_files_by_pdir_fid("0", 1, 50).await.unwrap();
@@ -1105,6 +1197,7 @@ mod tests {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie,
             open: None,
+            alert: Alert::new(None),
         };
         QuarkDrive::new(config).unwrap()
     }
@@ -1121,6 +1214,7 @@ mod tests {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie,
             open: None,
+            alert: Alert::new(None),
         };
         QuarkDrive::new(config).unwrap()
     }

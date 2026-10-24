@@ -120,25 +120,174 @@ impl QuarkDriveWebDav {
         }
     }
 
+    /// Open 授权相关路径不走 Basic Auth（OAuth 回调无浏览器凭证）。
+    fn is_quark_auth_path(path: &str) -> bool {
+        path == "/__quark_auth"
+            || path.starts_with("/__quark_auth/")
+            || path == "/__quark_auth/start"
+            || path == "/__quark_auth/callback"
+    }
+
     async fn handle_browser_request(
         &self,
-        req_path: &str,
+        req: &Request<hyper::body::Incoming>,
     ) -> Option<Response<Body>> {
+        let req_path = req.uri().path();
+        if Self::is_quark_auth_path(req_path) {
+            return Some(self.handle_quark_auth(req).await);
+        }
+
+        // Open 模式：授权失效时引导扫码，而不是空白目录。
+        if self.fs.drive.is_open_mode() {
+            match self.fs.drive.check_open_auth().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Some(html_response(200, render_open_login_page(false, None)));
+                }
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    self.fs.drive.alert().notify("Open 授权检测失败", &msg).await;
+                    return Some(html_response(
+                        200,
+                        render_open_login_page(false, Some(&msg)),
+                    ));
+                }
+            }
+        }
+
         let fs_path = self.compute_fs_path(req_path);
         debug!(req_path = %req_path, fs_path = %fs_path.display(), "browser: checking path");
 
-        let files = self.fs.dir_cache.get_or_insert(&fs_path.to_string_lossy()).await?;
-        debug!(req_path = %req_path, count = files.len(), "browser: directory listing");
-
-        let html = render_directory_html(req_path, &files);
-        Some(
-            Response::builder()
-                .status(200)
-                .header("Content-Type", "text/html; charset=utf-8")
-                .body(Body::from(html))
-                .unwrap(),
-        )
+        match self.fs.dir_cache.get_or_insert(&fs_path.to_string_lossy()).await {
+            Some(files) => {
+                debug!(req_path = %req_path, count = files.len(), "browser: directory listing");
+                let html = render_directory_html(req_path, &files);
+                Some(html_response(200, html))
+            }
+            None if self.fs.drive.is_open_mode() => {
+                Some(html_response(
+                    200,
+                    render_open_login_page(false, Some("无法列出目录，请重新扫码授权")),
+                ))
+            }
+            None => None,
+        }
     }
+
+    async fn handle_quark_auth(&self, req: &Request<hyper::body::Incoming>) -> Response<Body> {
+        if !self.fs.drive.is_open_mode() {
+            return html_response(
+                400,
+                "<p>当前不是 Open 模式，无需扫码授权。</p>".to_string(),
+            );
+        }
+        let path = req.uri().path();
+        let query = req.uri().query().unwrap_or("");
+
+        if path.ends_with("/callback") {
+            let nonce = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("nonce="))
+                .map(|v| percent_decode(v))
+                .unwrap_or_default();
+            if nonce.is_empty() {
+                return html_response(
+                    400,
+                    render_open_login_page(false, Some("回调缺少 nonce，请重试扫码")),
+                );
+            }
+            return match self.fs.drive.complete_open_login(&nonce).await {
+                Ok(()) => {
+                    self.fs.dir_cache.invalidate_all();
+                    Response::builder()
+                        .status(302)
+                        .header("Location", "/")
+                        .body(Body::from("授权成功，正在跳转…"))
+                        .unwrap()
+                }
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    html_response(200, render_open_login_page(false, Some(&msg)))
+                }
+            };
+        }
+
+        if path.ends_with("/start") {
+            // 回调指回本服务；优先用请求 Host，便于 Docker/反代。
+            let host = req
+                .headers()
+                .get("x-forwarded-host")
+                .or_else(|| req.headers().get("host"))
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("127.0.0.1:8080");
+            let proto = req
+                .headers()
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("http");
+            let redirect = format!("{proto}://{host}/__quark_auth/callback");
+            return match self.fs.drive.open_auth_url(&redirect).await {
+                Ok(url) => Response::builder()
+                    .status(302)
+                    .header("Location", url)
+                    .body(Body::from("redirecting to quark oauth"))
+                    .unwrap(),
+                Err(err) => {
+                    let msg = format!("获取授权链接失败: {err:#}");
+                    self.fs.drive.alert().notify("获取 Open 授权链接失败", &msg).await;
+                    html_response(200, render_open_login_page(false, Some(&msg)))
+                }
+            };
+        }
+
+        // /__quark_auth 状态页
+        match self.fs.drive.check_open_auth().await {
+            Ok(true) => html_response(200, render_open_login_page(true, None)),
+            Ok(false) => html_response(200, render_open_login_page(false, None)),
+            Err(err) => {
+                let msg = format!("{err:#}");
+                html_response(200, render_open_login_page(false, Some(&msg)))
+            }
+        }
+    }
+}
+
+fn html_response(status: u16, html: String) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap()
+}
+
+/// Open 模式登录/状态页：有效则提示正常，无效则引导扫码。
+fn render_open_login_page(ok: bool, error: Option<&str>) -> String {
+    let status = if ok {
+        r#"<p class="ok">授权有效，可正常使用 WebDAV / 浏览文件。</p>
+           <p><a href="/">进入网盘目录</a></p>"#
+    } else {
+        r#"<p class="bad">授权无效或未登录。</p>
+           <p>请点击下方按钮，用夸克账号完成扫码/登录授权。</p>
+           <p><a class="btn" href="/__quark_auth/start">扫码授权</a></p>"#
+    };
+    let err = error
+        .map(|e| format!(r#"<pre class="err">{}</pre>"#, html_escape(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>夸克 Open 授权</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.6}}
+.ok{{color:#0a7}} .bad{{color:#c33}} .err{{background:#f6f6f6;padding:12px;overflow:auto}}
+.btn{{display:inline-block;background:#1677ff;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none}}
+</style></head><body>
+<h1>夸克 Open 授权</h1>
+{status}
+{err}
+<p><a href="/__quark_auth">刷新状态</a></p>
+</body></html>"#
+    )
 }
 
 fn percent_decode(s: &str) -> String {
@@ -616,6 +765,7 @@ mod tests {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie,
             open: None,
+            alert: crate::alert::Alert::new(None),
         };
         let drive = crate::drive::QuarkDrive::new(config).unwrap();
         let fs = crate::vfs::QuarkDriveFileSystem::new(drive, root.to_string(), 100, 60).unwrap();
@@ -800,6 +950,7 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
         let auth_pwd = self.auth_password.clone();
         let is_browser = Self::is_browser_request(&req);
         let req_path = req.uri().path().to_string();
+        let skip_basic = Self::is_quark_auth_path(&req_path);
         let req_method = req.method().clone();
         let want_digest = req
             .headers()
@@ -808,6 +959,11 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
         let browser_handler = self.clone();
 
         Box::pin(async move {
+            // Open 扫码回调必须跳过 Basic Auth。
+            if skip_basic || (is_browser && Self::is_quark_auth_path(&req_path)) {
+                return Ok(browser_handler.handle_quark_auth(&req).await);
+            }
+
             let mut resp = if should_auth {
                 let auth_user_val = auth_user.clone().unwrap();
                 let auth_pwd_val = auth_pwd.clone().unwrap();
@@ -828,7 +984,7 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
                 };
 
                 if is_browser {
-                    if let Some(resp) = browser_handler.handle_browser_request(&req_path).await {
+                    if let Some(resp) = browser_handler.handle_browser_request(&req).await {
                         return Ok(resp);
                     }
                 }
@@ -837,7 +993,7 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
                 dav_server.handle_with(config, req).await
             } else {
                 if is_browser {
-                    if let Some(resp) = browser_handler.handle_browser_request(&req_path).await {
+                    if let Some(resp) = browser_handler.handle_browser_request(&req).await {
                         return Ok(resp);
                     }
                 }

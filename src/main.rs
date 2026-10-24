@@ -13,17 +13,19 @@ use tracing_subscriber::EnvFilter;
 #[cfg(unix)]
 use {signal_hook::consts::signal::*, signal_hook_tokio::Signals};
 
+use alert::Alert;
 use cache::Cache;
-use drive::open::{
-    exchange_token_by_nonce, fetch_auth_url, OpenCredentials, DEFAULT_RENEW_API, OPEN_API_BASE,
-};
+use drive::open::{OpenCredentials, OPEN_API_BASE};
 use drive::*;
+use util::parse_byte_size;
 use vfs::QuarkDriveFileSystem;
 use webdav::WebDavServer;
 
+mod alert;
 mod cache;
 mod drive;
 mod prefetch;
+mod util;
 mod vfs;
 mod webdav;
 use tokio::time::interval;
@@ -43,37 +45,21 @@ struct Opt {
     #[arg(long, env = "QUARK_COOKIE")]
     quark_cookie: Option<String>,
 
-    /// 启用夸克 Open API（对齐 OpenList quark_open）
+    /// 启用夸克 Open 模式（浏览器打开页面即可扫码授权）
     #[arg(long, env = "QUARK_OPEN", default_value_t = false)]
     quark_open: bool,
 
-    /// Open AppId（x-pan-client-id）
-    #[arg(long, env = "QUARK_APP_ID")]
-    quark_app_id: Option<String>,
-
-    /// Open SignKey（签名私钥）
-    #[arg(long, env = "QUARK_SIGN_KEY")]
-    quark_sign_key: Option<String>,
-
-    /// Open access_token（可空，启动后会用 refresh_token 刷新）
-    #[arg(long, env = "QUARK_ACCESS_TOKEN", default_value = "")]
-    quark_access_token: String,
-
-    /// Open refresh_token（Open 模式必填，除非 token 文件已有）
+    /// Open refresh_token（可选；也可只靠 token 文件或 Web 扫码）
     #[arg(long, env = "QUARK_REFRESH_TOKEN", default_value = "")]
     quark_refresh_token: String,
 
-    /// 是否用在线 API 刷新 token（缺文档时本地刷新可能不可用）
-    #[arg(long, env = "QUARK_USE_ONLINE_API", default_value_t = true)]
-    quark_use_online_api: bool,
+    /// token 落盘路径；扫码/刷新后写回
+    #[arg(long, env = "QUARK_TOKEN_FILE", default_value = "./quark-token.json")]
+    quark_token_file: String,
 
-    /// 在线刷新 API 地址
-    #[arg(long, env = "QUARK_RENEW_API", default_value = DEFAULT_RENEW_API)]
-    quark_renew_api: String,
-
-    /// token 落盘路径；刷新后写回，重启可复用
-    #[arg(long, env = "QUARK_TOKEN_FILE")]
-    quark_token_file: Option<String>,
+    /// 企业微信机器人 webhook key（只填 key）
+    #[arg(long, env = "WECOM_WEBHOOK_KEY")]
+    wecom_webhook_key: Option<String>,
 
     /// WebDAV authentication username
     #[arg(short = 'U', long, env = "WEBDAV_AUTH_USER")]
@@ -90,16 +76,16 @@ struct Opt {
     /// Upload buffer size in bytes, defaults to 16MB
     #[arg(long, default_value = "16777216")]
     upload_buffer_size: usize,
-    /// 上传内存上限（字节，多文件并行合计）。未超限直接进内存不写临时文件；0=始终落盘。默认 64MiB。
-    #[arg(long, env = "UPLOAD_MEMORY_LIMIT", default_value = "67108864")]
-    upload_memory_limit: u64,
+    /// 上传内存上限，支持 64MB / 1GB；并行合计，超限落盘。0=始终落盘
+    #[arg(long, env = "UPLOAD_MEMORY_LIMIT", default_value = "64MB")]
+    upload_memory_limit: String,
     /// Directory entries cache size
     #[arg(long, default_value = "1000")]
     cache_size: u64,
     /// Directory entries cache expiration time in seconds
     #[arg(long, default_value = "600")]
     cache_ttl: u64,
-    /// 分块预取缓存上限（MB）。播放器换连接时可命中已拉回的块；0 关闭。
+    /// 分块预取缓存上限（MB）。0 关闭
     #[arg(long, env = "CHUNK_CACHE_MB", default_value = "128")]
     chunk_cache_mb: u64,
     /// Root directory path
@@ -143,54 +129,25 @@ struct Opt {
     refresh_cache_secs_interval: u64,
 
     /// Max seconds to wait for upload completion before returning early to client.
-    /// If upload is still in progress after this timeout, return success to avoid
-    /// client timeout while upload continues in the background.
-    /// Set to 0 to wait indefinitely. Defaults to 280 seconds.
     #[arg(long, env = "UPLOAD_WAIT_TIMEOUT", default_value = "280")]
     upload_wait_timeout: u64,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Scan QRCode
+    /// Scan QRCode（旧 Cookie 扫码，保留兼容）
     #[command(subcommand)]
     Qr(QrCommand),
-    /// 夸克 Open OAuth 登录（飞牛授权流，对齐 OpenList）
-    #[command(subcommand)]
-    Open(OpenCommand),
 }
 
 #[derive(Subcommand, Debug)]
 enum QrCommand {
-    /// Scan QRCode login to get a token
     Login,
-    /// Generate a QRCode
     Generate,
-    /// Query the QRCode login result
     #[command(arg_required_else_help = true)]
     Query {
-        /// Query parameter sid
         #[arg(long)]
         sid: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum OpenCommand {
-    /// 打印授权 URL，浏览器打开后完成登录
-    Login {
-        /// 授权完成后前端回调基址（飞牛要求）
-        #[arg(long, default_value = "https://api.oplist.org/quarkyun/callback")]
-        redirect: String,
-    },
-    /// 用回调 URL 中的 nonce 换取 token，并可选写入 token 文件
-    Exchange {
-        /// 授权回调里的 nonce
-        #[arg(long)]
-        nonce: String,
-        /// 写入路径；不指定则只打印到 stdout
-        #[arg(long)]
-        token_file: Option<String>,
     },
 }
 
@@ -204,43 +161,23 @@ pub fn start_periodic_invalidate(cache: Arc<Cache>, secs: u64) {
     });
 }
 
-/// 根据 Cookie / Open 参数组装 DriveConfig，避免两套凭证混用。
-fn build_drive_config(opt: &Opt) -> anyhow::Result<DriveConfig> {
-    let use_open = opt.quark_open
-        || opt.quark_app_id.is_some()
-        || opt.quark_sign_key.is_some()
-        || !opt.quark_refresh_token.is_empty()
-        || opt.quark_token_file.is_some();
-
-    if use_open {
-        let app_id = opt
-            .quark_app_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Open 模式需要 --quark-app-id / QUARK_APP_ID"))?;
-        let sign_key = opt
-            .quark_sign_key
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Open 模式需要 --quark-sign-key / QUARK_SIGN_KEY"))?;
+/// 组装 DriveConfig：Open 用内置 AppId/SignKey，Cookie 用 QUARK_COOKIE。
+fn build_drive_config(opt: &Opt, alert: Alert) -> anyhow::Result<DriveConfig> {
+    if opt.quark_open {
         let open = OpenCredentials::new(
-            app_id,
-            sign_key,
-            opt.quark_access_token.clone(),
             opt.quark_refresh_token.clone(),
-            opt.quark_use_online_api,
-            opt.quark_renew_api.clone(),
-            opt.quark_token_file.clone(),
+            Some(opt.quark_token_file.clone()),
         )?;
         return Ok(DriveConfig {
             api_base_url: OPEN_API_BASE.to_string(),
             cookie: Arc::new(DashMap::new()),
             open: Some(open),
+            alert,
         });
     }
 
     let cookie_str = opt.quark_cookie.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "请指定 Cookie 模式凭证 QUARK_COOKIE，或启用 Open 模式（QUARK_APP_ID / QUARK_SIGN_KEY / QUARK_REFRESH_TOKEN）"
-        )
+        anyhow::anyhow!("请设置 QUARK_COOKIE，或使用 --quark-open / QUARK_OPEN=true")
     })?;
     let init_cookie = Arc::new(DashMap::new());
     for pair in cookie_str.split(';') {
@@ -252,6 +189,7 @@ fn build_drive_config(opt: &Opt) -> anyhow::Result<DriveConfig> {
         api_base_url: "https://drive.quark.cn".to_string(),
         cookie: init_cookie,
         open: None,
+        alert,
     })
 }
 
@@ -274,11 +212,19 @@ async fn main() -> anyhow::Result<()> {
         .with_timer(tracing_subscriber::fmt::time::time())
         .init();
 
-    if let Some(Commands::Open(cmd)) = &opt.subcommands {
-        return handle_open_command(cmd).await;
+    let alert = Alert::new(opt.wecom_webhook_key.clone());
+    if alert.enabled() {
+        info!("已启用企业微信告警");
     }
 
-    let drive_config = build_drive_config(&opt)?;
+    let upload_memory_limit = parse_byte_size(&opt.upload_memory_limit)?;
+    info!(
+        upload_memory_limit = %opt.upload_memory_limit,
+        upload_memory_bytes = upload_memory_limit,
+        "upload memory limit"
+    );
+
+    let drive_config = build_drive_config(&opt, alert)?;
     let auth_user = opt.auth_user;
     let auth_password = opt.auth_password;
     if (auth_user.is_some() && auth_password.is_none())
@@ -294,14 +240,16 @@ async fn main() -> anyhow::Result<()> {
     };
     let drive = QuarkDrive::new(drive_config)?;
     if drive.is_open_mode() {
-        info!("使用夸克 Open API 模式");
+        info!("使用夸克 Open 模式（可在浏览器扫码授权）");
         drive.init_open().await?;
+    } else {
+        let _ = drive.check_cookie_auth().await;
     }
     let mut fs = QuarkDriveFileSystem::new(drive, opt.root, opt.cache_size, opt.cache_ttl)?;
     fs.set_no_trash(opt.no_trash)
         .set_read_only(opt.read_only)
         .set_upload_buffer_size(opt.upload_buffer_size)
-        .set_upload_memory_limit(opt.upload_memory_limit)
+        .set_upload_memory_limit(upload_memory_limit)
         .set_skip_upload_same_size(opt.skip_upload_same_size)
         .set_prefer_http_download(opt.prefer_http_download)
         .set_upload_wait_timeout(opt.upload_wait_timeout)
@@ -348,56 +296,8 @@ async fn main() -> anyhow::Result<()> {
 
         server.serve().await?;
 
-        // Terminate the signal stream.
         handle.close();
         signals_task.await?;
-    }
-    Ok(())
-}
-
-/// 处理 `open login` / `open exchange`，方便拿到 refresh_token。
-async fn handle_open_command(cmd: &OpenCommand) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder()
-        .user_agent("quarkdrive-webdav/open-login")
-        .build()?;
-    // middleware 客户端与驱动层一致，便于复用同一套 HTTP 栈。
-    let client = reqwest_middleware::ClientBuilder::new(client).build();
-    match cmd {
-        OpenCommand::Login { redirect } => {
-            let url = fetch_auth_url(&client, redirect).await?;
-            println!("{url}");
-            eprintln!("请在浏览器打开上述链接完成授权。");
-            eprintln!(
-                "授权完成后从回调 URL 取出 nonce，执行: quarkdrive-webdav open exchange --nonce <nonce>"
-            );
-        }
-        OpenCommand::Exchange { nonce, token_file } => {
-            let (access, refresh, app_id, sign_key) =
-                exchange_token_by_nonce(&client, nonce).await?;
-            println!("access_token={access}");
-            println!("refresh_token={refresh}");
-            if let Some(id) = &app_id {
-                println!("app_id={id}");
-            }
-            if let Some(key) = &sign_key {
-                println!("sign_key={key}");
-            }
-            if let Some(path) = token_file {
-                let data = drive::TokenFile {
-                    access_token: access,
-                    refresh_token: refresh,
-                    app_id,
-                    sign_key,
-                };
-                if let Some(parent) = std::path::Path::new(path).parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                }
-                std::fs::write(path, serde_json::to_string_pretty(&data)?)?;
-                eprintln!("已写入 {path}");
-            }
-        }
     }
     Ok(())
 }

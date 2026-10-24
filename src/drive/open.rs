@@ -18,6 +18,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::alert::Alert;
+
 use super::model::QuarkFile;
 use super::get_format_type;
 
@@ -34,6 +36,10 @@ const FNNAS_EXCHANGE_URL: &str = "https://oauth.fnnas.com/api/v1/oauth/exchangeT
 const FNNAS_TRIM_APP_ID: &str = "com.trim.cloudstorage";
 const OPEN_UA: &str = "quarkdrive-webdav/open";
 
+/// 内置飞牛夸克 Open 应用凭证（不对外暴露为配置项）。
+pub const BUILTIN_APP_ID: &str = "93b14d40cbef4e5d91945ec93d26fe8f";
+pub const BUILTIN_SIGN_KEY: &str = "6d27122d2d7b41598a1dbb9b5f605e00";
+
 /// Open 模式运行时凭证；token 可在刷新后写回，故用 RwLock 共享。
 #[derive(Debug, Clone)]
 pub struct OpenCredentials {
@@ -41,8 +47,6 @@ pub struct OpenCredentials {
     pub sign_key: String,
     pub access_token: Arc<RwLock<String>>,
     pub refresh_token: Arc<RwLock<String>>,
-    pub use_online_api: bool,
-    pub renew_api_url: String,
     /// 刷新后可选落盘，避免进程重启后仍用已轮换的 refresh_token。
     pub token_file: Option<String>,
     pub user_id: Arc<RwLock<String>>,
@@ -60,17 +64,10 @@ pub struct TokenFile {
 }
 
 impl OpenCredentials {
-    /// 从 CLI/环境变量构造凭证；token_file 若存在则优先覆盖内存中的 token。
-    pub fn new(
-        app_id: String,
-        sign_key: String,
-        access_token: String,
-        refresh_token: String,
-        use_online_api: bool,
-        renew_api_url: String,
-        token_file: Option<String>,
-    ) -> Result<Self> {
-        let mut access = access_token;
+    /// 使用内置 AppId/SignKey；token_file / refresh_token 任一有值即可启动，
+    /// 都没有时仍可起服务，由 Web 页扫码授权补齐。
+    pub fn new(refresh_token: String, token_file: Option<String>) -> Result<Self> {
+        let mut access = String::new();
         let mut refresh = refresh_token;
         if let Some(ref path) = token_file {
             if Path::new(path).exists() {
@@ -86,19 +83,18 @@ impl OpenCredentials {
                 }
             }
         }
-        if refresh.is_empty() {
-            bail!("Open 模式需要 refresh_token（或有效的 token 文件）");
-        }
         Ok(Self {
-            app_id,
-            sign_key,
+            app_id: BUILTIN_APP_ID.to_string(),
+            sign_key: BUILTIN_SIGN_KEY.to_string(),
             access_token: Arc::new(RwLock::new(access)),
             refresh_token: Arc::new(RwLock::new(refresh)),
-            use_online_api,
-            renew_api_url,
             token_file,
             user_id: Arc::new(RwLock::new(String::new())),
         })
+    }
+
+    pub async fn has_refresh_token(&self) -> bool {
+        !self.refresh_token.read().await.is_empty()
     }
 
     /// 下载直链需要的 Cookie，与 OpenList `generateAuthCookie` 一致。
@@ -384,13 +380,15 @@ pub fn generate_req_sign(method: &str, pathname: &str, sign_key: &str) -> (Strin
 pub struct OpenClient {
     pub creds: OpenCredentials,
     pub api_base: String,
+    alert: Alert,
 }
 
 impl OpenClient {
-    pub fn new(creds: OpenCredentials) -> Self {
+    pub fn new(creds: OpenCredentials, alert: Alert) -> Self {
         Self {
             creds,
             api_base: OPEN_API_BASE.to_string(),
+            alert,
         }
     }
 
@@ -719,11 +717,25 @@ impl OpenClient {
             Ok(v) => Ok(v),
             Err(err) if is_token_expired_error(&err) => {
                 warn!(error = %err, "access_token 失效，尝试刷新后重试");
-                self.refresh_token(client).await?;
+                if let Err(refresh_err) = self.refresh_token(client).await {
+                    let msg = format!("{refresh_err:#}");
+                    self.alert.notify("Open Token 刷新失败", &msg).await;
+                    return Err(refresh_err);
+                }
                 self.request_once(client, pathname, method, body.as_ref(), manual, true)
                     .await
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("errno")
+                    || msg.contains("Open API")
+                    || msg.contains("令牌")
+                    || msg.contains("token")
+                {
+                    self.alert.notify("Open API 请求失败", &msg).await;
+                }
+                Err(err)
+            }
         }
     }
 
@@ -805,11 +817,15 @@ impl OpenClient {
             .with_context(|| format!("解析 Open API 响应失败 ({pathname}): {text}"))
     }
 
-    /// 优先走在线 renew API；失败再试飞牛本地刷新。
+    /// 优先走在线 renew API；失败再试飞牛本地刷新。错误信息区分「不可达」与「令牌无效」。
     pub async fn refresh_token(&self, client: &ClientWithMiddleware) -> Result<()> {
+        let refresh = self.creds.refresh_token.read().await.clone();
+        if refresh.is_empty() {
+            bail!("缺少 refresh_token，请打开 Web 页扫码授权");
+        }
         let mut last_err = None;
         for attempt in 1..=3 {
-            match self.refresh_token_once(client).await {
+            match self.refresh_token_once(client, &refresh).await {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     warn!(attempt, error = %err, "刷新 token 失败");
@@ -821,22 +837,30 @@ impl OpenClient {
         Err(last_err.unwrap_or_else(|| anyhow!("刷新 token 失败")))
     }
 
-    async fn refresh_token_once(&self, client: &ClientWithMiddleware) -> Result<()> {
-        let refresh = self.creds.refresh_token.read().await.clone();
-        if self.creds.use_online_api && !self.creds.renew_api_url.is_empty() {
-            match self.refresh_via_online(client, &refresh).await {
-                Ok((new_refresh, new_access)) => {
-                    self.apply_tokens(new_access, new_refresh).await?;
-                    return Ok(());
-                }
-                Err(err) => {
-                    warn!(error = %err, "在线刷新失败，尝试飞牛本地刷新");
+    async fn refresh_token_once(
+        &self,
+        client: &ClientWithMiddleware,
+        refresh: &str,
+    ) -> Result<()> {
+        match self.refresh_via_online(client, refresh).await {
+            Ok((new_refresh, new_access)) => {
+                self.apply_tokens(new_access, new_refresh).await?;
+                return Ok(());
+            }
+            Err(err) => {
+                warn!(error = %err, "在线 renew API 失败，尝试飞牛本地刷新");
+                // 保留在线错误，飞牛也失败时一并带回
+                match self.refresh_via_fnnas(client, refresh).await {
+                    Ok((new_refresh, new_access)) => {
+                        self.apply_tokens(new_access, new_refresh).await?;
+                        Ok(())
+                    }
+                    Err(fnnas_err) => Err(anyhow!(
+                        "刷新失败：在线 renew API（{DEFAULT_RENEW_API}）→ {err}；飞牛本地刷新 → {fnnas_err}"
+                    )),
                 }
             }
         }
-        let (new_refresh, new_access) = self.refresh_via_fnnas(client, &refresh).await?;
-        self.apply_tokens(new_access, new_refresh).await?;
-        Ok(())
     }
 
     async fn refresh_via_online(
@@ -845,21 +869,34 @@ impl OpenClient {
         refresh: &str,
     ) -> Result<(String, String)> {
         let res = client
-            .get(&self.creds.renew_api_url)
+            .get(DEFAULT_RENEW_API)
             .query(&[
                 ("refresh_ui", refresh),
                 ("server_use", "true"),
                 ("driver_txt", "quarkyun_oa"),
             ])
+            .timeout(Duration::from_secs(20))
             .send()
-            .await?
-            .error_for_status()?;
-        let body: OnlineRenewResp = res.json().await?;
+            .await
+            .map_err(|e| {
+                if e.is_timeout() || e.is_connect() {
+                    anyhow!("无法访问 renew API（网络超时/连接失败）: {e}")
+                } else {
+                    anyhow!("请求 renew API 失败: {e}")
+                }
+            })?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("renew API 返回 HTTP {status}: {text}");
+        }
+        let body: OnlineRenewResp = serde_json::from_str(&text)
+            .map_err(|e| anyhow!("renew API 响应无法解析: {e}; body={text}"))?;
         if body.refresh_token.is_empty() || body.access_token.is_empty() {
             if !body.text.is_empty() {
-                bail!("在线刷新失败: {}", body.text);
+                bail!("renew API 拒绝刷新（令牌可能已失效）: {}", body.text);
             }
-            bail!("在线刷新返回空 token，请检查 refresh_token");
+            bail!("renew API 返回空 token，请重新扫码授权");
         }
         Ok((body.refresh_token, body.access_token))
     }
@@ -877,21 +914,79 @@ impl OpenClient {
         let res = client
             .post(FNNAS_REFRESH_URL)
             .json(&body)
+            .timeout(Duration::from_secs(20))
             .send()
-            .await?
-            .error_for_status()?;
-        let parsed: FnnasResp<FnnasRefreshData> = res.json().await?;
+            .await
+            .map_err(|e| {
+                if e.is_timeout() || e.is_connect() {
+                    anyhow!("无法访问飞牛刷新接口（网络超时/连接失败）: {e}")
+                } else {
+                    anyhow!("请求飞牛刷新接口失败: {e}")
+                }
+            })?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("飞牛刷新 HTTP {status}: {text}");
+        }
+        let parsed: FnnasResp<FnnasRefreshData> = serde_json::from_str(&text)
+            .map_err(|e| anyhow!("飞牛刷新响应无法解析: {e}; body={text}"))?;
         if parsed.code != 0 {
-            bail!("飞牛刷新失败: {}", parsed.msg);
+            bail!("飞牛刷新失败（令牌可能已失效）: {}", parsed.msg);
         }
         let info = parsed
             .data
             .ok_or_else(|| anyhow!("飞牛刷新无 data"))?
             .token_info;
         if info.access_token.is_empty() || info.refresh_token.is_empty() {
-            bail!("飞牛刷新返回空 token");
+            bail!("飞牛刷新返回空 token，请重新扫码授权");
         }
         Ok((info.refresh_token, info.access_token))
+    }
+
+    /// 用扫码得到的 nonce 换 token 并落盘。
+    pub async fn complete_login_with_nonce(
+        &self,
+        client: &ClientWithMiddleware,
+        nonce: &str,
+    ) -> Result<()> {
+        let (access, refresh, _, _) = exchange_token_by_nonce(client, nonce).await?;
+        self.apply_tokens(access, refresh).await?;
+        // 登录后立刻拉 user_id，供后续上传 proof。
+        let mut resp: UserInfoResp = self
+            .request(client, "/open/v1/user/info", "GET", None, None)
+            .await?;
+        if !resp.data.user_id.is_empty() {
+            *self.creds.user_id.write().await = std::mem::take(&mut resp.data.user_id);
+        }
+        Ok(())
+    }
+
+    /// 探测当前 access/refresh 是否可用。
+    pub async fn check_auth(&self, client: &ClientWithMiddleware) -> Result<bool> {
+        if !self.creds.has_refresh_token().await
+            && self.creds.access_token.read().await.is_empty()
+        {
+            return Ok(false);
+        }
+        match self
+            .request::<UserInfoResp>(client, "/open/v1/user/info", "GET", None, None)
+            .await
+        {
+            Ok(resp) => Ok(!resp.data.user_id.is_empty()),
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("缺少 refresh_token")
+                    || msg.contains("令牌")
+                    || msg.contains("token")
+                    || msg.contains("access_token")
+                {
+                    Ok(false)
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     async fn apply_tokens(&self, access: String, refresh: String) -> Result<()> {
