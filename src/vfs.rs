@@ -213,6 +213,15 @@ impl QuarkDriveFileSystem {
         }
     }
 
+    fn parent_cache_key(parent: &Path) -> String {
+        let s = parent.to_string_lossy();
+        if s.is_empty() {
+            "/".to_string()
+        } else {
+            s.into_owned()
+        }
+    }
+
     fn list_uploading_files(&self, parent_file_path: &str) -> Vec<QuarkFile> {
         self.uploading
             .get(parent_file_path)
@@ -228,9 +237,66 @@ impl QuarkDriveFileSystem {
         }
     }
 
+    /// CloudSync 等客户端 PUT 后立刻 PROPFIND：上传过程中必须能查到条目与正确 size。
+    fn update_uploading_file(&self, parent_file_path: &str, file_name: &str, size: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if let Some(mut files) = self.uploading.get_mut(parent_file_path) {
+            if let Some(f) = files.iter_mut().find(|x| x.file_name == file_name) {
+                f.size = size;
+                f.updated_at = now;
+            }
+        }
+    }
+
+    /// 上传完成后等到父目录列表能看见该文件，再摘掉 uploading 占位。
+    /// 否则 CloudSync 会报「未找到远程文件」。
+    async fn wait_until_remote_visible(
+        &self,
+        parent_dir: &Path,
+        file_name: &str,
+        size: u64,
+        parent_key: &str,
+    ) {
+        self.update_uploading_file(parent_key, file_name, size);
+        self.dir_cache.invalidate(parent_dir).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut delay = std::time::Duration::from_millis(300);
+        let key = Self::parent_cache_key(parent_dir);
+
+        loop {
+            if let Some(files) = self.dir_cache.get_or_insert(&key).await {
+                if files.iter().any(|f| f.file_name == file_name) {
+                    debug!(
+                        parent = %parent_dir.display(),
+                        file_name = %file_name,
+                        "upload visible in remote listing"
+                    );
+                    self.remove_uploading_file(parent_key, file_name);
+                    return;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    parent = %parent_dir.display(),
+                    file_name = %file_name,
+                    "remote listing still missing file after upload; keep uploading stub for PROPFIND"
+                );
+                // 不 remove：占位继续支撑后续 PROPFIND，避免 CloudSync 报未找到远程文件。
+                return;
+            }
+            self.dir_cache.invalidate(parent_dir).await;
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(2));
+        }
+    }
+
     async fn find_in_cache(&self, path: &Path) -> Result<Option<QuarkFile>, FsError> {
         if let Some(parent) = path.parent() {
-            let parent_str = parent.to_string_lossy();
+            let parent_str = Self::parent_cache_key(parent);
             let file_name = path
                 .file_name()
                 .ok_or(FsError::NotFound)?
@@ -252,14 +318,26 @@ impl QuarkDriveFileSystem {
     }
 
     async fn get_file(&self, path: PathBuf) -> Result<Option<QuarkFile>, FsError> {
-        let file = self.find_in_cache(&path).await?;
-        if let Some(file) = file {
+        if let Some(file) = self.find_in_cache(&path).await? {
             trace!(path = %path.display(), file_id = %file.fid, "file found in cache");
-            Ok(Some(file))
-        } else {
-            // find in drive
-            Ok(None)
+            return Ok(Some(file));
         }
+        // 上传中 / 刚传完尚未进列表：用 uploading 占位，供 CloudSync PROPFIND。
+        if let Some(parent) = path.parent() {
+            let parent_key = Self::parent_cache_key(parent);
+            let want = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if let Some(f) = self
+                .list_uploading_files(&parent_key)
+                .into_iter()
+                .find(|f| f.file_name == want)
+            {
+                return Ok(Some(f));
+            }
+        }
+        Ok(None)
     }
 
 
@@ -375,7 +453,8 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     parent_path: Some(parent_path.to_string_lossy().into_owned()),
                 };
 
-                let mut uploading = self.uploading.entry(parent_path.to_str().unwrap().to_string()).or_default();
+                let parent_key = Self::parent_cache_key(parent_path);
+                let mut uploading = self.uploading.entry(parent_key).or_default();
                 uploading.push(file.clone());
                 QuarkDavFile::new(
                     self.clone(),
@@ -405,22 +484,26 @@ impl DavFileSystem for QuarkDriveFileSystem {
         let path = self.normalize_dav_path(path);
         debug!(path = %path.display(), "fs: read_dir");
         async move {
-            let files = self.dir_cache.get_or_insert(&path.to_string_lossy())
+            let key = Self::parent_cache_key(&path);
+            let mut files = self
+                .dir_cache
+                .get_or_insert(&key)
                 .await
-                .ok_or(FsError::NotFound)
-                .and_then(|files| {
-                    Ok(files)
-                })?;
+                .ok_or(FsError::NotFound)?;
 
-            // 创建包含结果的向量
-            let mut v: Vec<Result<Box<dyn DavDirEntry>, FsError>> = Vec::with_capacity(files.len());
-
-            // 将每个文件转换为 trait 对象
-            for file in files {
-                v.push(Ok(Box::new(file))); // 现在类型匹配了
+            // 合并正在上传的占位，避免 CloudSync 列目录时看不到刚 PUT 的文件。
+            for up in self.list_uploading_files(&key) {
+                if !files.iter().any(|f| f.file_name == up.file_name) {
+                    files.push(up);
+                }
             }
 
-            // 创建流并装箱
+            let mut v: Vec<Result<Box<dyn DavDirEntry>, FsError>> =
+                Vec::with_capacity(files.len());
+            for file in files {
+                v.push(Ok(Box::new(file)));
+            }
+
             let stream = futures_util::stream::iter(v);
             Ok(Box::pin(stream) as FsStream<Box<dyn DavDirEntry>>)
         }
@@ -443,22 +526,11 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 return Ok(Box::new(root_file) as Box<dyn DavMetaData>);
             }
 
-            // if not found in cache, get from uploading files: self.fs.uploading
-            let mut file = self.get_file(path.clone()).await.unwrap_or_else(|_| Option::None);
-            if file.is_none() {
-                let parent_path = path.parent().ok_or(FsError::NotFound)?;
-                let want = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                file = self
-                    .list_uploading_files(parent_path.to_str().unwrap_or_default())
-                    .into_iter()
-                    .find(|f| f.file_name == want);
-            };
-
-            let file = file.ok_or(FsError::NotFound)?;
-
+            let file = self
+                .get_file(path.clone())
+                .await
+                .unwrap_or(None)
+                .ok_or(FsError::NotFound)?;
             Ok(Box::new(file) as Box<dyn DavMetaData>)
         }
             .boxed()
@@ -944,6 +1016,10 @@ impl QuarkDavFile {
 
     async fn do_flush(&mut self) -> Result<(), FsError> {
         let size = self.upload_state.size;
+        if let Some(ref parent) = self.file.parent_path {
+            self.fs
+                .update_uploading_file(parent, &self.file.file_name, size);
+        }
 
         // Compute final SHA-1 and MD5 (all data has been written)
         let sha1 = format!("{:x}", self.sha1_ctx.clone().finalize());
@@ -984,7 +1060,7 @@ impl QuarkDavFile {
             if skip {
                 self.upload_state.is_finished = true;
                 self.log_upload_result(size, "skip").await;
-                self.after_flush().await?;
+                self.after_flush(true).await?;
                 return Ok(());
             }
             // 内容不同：先删旧文件再上传（不用 OpenList same_path_reuse）。
@@ -1024,7 +1100,7 @@ impl QuarkDavFile {
             // 秒传
             self.upload_state.is_finished = true;
             self.log_upload_result(size, "ok:rapid").await;
-            self.after_flush().await?;
+            self.after_flush(true).await?;
             return Ok(());
         }
         self.upload_state.auth_info = res.data.auth_info;
@@ -1067,7 +1143,7 @@ impl QuarkDavFile {
         if res.data.finish {
             self.upload_state.is_finished = true;
             self.log_upload_result(size, "ok:rapid").await;
-            self.after_flush().await?;
+            self.after_flush(true).await?;
             return Ok(());
         }
         // Spawn upload task so it won't be cancelled if client disconnects.
@@ -1196,18 +1272,24 @@ impl QuarkDavFile {
             if !temp_path.is_empty() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
-            fs.remove_uploading_file(&parent_path, &file_name);
 
             match result {
                 Ok(_) => {
                     fs.oplog
                         .log_upload(&log_path, log_size, log_mode, "ok")
                         .await;
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    fs.dir_cache.invalidate(parent_dir.as_path()).await;
+                    // 等夸克列表可见后再摘占位，避免 CloudSync PUT 后 PROPFIND 404。
+                    fs.wait_until_remote_visible(
+                        parent_dir.as_path(),
+                        &file_name,
+                        log_size,
+                        &parent_path,
+                    )
+                    .await;
                     Ok::<(), FsError>(())
                 }
                 Err(err) => {
+                    fs.remove_uploading_file(&parent_path, &file_name);
                     fs.oplog
                         .log_upload(&log_path, log_size, log_mode, "error")
                         .await;
@@ -1232,7 +1314,7 @@ impl QuarkDavFile {
                     })??;
                 }
                 Err(_) => {
-                    // Timeout reached, upload continues in background
+                    // Timeout reached, upload continues in background；占位仍在 uploading。
                     info!(file_name = %self.file.file_name, timeout_secs = upload_wait_timeout,
                           "upload still in progress, returning early to avoid client timeout");
                 }
@@ -1245,6 +1327,7 @@ impl QuarkDavFile {
             })??;
         }
 
+        self.upload_state.is_finished = true;
         self.upload_state = UploadState::default();
         Ok(())
     }
@@ -1316,18 +1399,23 @@ impl QuarkDavFile {
             if !temp_path.is_empty() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
-            fs.remove_uploading_file(&parent_path, &file_name);
             match result {
                 Ok(()) => {
                     fs.oplog
                         .log_upload(&log_path, size, log_mode, "ok")
                         .await;
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    fs.dir_cache.invalidate(parent_dir.as_path()).await;
+                    fs.wait_until_remote_visible(
+                        parent_dir.as_path(),
+                        &file_name,
+                        size,
+                        &parent_path,
+                    )
+                    .await;
                     Ok::<(), FsError>(())
                 }
                 Err(err) => {
                     error!(file_name = %file_name, error = %err, "open upload failed");
+                    fs.remove_uploading_file(&parent_path, &file_name);
                     fs.oplog
                         .log_upload(&log_path, size, log_mode, &format!("error:{err:#}"))
                         .await;
@@ -1362,6 +1450,7 @@ impl QuarkDavFile {
             })??;
         }
 
+        self.upload_state.is_finished = true;
         self.upload_state = UploadState::default();
         Ok(())
     }
@@ -1378,7 +1467,7 @@ impl QuarkDavFile {
                     debug!(file_name = %self.file.file_name,
                            "skip uploading: empty file content hash unchanged");
                     self.upload_state.is_finished = true;
-                    self.after_flush().await?;
+                    self.after_flush(true).await?;
                     return Ok(());
                 }
                 Ok(_) => {}
@@ -1416,7 +1505,7 @@ impl QuarkDavFile {
         if res.data.finish {
             // 秒传
             self.upload_state.is_finished = true;
-            self.after_flush().await?;
+            self.after_flush(true).await?;
             return Ok(());
         }
         self.upload_state.auth_info = res.data.auth_info;
@@ -1455,7 +1544,7 @@ impl QuarkDavFile {
         })?;
         if res.data.finish {
             self.upload_state.is_finished = true;
-            self.after_flush().await?;
+            self.after_flush(true).await?;
             return Ok(());
         }
         // 空文件优先走内存源，避免额外落盘。
@@ -1465,7 +1554,7 @@ impl QuarkDavFile {
         self.upload_state.temp_file_path.clear();
         self.upload_chunk().await?;
         self.log_upload_result(0, "ok").await;
-        self.after_flush().await?;
+        self.after_flush(true).await?;
 
         Ok(())
     }
@@ -1632,15 +1721,33 @@ impl QuarkDavFile {
         Ok(())
     }
 
-    async fn after_flush(&mut self) -> Result<(), FsError> {
+    /// `ok=true`：等远程列表可见（CloudSync PUT 后立刻 PROPFIND）。
+    /// `ok=false`：失败清理，尽快摘掉 uploading 占位。
+    async fn after_flush(&mut self, ok: bool) -> Result<(), FsError> {
         self.delete_temp_file().await?;
         self.release_upload_memory();
-        let parent_path = self.file.parent_path.as_ref().unwrap().as_str();
-        self.fs.remove_uploading_file(parent_path, &self.file.file_name);
+        let parent_path = self.file.parent_path.as_ref().unwrap().clone();
+        if ok {
+            let size = if self.upload_state.size > 0 {
+                self.upload_state.size
+            } else {
+                self.file.size
+            };
+            self.fs
+                .wait_until_remote_visible(
+                    self.parent_dir.as_path(),
+                    &self.file.file_name,
+                    size,
+                    &parent_path,
+                )
+                .await;
+        } else {
+            self.fs
+                .remove_uploading_file(&parent_path, &self.file.file_name);
+            self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
+        }
+        self.upload_state.is_finished = true;
         self.upload_state = UploadState::default();
-        // sleep 1s for quark server to update cache
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
         Ok(())
     }
 
@@ -1870,7 +1977,7 @@ impl DavFile for QuarkDavFile {
                 let res = self.upload_mini_byte_file().await;
                 if let Err(err) = res {
                     error!(file_id = %self.file.fid, file_name = %self.file.file_name, error = %err, "empty flush failed");
-                    self.after_flush().await?;
+                    self.after_flush(false).await?;
                     return Err(err);
                 }
                 return Ok(());
@@ -1879,7 +1986,7 @@ impl DavFile for QuarkDavFile {
             let res = self.do_flush().await;
             if let Err(err) = res {
                 error!(file_id = %self.file.fid, file_name = %self.file.file_name, error = %err, "file: flush failed");
-                self.after_flush().await?;
+                self.after_flush(false).await?;
                 return Err(err);
             }
             Ok(())
