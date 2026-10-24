@@ -126,6 +126,8 @@ pub struct QuarkDriveFileSystem {
     oplog: Arc<OpLog>,
     /// Web 控制台上传进度（与 CloudSync uploading stub 独立）。
     upload_tracker: UploadTracker,
+    /// 正在向网盘上传的路径集合：防止 upload_wait_timeout 提前返回后客户端重 PUT 再开一条 OSS。
+    upload_inflight: Arc<DashMap<String, ()>>,
 }
 
 impl QuarkDriveFileSystem {
@@ -160,7 +162,23 @@ impl QuarkDriveFileSystem {
             upload_wait_timeout: 0,
             oplog: Arc::new(OpLog::new("./logs", 7)),
             upload_tracker: UploadTracker::new(),
+            upload_inflight: Arc::new(DashMap::new()),
         })
+    }
+
+    /// 尝试登记「此路径正在上传」；已有则返回 None（调用方应跳过重复 flush）。
+    fn try_begin_upload(&self, path: &str) -> Option<UploadInflightGuard> {
+        use dashmap::mapref::entry::Entry;
+        match self.upload_inflight.entry(path.to_string()) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(v) => {
+                v.insert(());
+                Some(UploadInflightGuard {
+                    map: self.upload_inflight.clone(),
+                    path: path.to_string(),
+                })
+            }
+        }
     }
 
     /// 供 Web 页读取上传进度。
@@ -1054,6 +1072,16 @@ impl QuarkDavFile {
         )
     }
 
+    /// 丢弃客户端重试 PUT 产生的本地副本，并让本次 flush 成功返回（后台仍在传）。
+    async fn abandon_duplicate_retry_upload(&mut self) -> Result<(), FsError> {
+        self.upload_state.handed_off = false;
+        self.delete_temp_file().await?;
+        self.release_upload_memory();
+        self.upload_state.is_finished = true;
+        self.upload_state = UploadState::default();
+        Ok(())
+    }
+
     async fn log_upload_result(&self, size: u64, result: &str) {
         let path = self.upload_log_path();
         let status = if result.starts_with("error") {
@@ -1141,6 +1169,17 @@ impl QuarkDavFile {
             return self.upload_mini_byte_file().await;
         }
 
+        // 须在 up_pre 之前占坑：超时提前返回后客户端重 PUT 不得再开一条 multipart。
+        let log_path = self.upload_log_path();
+        let Some(inflight_guard) = self.fs.try_begin_upload(&log_path) else {
+            info!(
+                path = %log_path,
+                file_name = %self.file.file_name,
+                "skip duplicate cookie upload: already in flight"
+            );
+            return self.abandon_duplicate_retry_upload().await;
+        };
+
         // up_pre
         let res = self
             .fs
@@ -1217,7 +1256,6 @@ impl QuarkDavFile {
         let parent_path = self.file.parent_path.as_ref().unwrap().clone();
         let parent_dir = self.parent_dir.clone();
         let fs = self.fs.clone();
-        let log_path = self.upload_log_path();
         let log_size = size;
         let log_mode = self.fs.drive_mode();
         // 后台任务拥有临时文件生命周期；避免客户端断连时 Drop 删掉还在读的文件。
@@ -1227,6 +1265,8 @@ impl QuarkDavFile {
         let progress_path = log_path.clone();
 
         let handle = tokio::spawn(async move {
+            // 与后台任务同寿：提前返回给客户端后仍占坑，直到 OSS 传完。
+            let _inflight_guard = inflight_guard;
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
             // 大文件 FIFO 快车道：队首全速，其余限速慢传且不可插队。
             let smart = crate::upload_schedule::join(size).await;
@@ -1409,6 +1449,17 @@ impl QuarkDavFile {
 
     /// Open 模式上传：内容已在内存或临时文件，整段交给 drive。
     async fn do_flush_open(&mut self, md5: &str, sha1: &str, size: u64) -> Result<(), FsError> {
+        let log_path = self.upload_log_path();
+        // 与 Cookie 路径相同：提前返回后客户端重试时勿再开一条 Open 上传。
+        let Some(inflight_guard) = self.fs.try_begin_upload(&log_path) else {
+            info!(
+                path = %log_path,
+                file_name = %self.file.file_name,
+                "skip duplicate open upload: already in flight"
+            );
+            return self.abandon_duplicate_retry_upload().await;
+        };
+
         // 空上传且既无内存也无文件时，用空内存源即可。
         if size == 0 && self.upload_state.use_memory && self.upload_state.memory_data.is_empty() {
             // keep empty memory source
@@ -1453,7 +1504,6 @@ impl QuarkDavFile {
         let temp_path = self.upload_state.temp_file_path.clone();
         let md5 = md5.to_string();
         let sha1 = sha1.to_string();
-        let log_path = self.upload_log_path();
         let log_mode = self.fs.drive_mode();
         // 后台任务拥有临时文件生命周期；避免客户端断连时 Drop 删掉还在读的文件。
         self.upload_state.handed_off = true;
@@ -1462,6 +1512,7 @@ impl QuarkDavFile {
         let progress_path = log_path.clone();
 
         let handle = tokio::spawn(async move {
+            let _inflight_guard = inflight_guard;
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
             let smart = crate::upload_schedule::join(size).await;
             tracker.set_lane(&progress_path, smart.lane().as_str());
@@ -2131,6 +2182,18 @@ struct UploadMemoryGuard {
 impl Drop for UploadMemoryGuard {
     fn drop(&mut self) {
         self.pool.release(self.reserved);
+    }
+}
+
+/// 路径级上传互斥：任务结束（成功/失败/提前 return）时自动摘掉，允许合法重试。
+struct UploadInflightGuard {
+    map: Arc<DashMap<String, ()>>,
+    path: String,
+}
+
+impl Drop for UploadInflightGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.path);
     }
 }
 
