@@ -109,6 +109,7 @@ services:
       - WEBDAV_AUTH_USER=admin
       - WEBDAV_AUTH_PASSWORD=admin
       - CHUNK_CACHE_MB=128
+      - UPLOAD_MEMORY_LIMIT=67108864
 ```
 
 镜像由 `.github/workflows/docker.yml` 自动构建：
@@ -136,6 +137,7 @@ GHCR 私有包需先登录：`echo $GITHUB_TOKEN | docker login ghcr.io -u USERN
 | `--quark-use-online-api` / `QUARK_USE_ONLINE_API` | 用在线 API 刷新 token | `true` |
 | `--quark-renew-api` / `QUARK_RENEW_API` | 在线刷新地址 | `https://api.oplist.org/quarkyun/renewapi` |
 | `--chunk-cache-mb` / `CHUNK_CACHE_MB` | 预取块缓存（MB），`0` 关闭 | `128` |
+| `--upload-memory-limit` / `UPLOAD_MEMORY_LIMIT` | 上传内存上限（字节，并行合计）；未超限不写临时文件，`0`=始终落盘 | `67108864`（64MiB） |
 | `-U` / `WEBDAV_AUTH_USER` | WebDAV 用户名 | — |
 | `-W` / `WEBDAV_AUTH_PASSWORD` | WebDAV 密码 | — |
 | `-p` / `PORT` | 监听端口 | `8080` |

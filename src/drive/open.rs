@@ -540,7 +540,7 @@ impl OpenClient {
     }
 
     /// Open 上传全流程：pre（含 proof）→ 分片 URL → PUT → finish。
-    /// 与 Cookie 模式接口不同，由 VFS 在 Open 模式下整段调用，避免硬套旧分片鉴权。
+    /// `source` 可为内存字节或临时文件，避免小文件强制落盘。
     pub async fn upload_file(
         &self,
         client: &ClientWithMiddleware,
@@ -549,13 +549,13 @@ impl OpenClient {
         pdir_fid: &str,
         md5: &str,
         sha1: &str,
-        temp_path: &Path,
+        source: &UploadSource,
     ) -> Result<()> {
         let pathname = "/open/v1/file/upload_pre";
         let (tm, x_pan_token, req_id) =
             generate_req_sign("POST", pathname, &self.creds.sign_key);
         let (proof_version, proof_seed1, proof_seed2, proof_code1, proof_code2) = self
-            .generate_proof(temp_path, size, &x_pan_token)
+            .generate_proof(source, size, &x_pan_token)
             .await?;
 
         let now_ms = SystemTime::now()
@@ -614,15 +614,13 @@ impl OpenClient {
             .await?;
 
         let mut etags = Vec::with_capacity(up_urls.data.upload_urls.len());
-        let mut file = tokio::fs::File::open(temp_path).await.with_context(|| {
-            format!("打开临时文件失败: {}", temp_path.display())
-        })?;
         for (i, item) in up_urls.data.upload_urls.iter().enumerate() {
             let offset = i as u64 * part_size;
             let this_size = std::cmp::min(part_size, size.saturating_sub(offset));
-            let mut buf = vec![0u8; this_size as usize];
-            file.seek(std::io::SeekFrom::Start(offset)).await?;
-            file.read_exact(&mut buf).await?;
+            let buf = source
+                .read_at(offset, this_size as usize)
+                .await
+                .with_context(|| format!("读取上传分片 {} 失败", i + 1))?;
             let etag = self
                 .upload_part(client, item, &up_urls.data.common_headers, buf)
                 .await
@@ -908,16 +906,54 @@ impl OpenClient {
 
     async fn generate_proof(
         &self,
-        path: &Path,
+        source: &UploadSource,
         file_size: u64,
         x_pan_token: &str,
     ) -> Result<(String, String, String, String, String)> {
         let user_id = self.creds.user_id.read().await.clone();
         let seed1 = md5_hex(&(user_id + x_pan_token));
         let seed2 = md5_hex(&file_size.to_string());
-        let code1 = read_proof_code(path, &seed1, file_size).await?;
-        let code2 = read_proof_code(path, &seed2, file_size).await?;
+        let code1 = read_proof_code(source, &seed1, file_size).await?;
+        let code2 = read_proof_code(source, &seed2, file_size).await?;
         Ok(("v1".to_string(), seed1, seed2, code1, code2))
+    }
+}
+
+/// 上传内容来源：内存或临时文件（由 VFS 按内存池决定）。
+#[derive(Debug, Clone)]
+pub enum UploadSource {
+    Memory(bytes::Bytes),
+    Path(std::path::PathBuf),
+}
+
+impl UploadSource {
+    /// 按偏移读取一段，供 proof / 分片上传复用。
+    async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        match self {
+            UploadSource::Memory(data) => {
+                let start = offset as usize;
+                let end = start.saturating_add(len);
+                if end > data.len() {
+                    bail!(
+                        "内存上传越界: offset={offset}, len={len}, size={}",
+                        data.len()
+                    );
+                }
+                Ok(data[start..end].to_vec())
+            }
+            UploadSource::Path(path) => {
+                let mut file = tokio::fs::File::open(path)
+                    .await
+                    .with_context(|| format!("打开临时文件失败: {}", path.display()))?;
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+                let mut buf = vec![0u8; len];
+                file.read_exact(&mut buf).await?;
+                Ok(buf)
+            }
+        }
     }
 }
 
@@ -1001,20 +1037,17 @@ fn build_part_info(total: u64, part_size: u64) -> Vec<serde_json::Value> {
     parts
 }
 
-async fn read_proof_code(path: &Path, proof_seed: &str, file_size: u64) -> Result<String> {
+async fn read_proof_code(
+    source: &UploadSource,
+    proof_seed: &str,
+    file_size: u64,
+) -> Result<String> {
     let (start, end) = proof_range(proof_seed, file_size)?;
     let length = end.saturating_sub(start);
-    if length == 0 {
+    if length == 0 || file_size == 0 {
         return Ok(String::new());
     }
-    // 空文件上传时可能还没有 temp 文件，按空 proof 处理。
-    if file_size == 0 || !path.exists() {
-        return Ok(String::new());
-    }
-    let mut file = tokio::fs::File::open(path).await?;
-    file.seek(std::io::SeekFrom::Start(start)).await?;
-    let mut buf = vec![0u8; length as usize];
-    file.read_exact(&mut buf).await?;
+    let buf = source.read_at(start, length as usize).await?;
     Ok(general_purpose::STANDARD.encode(buf))
 }
 

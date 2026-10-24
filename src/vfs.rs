@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Formatter};
 use std::io::{SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +19,7 @@ use futures_util::future::{ready, FutureExt};
 use tracing::{debug, error, info, trace, warn};
 use crate::{
     cache::Cache,
-    drive::{QuarkDrive, QuarkFile},
+    drive::{QuarkDrive, QuarkFile, UploadSource},
 };
 use bytes::BufMut;
 
@@ -27,10 +28,81 @@ use sha1::Sha1;
 use tokio::io::AsyncWriteExt;
 
 use sha1::Digest;
-use tokio::fs::File;
 
 use crate::drive::model::{Callback, UpAuthAndCommitRequest, UpPartMethodRequest};
-use tokio::io::AsyncReadExt;
+
+/// 并行上传共用的内存预算：多文件占用合计，超限则新写入改走临时文件。
+#[derive(Debug)]
+pub struct UploadMemoryPool {
+    limit: AtomicU64,
+    used: AtomicU64,
+}
+
+impl UploadMemoryPool {
+    /// `limit == 0` 表示禁止内存上传（始终落盘）。
+    fn new(limit: u64) -> Self {
+        Self {
+            limit: AtomicU64::new(limit),
+            used: AtomicU64::new(0),
+        }
+    }
+
+    fn limit(&self) -> u64 {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// 尝试再占 `bytes`；成功返回 true。CAS 保证并行上传合计不超限。
+    fn try_reserve(&self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let limit = self.limit();
+        if limit == 0 {
+            return false;
+        }
+        loop {
+            let used = self.used.load(Ordering::Acquire);
+            let Some(new_used) = used.checked_add(bytes) else {
+                return false;
+            };
+            if new_used > limit {
+                return false;
+            }
+            if self
+                .used
+                .compare_exchange(used, new_used, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        loop {
+            let used = self.used.load(Ordering::Acquire);
+            let new_used = used.saturating_sub(bytes);
+            if self
+                .used
+                .compare_exchange(used, new_used, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn set_limit(&self, limit: u64) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone)]
 pub struct QuarkDriveFileSystem {
@@ -38,6 +110,8 @@ pub struct QuarkDriveFileSystem {
     pub(crate) dir_cache: Cache,
     /// 已拉回的分块，按 (fid, 块号) 共享。挂文件系统层，避免随 DavFile 句柄丢弃。
     pub(crate) chunk_cache: crate::prefetch::ChunkCache,
+    /// 上传内存池：并行上传共享配额。
+    upload_memory: Arc<UploadMemoryPool>,
     uploading: Arc<DashMap<String, Vec<QuarkFile>>>,
     pub(crate) root: PathBuf,
     no_trash: bool,
@@ -62,6 +136,8 @@ impl QuarkDriveFileSystem {
             drive,
             dir_cache,
             chunk_cache: crate::prefetch::new_chunk_cache(crate::prefetch::DEFAULT_CACHE_BYTES),
+            // 默认 64MiB：小文件走内存，并行合计超限再落盘。
+            upload_memory: Arc::new(UploadMemoryPool::new(64 * 1024 * 1024)),
             uploading: Arc::new(DashMap::new()),
             root,
             no_trash: false,
@@ -76,6 +152,12 @@ impl QuarkDriveFileSystem {
     /// 分块预取缓存上限（字节）。0 = 关闭缓存。用 setter 避免改动 `new` 公开签名。
     pub fn set_chunk_cache_bytes(&mut self, bytes: u64) -> &mut Self {
         self.chunk_cache = crate::prefetch::new_chunk_cache(bytes);
+        self
+    }
+
+    /// 上传内存上限（字节，全进程并行合计）。0 = 始终写临时文件。
+    pub fn set_upload_memory_limit(&mut self, bytes: u64) -> &mut Self {
+        self.upload_memory.set_limit(bytes);
         self
     }
 
@@ -609,6 +691,11 @@ struct UploadState {
     sha1: Option<String>,
     task_id: String,
     temp_file_path: String,
+    /// true：内容在 memory_data；false：已落盘到 temp_file_path。
+    use_memory: bool,
+    memory_data: BytesMut,
+    /// 已向 UploadMemoryPool 预留的字节，结束/溢出时归还。
+    memory_reserved: u64,
     is_finished: bool,
     bucket: String,
     obj_key: String,
@@ -617,7 +704,6 @@ struct UploadState {
     callback: Option<Callback>,
     is_uploading: bool,
     flush_count: u32,
-
 }
 
 impl Default for UploadState {
@@ -633,6 +719,9 @@ impl Default for UploadState {
             sha1: None,
             task_id: "".to_string(),
             temp_file_path: "".to_string(),
+            use_memory: false,
+            memory_data: BytesMut::new(),
+            memory_reserved: 0,
             is_finished: false,
             bucket: "".to_string(),
             obj_key: "".to_string(),
@@ -708,9 +797,77 @@ impl QuarkDavFile {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis();
-            self.upload_state.temp_file_path = format!("/tmp/{}_{}", timestamp, self.file.file_name);
+            self.upload_state.temp_file_path =
+                format!("/tmp/{}_{}", timestamp, self.file.file_name);
+            // 内存池可用则先走内存；limit=0 或预留失败时仍可稍后在写入时落盘。
+            self.upload_state.use_memory = self.fs.upload_memory.limit() > 0;
         }
         Ok(true)
+    }
+
+    /// 归还本上传占用的内存配额（溢出落盘 / 上传结束 / Drop 时调用）。
+    fn release_upload_memory(&mut self) {
+        let reserved = self.upload_state.memory_reserved;
+        if reserved > 0 {
+            self.fs.upload_memory.release(reserved);
+            self.upload_state.memory_reserved = 0;
+        }
+        self.upload_state.use_memory = false;
+        self.upload_state.memory_data.clear();
+    }
+
+    /// 把已在内存中的数据冲到临时文件，并释放配额。
+    async fn spill_memory_to_temp(&mut self, extra: &[u8]) -> Result<(), FsError> {
+        let temp_path = self.upload_state.temp_file_path.clone();
+        if let Some(parent) = Path::new(&temp_path).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .await
+            .map_err(|e| {
+                error!(file_name = %self.file.file_name, error = %e, path = %temp_path, "spill: create temp failed");
+                FsError::GeneralFailure
+            })?;
+        if !self.upload_state.memory_data.is_empty() {
+            file.write_all(&self.upload_state.memory_data)
+                .await
+                .map_err(|e| {
+                    error!(file_name = %self.file.file_name, error = %e, "spill: write memory failed");
+                    FsError::GeneralFailure
+                })?;
+        }
+        if !extra.is_empty() {
+            file.write_all(extra).await.map_err(|e| {
+                error!(file_name = %self.file.file_name, error = %e, "spill: write extra failed");
+                FsError::GeneralFailure
+            })?;
+        }
+        file.flush().await.map_err(|e| {
+            error!(file_name = %self.file.file_name, error = %e, "spill: flush failed");
+            FsError::GeneralFailure
+        })?;
+        debug!(
+            file_name = %self.file.file_name,
+            reserved = self.upload_state.memory_reserved,
+            used = self.fs.upload_memory.used(),
+            limit = self.fs.upload_memory.limit(),
+            "upload spilled from memory to temp file"
+        );
+        self.release_upload_memory();
+        Ok(())
+    }
+
+    /// 组装当前上传内容来源，供 Cookie / Open 上传读取。
+    fn upload_source(&self) -> UploadSource {
+        if self.upload_state.use_memory {
+            UploadSource::Memory(self.upload_state.memory_data.clone().freeze())
+        } else {
+            UploadSource::Path(PathBuf::from(&self.upload_state.temp_file_path))
+        }
     }
 
     async fn do_flush(&mut self) -> Result<(), FsError> {
@@ -821,20 +978,25 @@ impl QuarkDavFile {
         // If the client disconnects (e.g. timeout), the spawned task continues uploading.
         let drive = self.fs.drive.clone();
         let upload_state = self.upload_state.clone();
+        let source = self.upload_source();
+        let memory_reserved = self.upload_state.memory_reserved;
+        // 配额交由后台任务归还，避免 self 清空时重复 release。
+        self.upload_state.memory_reserved = 0;
+        self.upload_state.use_memory = false;
+        self.upload_state.memory_data.clear();
         let file_name = self.file.file_name.clone();
         let parent_path = self.file.parent_path.as_ref().unwrap().clone();
         let parent_dir = self.parent_dir.clone();
         let fs = self.fs.clone();
 
         let handle = tokio::spawn(async move {
+            let _memory_guard = UploadMemoryGuard {
+                pool: fs.upload_memory.clone(),
+                reserved: memory_reserved,
+            };
             // upload chunks
             let chunk_size = upload_state.chunk_size as usize;
-            let temp_path = &upload_state.temp_file_path;
-            let file = File::open(temp_path).await.map_err(|err| {
-                error!(file_name = %file_name, error = %err, "open temp file failed");
-                FsError::GeneralFailure
-            })?;
-            let mut file = tokio::io::BufReader::new(file);
+            let temp_path = upload_state.temp_file_path.clone();
             let chunk_count = upload_state.chunk_count;
             let mut etags = vec![String::new(); chunk_count as usize];
 
@@ -852,11 +1014,13 @@ impl QuarkDavFile {
                 } else {
                     chunk_size
                 };
-                let mut buf = vec![0u8; bytes_to_read];
-                file.read_exact(&mut buf).await.map_err(|e| {
-                    error!(file_name = %file_name, error = %e, "read temp file failed");
-                    FsError::GeneralFailure
-                })?;
+                let offset = (chunk_idx - 1) * chunk_size as u64;
+                let buf = read_upload_slice(&source, offset, bytes_to_read)
+                    .await
+                    .map_err(|e| {
+                        error!(file_name = %file_name, error = %e, "read upload slice failed");
+                        FsError::GeneralFailure
+                    })?;
                 let now: chrono::DateTime<chrono::Utc> = chrono::Utc::now();
                 let utc_time = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
                 let auth_meta = drive.up_part_auth_meta(mime_type, &utc_time, bucket, obj_key, chunk_idx as u32, upload_id).await.map_err(|err| {
@@ -885,9 +1049,8 @@ impl QuarkDavFile {
                 })?;
                 let etag_from_up_part = res.unwrap();
                 if etag_from_up_part == "finish" {
-                    // cleanup
-                    if tokio::fs::metadata(temp_path).await.is_ok() {
-                        let _ = tokio::fs::remove_file(temp_path).await;
+                    if !temp_path.is_empty() && tokio::fs::metadata(&temp_path).await.is_ok() {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
                     }
                     fs.remove_uploading_file(&parent_path, &file_name);
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -918,9 +1081,8 @@ impl QuarkDavFile {
                 FsError::GeneralFailure
             })?;
 
-            // cleanup
-            if tokio::fs::metadata(temp_path).await.is_ok() {
-                let _ = tokio::fs::remove_file(temp_path).await;
+            if !temp_path.is_empty() && tokio::fs::metadata(&temp_path).await.is_ok() {
+                let _ = tokio::fs::remove_file(&temp_path).await;
             }
             fs.remove_uploading_file(&parent_path, &file_name);
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -963,28 +1125,32 @@ impl QuarkDavFile {
     }
 
 
-    /// Open 模式上传：临时文件已齐，直接走 upload_pre + 分片 + finish。
+    /// Open 模式上传：内容已在内存或临时文件，整段交给 drive。
     async fn do_flush_open(&mut self, md5: &str, sha1: &str, size: u64) -> Result<(), FsError> {
-        let temp_path = self.upload_state.temp_file_path.clone();
-        // 空文件可能尚未落盘，补一个空临时文件供 proof/分片读取。
-        if temp_path.is_empty() || (size == 0 && !std::path::Path::new(&temp_path).exists()) {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            let path = if temp_path.is_empty() {
-                format!("./temp/{}_{}", timestamp, self.file.file_name)
-            } else {
-                temp_path.clone()
-            };
-            if let Some(parent) = std::path::Path::new(&path).parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+        // 空上传且既无内存也无文件时，用空内存源即可。
+        if size == 0 && self.upload_state.use_memory && self.upload_state.memory_data.is_empty() {
+            // keep empty memory source
+        } else if !self.upload_state.use_memory {
+            let temp_path = self.upload_state.temp_file_path.clone();
+            if temp_path.is_empty() || !Path::new(&temp_path).exists() {
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                let path = if temp_path.is_empty() {
+                    format!("/tmp/{}_{}", timestamp, self.file.file_name)
+                } else {
+                    temp_path
+                };
+                if let Some(parent) = Path::new(&path).parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                tokio::fs::write(&path, b"").await.map_err(|e| {
+                    error!(file_name = %self.file.file_name, error = %e, "create empty temp file failed");
+                    FsError::GeneralFailure
+                })?;
+                self.upload_state.temp_file_path = path;
             }
-            tokio::fs::write(&path, b"").await.map_err(|e| {
-                error!(file_name = %self.file.file_name, error = %e, "create empty temp file failed");
-                FsError::GeneralFailure
-            })?;
-            self.upload_state.temp_file_path = path;
         }
 
         let drive = self.fs.drive.clone();
@@ -993,11 +1159,20 @@ impl QuarkDavFile {
         let parent_path = self.file.parent_path.as_ref().unwrap().clone();
         let parent_dir = self.parent_dir.clone();
         let fs = self.fs.clone();
+        let source = self.upload_source();
         let temp_path = self.upload_state.temp_file_path.clone();
+        let memory_reserved = self.upload_state.memory_reserved;
+        self.upload_state.memory_reserved = 0;
+        self.upload_state.use_memory = false;
+        self.upload_state.memory_data.clear();
         let md5 = md5.to_string();
         let sha1 = sha1.to_string();
 
         let handle = tokio::spawn(async move {
+            let _memory_guard = UploadMemoryGuard {
+                pool: fs.upload_memory.clone(),
+                reserved: memory_reserved,
+            };
             drive
                 .upload_open_file(
                     &file_name,
@@ -1005,14 +1180,14 @@ impl QuarkDavFile {
                     &parent_file_id,
                     &md5,
                     &sha1,
-                    std::path::Path::new(&temp_path),
+                    &source,
                 )
                 .await
                 .map_err(|err| {
                     error!(file_name = %file_name, error = %err, "open upload failed");
                     FsError::GeneralFailure
                 })?;
-            if tokio::fs::metadata(&temp_path).await.is_ok() {
+            if !temp_path.is_empty() && tokio::fs::metadata(&temp_path).await.is_ok() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
             fs.remove_uploading_file(&parent_path, &file_name);
@@ -1175,58 +1350,59 @@ impl QuarkDavFile {
 
 
     async fn consume_buf(&mut self) -> Result<(), FsError> {
-        let temp_path = self.upload_state.temp_file_path.clone();
         let mut md5_ctx = self.md5_ctx.clone();
         let mut sha1_ctx = self.sha1_ctx.clone();
         let bytes = self.upload_state.buffer.split().freeze().to_vec();
-        // 写入临时文件
-        self.upload_state.size = self.upload_state.size + bytes.len() as u64;
-        if let Some(parent) = std::path::Path::new(&temp_path).parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                error!("create_dir_all failed: {}, path: {:?}", e, parent);
+        let add = bytes.len() as u64;
+        self.upload_state.size = self.upload_state.size + add;
+
+        if self.upload_state.use_memory {
+            // 并行合计超限则溢出到临时文件。
+            if self.fs.upload_memory.try_reserve(add) {
+                self.upload_state.memory_reserved += add;
+                self.upload_state.memory_data.extend_from_slice(&bytes);
+            } else {
+                self.spill_memory_to_temp(&bytes).await?;
             }
-        }
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(&temp_path)
-            .await
-            .map_err(|e| {
-                error!("failed to open file: {}, {}", temp_path, e);
+        } else {
+            let temp_path = self.upload_state.temp_file_path.clone();
+            if let Some(parent) = Path::new(&temp_path).parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    error!("create_dir_all failed: {}, path: {:?}", e, parent);
+                }
+            }
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(&temp_path)
+                .await
+                .map_err(|e| {
+                    error!("failed to open file: {}, {}", temp_path, e);
+                    FsError::GeneralFailure
+                })?;
+            file.write_all(&bytes).await.map_err(|e| {
+                error!(file_name = %self.file.file_name, error = %e, "write to temp file failed");
                 FsError::GeneralFailure
             })?;
-        file.write_all(&bytes).await.map_err(|e| {
-            error!(file_name = %self.file.file_name, error = %e, "write to temp file failed");
-            FsError::GeneralFailure
-        })?;
-        file.flush().await.map_err(|e| {
-            error!(file_name = %self.file.file_name, error = %e, "flush temp file failed");
-            FsError::GeneralFailure
-        })?;
-        // 更新哈希
+            file.flush().await.map_err(|e| {
+                error!(file_name = %self.file.file_name, error = %e, "flush temp file failed");
+                FsError::GeneralFailure
+            })?;
+        }
+
         md5_ctx.consume(&bytes);
         sha1_ctx.update(&bytes);
-        // 保存回结构体
         self.md5_ctx = md5_ctx;
         self.sha1_ctx = sha1_ctx;
         Ok(())
     }
 
     async fn upload_chunk(&mut self) -> Result<(), FsError> {
-
         let chunk_size = self.upload_state.chunk_size as usize;
-        let temp_path = &self.upload_state.temp_file_path;
-        let file = File::open(temp_path).await.map_err(|err| {
-            error!(file_name = %self.file.file_name, error = %err, "open temp file failed");
-            FsError::GeneralFailure
-        })?;
-        let mut file = tokio::io::BufReader::new(file);
+        let source = self.upload_source();
         let chunk_count = self.upload_state.chunk_count;
-        // 定义一个字符串数组，size = chunk_count
         let mut etags = vec![String::new(); chunk_count as usize];
-        // 分块上传文件,将temp_path目录所在文件,切成chunk_count块，每块大小 chunk_size，分块上传文件到夸克网盘
-        // auth
         let mime_type = &self.upload_state.mime_type;
         let obj_key = &self.upload_state.obj_key;
         let bucket = &self.upload_state.bucket;
@@ -1234,41 +1410,46 @@ impl QuarkDavFile {
         let upload_id = &self.upload_state.upload_id;
         let upload_url = &self.upload_state.upload_url;
 
-        for chunk_idx in 1..= chunk_count {
-
+        for chunk_idx in 1..=chunk_count {
             let bytes_to_read = if chunk_idx == chunk_count {
-                // 最后一块可能小于 chunk_size
-                let remaining_bytes = self.upload_state.size as usize - ((chunk_idx - 1) as usize * chunk_size);
+                let remaining_bytes =
+                    self.upload_state.size as usize - ((chunk_idx - 1) as usize * chunk_size);
                 std::cmp::min(remaining_bytes, chunk_size)
             } else {
                 chunk_size
             };
-            let mut buf = vec![0u8; bytes_to_read]; // 创建指定大小的缓冲区
-            file.read_exact(&mut buf).await.map_err(|e| {
-                error!(file_name = %self.file.file_name, error = %e, "read temp file failed");
-                FsError::GeneralFailure
-            })?;
+            let offset = (chunk_idx - 1) * chunk_size as u64;
+            let buf = read_upload_slice(&source, offset, bytes_to_read)
+                .await
+                .map_err(|e| {
+                    error!(file_name = %self.file.file_name, error = %e, "read upload slice failed");
+                    FsError::GeneralFailure
+                })?;
             let now: chrono::DateTime<chrono::Utc> = chrono::Utc::now();
-            // RFC1123 格式
             let utc_time = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-            let auth_meta = self.fs.drive.up_part_auth_meta(mime_type, &utc_time, bucket, obj_key, chunk_idx as u32, upload_id).await.map_err(|err| {
-                error!(file_name = %self.file.file_name, error = %err, "get upload part auth meta failed");
-                FsError::GeneralFailure
-            })?;
+            let auth_meta = self
+                .fs
+                .drive
+                .up_part_auth_meta(mime_type, &utc_time, bucket, obj_key, chunk_idx as u32, upload_id)
+                .await
+                .map_err(|err| {
+                    error!(file_name = %self.file.file_name, error = %err, "get upload part auth meta failed");
+                    FsError::GeneralFailure
+                })?;
             let auth_info = &self.upload_state.auth_info;
-
-            let auth_res = self.fs.drive.auth(auth_info, &auth_meta, task_id).await.map_err(|err| {
-                error!(file_name = %self.file.file_name, error = %err, "auth upload part failed");
-                FsError::GeneralFailure
-            })?;
-
-
-            let auth_key = auth_res.data.auth_key;
-
+            let auth_res = self
+                .fs
+                .drive
+                .auth(auth_info, &auth_meta, task_id)
+                .await
+                .map_err(|err| {
+                    error!(file_name = %self.file.file_name, error = %err, "auth upload part failed");
+                    FsError::GeneralFailure
+                })?;
             let up_req = UpPartMethodRequest {
-                auth_key: auth_key.clone(),
+                auth_key: auth_res.data.auth_key,
                 mime_type: self.upload_state.mime_type.clone(),
-                utc_time: utc_time.clone(),
+                utc_time,
                 bucket: bucket.clone(),
                 upload_url: upload_url.clone(),
                 obj_key: obj_key.clone(),
@@ -1276,18 +1457,15 @@ impl QuarkDavFile {
                 upload_id: upload_id.to_string(),
                 part_bytes: buf,
             };
-
             let res = self.fs.drive.up_part(up_req).await.map_err(|err| {
                 error!(file_name = %self.file.file_name, error = %err, "upload chunk failed");
                 FsError::GeneralFailure
             })?;
             let etag_from_up_part = res.unwrap();
-            // 检查是否提前完成
             if etag_from_up_part == "finish" {
                 return Ok(());
             }
             etags[(chunk_idx - 1) as usize] = etag_from_up_part;
-            // self.upload_state.chunk += 1;
         }
         let callback = self.upload_state.callback.clone().unwrap();
 
@@ -1328,6 +1506,7 @@ impl QuarkDavFile {
 
     async fn after_flush(&mut self) -> Result<(), FsError> {
         self.delete_temp_file().await?;
+        self.release_upload_memory();
         let parent_path = self.file.parent_path.as_ref().unwrap().as_str();
         self.fs.remove_uploading_file(parent_path, &self.file.file_name);
         self.upload_state = UploadState::default();
@@ -1528,7 +1707,55 @@ impl DavFile for QuarkDavFile {
     }
 }
 
+impl Drop for QuarkDavFile {
+    /// 客户端中断上传时归还内存配额，避免并行额度泄漏。
+    fn drop(&mut self) {
+        self.release_upload_memory();
+    }
+}
 
+/// 后台上传任务结束时自动归还内存池占用。
+struct UploadMemoryGuard {
+    pool: Arc<UploadMemoryPool>,
+    reserved: u64,
+}
+
+impl Drop for UploadMemoryGuard {
+    fn drop(&mut self) {
+        self.pool.release(self.reserved);
+    }
+}
+
+/// 从内存或临时文件按偏移读取一段，供 Cookie 分片上传使用。
+async fn read_upload_slice(
+    source: &UploadSource,
+    offset: u64,
+    len: usize,
+) -> anyhow::Result<Vec<u8>> {
+    match source {
+        UploadSource::Memory(data) => {
+            let start = offset as usize;
+            let end = start.saturating_add(len);
+            if end > data.len() {
+                anyhow::bail!(
+                    "memory slice OOB: offset={offset} len={len} size={}",
+                    data.len()
+                );
+            }
+            Ok(data[start..end].to_vec())
+        }
+        UploadSource::Path(path) => {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut file = tokio::fs::File::open(path).await?;
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            let mut buf = vec![0u8; len];
+            if len > 0 {
+                file.read_exact(&mut buf).await?;
+            }
+            Ok(buf)
+        }
+    }
+}
 
 fn is_url_expired(url: &str) -> bool {
     if let Ok(oss_url) = ::url::Url::parse(url) {
@@ -1555,6 +1782,24 @@ fn is_url_expired(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_upload_memory_pool_parallel_cap() {
+        let pool = UploadMemoryPool::new(100);
+        assert!(pool.try_reserve(60));
+        assert!(!pool.try_reserve(50)); // 60+50 > 100
+        assert!(pool.try_reserve(40));
+        assert_eq!(pool.used(), 100);
+        pool.release(60);
+        assert!(pool.try_reserve(50));
+        assert_eq!(pool.used(), 90);
+    }
+
+    #[test]
+    fn test_upload_memory_pool_disabled() {
+        let pool = UploadMemoryPool::new(0);
+        assert!(!pool.try_reserve(1));
+    }
 
     #[test]
     fn test_is_url_expired_with_past_timestamp() {

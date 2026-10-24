@@ -90,6 +90,9 @@ struct Opt {
     /// Upload buffer size in bytes, defaults to 16MB
     #[arg(long, default_value = "16777216")]
     upload_buffer_size: usize,
+    /// 上传内存上限（字节，多文件并行合计）。未超限直接进内存不写临时文件；0=始终落盘。默认 64MiB。
+    #[arg(long, env = "UPLOAD_MEMORY_LIMIT", default_value = "67108864")]
+    upload_memory_limit: u64,
     /// Directory entries cache size
     #[arg(long, default_value = "1000")]
     cache_size: u64,
@@ -298,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
     fs.set_no_trash(opt.no_trash)
         .set_read_only(opt.read_only)
         .set_upload_buffer_size(opt.upload_buffer_size)
+        .set_upload_memory_limit(opt.upload_memory_limit)
         .set_skip_upload_same_size(opt.skip_upload_same_size)
         .set_prefer_http_download(opt.prefer_http_download)
         .set_upload_wait_timeout(opt.upload_wait_timeout)

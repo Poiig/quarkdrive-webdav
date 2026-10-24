@@ -33,7 +33,7 @@ pub mod model;
 pub mod open;
 
 pub use model::{QuarkFile};
-pub use open::{OpenClient, OpenCredentials, TokenFile};
+pub use open::{OpenClient, OpenCredentials, TokenFile, UploadSource};
 
 const ORIGIN: &str = "https://pan.quark.cn";
 const REFERER: &str = "https://pan.quark.cn/";
@@ -165,7 +165,7 @@ impl QuarkDrive {
         pdir_fid: &str,
         md5: &str,
         sha1: &str,
-        temp_path: &std::path::Path,
+        source: &open::UploadSource,
     ) -> Result<()> {
         let open = self
             .open
@@ -178,7 +178,7 @@ impl QuarkDrive {
             pdir_fid,
             md5,
             sha1,
-            temp_path,
+            source,
         )
         .await
     }
