@@ -1063,7 +1063,8 @@ impl OpenClient {
             Err(err) => {
                 *self.auth_ok_until.lock().await = None;
                 let msg = err.to_string();
-                if msg.contains("缺少 refresh_token")
+                if msg.contains("尚未授权")
+                    || msg.contains("缺少 refresh_token")
                     || msg.contains("令牌")
                     || msg.contains("token")
                     || msg.contains("access_token")
