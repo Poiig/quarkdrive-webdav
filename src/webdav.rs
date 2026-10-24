@@ -752,10 +752,10 @@ fn console_float_css() -> &'static str {
 .qd-badge[data-n="0"]{background:#94a3b8}
 .qd-float-hd .chev{margin-left:auto;color:var(--muted);font-size:12px;transition:transform .2s}
 .qd-float.open .qd-float-hd .chev{transform:rotate(180deg)}
-.qd-float-bd{display:none;max-height:min(52vh,420px);overflow:auto;padding:8px 10px 12px}
+.qd-float-bd{display:none;max-height:min(52vh,420px);overflow:auto;padding:4px 0}
 .qd-float.open .qd-float-bd{display:block}
-.qd-empty{padding:18px 10px;text-align:center;color:var(--muted);font-size:13px}
-.qd-item{padding:12px 12px 10px;border-bottom:1px solid var(--line)}
+.qd-empty{padding:22px 16px;text-align:center;color:var(--muted);font-size:13px}
+.qd-item{padding:12px 14px 10px;border-bottom:1px solid var(--line)}
 .qd-item:last-child{border-bottom:0}
 .qd-item .r1,.qd-item .r2{
   display:flex;align-items:center;justify-content:space-between;gap:10px;
@@ -785,34 +785,54 @@ fn console_float_css() -> &'static str {
 @keyframes qd-slide{0%{transform:translateX(-120%)}100%{transform:translateX(280%)}}
 .qd-modal{
   position:fixed;inset:0;z-index:50;display:none;align-items:center;justify-content:center;
-  background:rgba(15,23,32,.45);padding:16px;
+  background:rgba(15,23,32,.48);padding:28px 32px;
 }
 .qd-modal.open{display:flex}
 .qd-modal-card{
-  width:min(820px,100%);max-height:min(80vh,720px);background:#fff;border:1px solid var(--line);
+  width:min(880px,100%);max-height:min(82vh,740px);background:#fff;border:1px solid var(--line);
   display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.25);
 }
 .qd-modal-hd{
-  display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line);
+  display:flex;align-items:center;gap:12px;padding:18px 28px 14px;border-bottom:1px solid var(--line);
 }
-.qd-modal-hd h2{margin:0;font-size:16px;flex:1}
-.qd-modal-hd button{border:1px solid var(--line);background:#fff;padding:6px 10px;cursor:pointer;font:inherit;font-size:13px}
+.qd-modal-hd h2{margin:0;font-size:17px;flex:1;font-weight:700}
+.qd-modal-hd button{
+  border:1px solid var(--line);background:#fff;padding:7px 14px;cursor:pointer;font:inherit;font-size:13px;color:var(--muted);
+}
+.qd-modal-hd button:hover{color:var(--ink);border-color:var(--accent)}
 .qd-modal-tools{
-  display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);background:#f8fafb;
+  display:flex;flex-wrap:wrap;gap:12px 14px;align-items:end;
+  padding:16px 28px;border-bottom:1px solid var(--line);background:#f7fafb;
 }
-.qd-modal-tools label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)}
-.qd-modal-tools input,.qd-modal-tools select{padding:6px 8px;border:1px solid var(--line);font:inherit;font-size:13px;min-width:110px}
-.qd-modal-tools button{align-self:end;padding:7px 12px;border:1px solid var(--line);background:#fff;cursor:pointer;font:inherit;font-size:13px}
+.qd-modal-tools label{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--muted);min-width:0}
+.qd-modal-tools label.grow{flex:1 1 180px}
+.qd-modal-tools input,.qd-modal-tools select{
+  padding:8px 10px;border:1px solid var(--line);font:inherit;font-size:13px;min-width:120px;background:#fff;color:var(--ink);
+}
+.qd-modal-tools label.grow input{width:100%;min-width:0}
+.qd-modal-tools .btns{display:flex;gap:8px;margin-left:auto}
+.qd-modal-tools button{
+  align-self:end;padding:8px 14px;border:1px solid var(--line);background:#fff;cursor:pointer;font:inherit;font-size:13px;
+}
 .qd-modal-tools button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.qd-modal-tools button.danger{color:var(--bad);border-color:#fecaca}
-.qd-modal-bd{overflow:auto;padding:0}
+.qd-modal-tools button.danger{color:var(--bad);border-color:#fecaca;background:#fff}
+.qd-modal-bd{overflow:auto;padding:8px 20px 24px;flex:1}
 .qd-modal table{width:100%;border-collapse:collapse;font-size:13px}
-.qd-modal th,.qd-modal td{padding:9px 12px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:top}
-.qd-modal th{color:var(--muted);font-weight:600;background:#fafcfd;position:sticky;top:0}
-.qd-modal .path{word-break:break-all}
+.qd-modal th,.qd-modal td{
+  padding:11px 12px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:top;
+}
+.qd-modal th:first-child,.qd-modal td:first-child{padding-left:8px}
+.qd-modal th:last-child,.qd-modal td:last-child{padding-right:8px}
+.qd-modal th{color:var(--muted);font-weight:600;background:#fff;position:sticky;top:0}
+.qd-modal .path{word-break:break-all;color:var(--ink)}
 .qd-modal .ok{color:var(--ok)} .qd-modal .bad{color:var(--bad)}
+.qd-modal .empty-row td{text-align:center;color:var(--muted);padding:36px 16px}
 @media (max-width:720px){
   .qd-float{top:auto;bottom:12px;right:12px;left:12px;width:auto}
+  .qd-modal{padding:16px}
+  .qd-modal-hd,.qd-modal-tools{padding-left:16px;padding-right:16px}
+  .qd-modal-bd{padding:4px 8px 16px}
+  .qd-modal-tools .btns{margin-left:0;width:100%}
 }
 "#
 }
@@ -837,9 +857,11 @@ fn console_float_html() -> &'static str {
     <div class="qd-modal-tools">
       <label>类型<select id="qdHistKind"><option value="upload">上传</option><option value="delete">删除</option><option value="all">全部</option></select></label>
       <label>结果<select id="qdHistResult"><option value="all">全部</option><option value="ok">成功</option><option value="error">失败</option></select></label>
-      <label>路径包含<input id="qdHistQ" placeholder="关键词"/></label>
-      <button type="button" class="primary" id="qdHistReload">筛选</button>
-      <button type="button" class="danger" id="qdHistClear">清除日志</button>
+      <label class="grow">路径包含<input id="qdHistQ" placeholder="关键词"/></label>
+      <div class="btns">
+        <button type="button" class="primary" id="qdHistReload">筛选</button>
+        <button type="button" class="danger" id="qdHistClear">清除日志</button>
+      </div>
     </div>
     <div class="qd-modal-bd"><table><thead><tr><th>时间</th><th>类型</th><th>结果</th><th>大小</th><th>路径</th></tr></thead><tbody id="qdHistBody"></tbody></table></div>
   </div>
@@ -847,6 +869,7 @@ fn console_float_html() -> &'static str {
 <script>
 (function(){
   const STATUS={receiving:"接收中",uploading:"上传中",ok:"完成",error:"失败",skip:"跳过"};
+  const LANE={fast:"全速",slow:"慢传",small:""};
   const fmt=b=>{
     b=Number(b)||0; if(b<1024) return b+" B";
     const u=["KB","MB","GB","TB"]; let i=-1; let n=b;
@@ -859,32 +882,62 @@ fn console_float_html() -> &'static str {
   const badge=document.getElementById("qdBadge");
   document.getElementById("qdFloatToggle").addEventListener("click",()=>floatEl.classList.toggle("open"));
 
-  const LANE={fast:"全速",slow:"慢传",small:""};
+  // 客户端固定出现顺序，刷新只改内容，避免整表重绘导致跳动。
+  const order=[];
+  function itemHtml(it){
+    const pct=Math.max(0,Math.min(100,Number(it.percent)||0));
+    const st=STATUS[it.status]||it.status;
+    const unknown=!it.size && (it.status==="receiving"||it.status==="uploading");
+    const barCls=unknown?"qd-bar indeterminate":"qd-bar";
+    let speed="—";
+    if(it.status==="uploading") speed=fmt(it.speed_bps)+"/s";
+    else if(it.status==="receiving") speed="接收中";
+    else if(it.avg_speed_bps) speed="均 "+fmt(it.avg_speed_bps)+"/s";
+    const name=it.name||String(it.path||"").split("/").filter(Boolean).pop()||it.path;
+    const lane=LANE[it.lane]||"";
+    const laneCls=it.lane==="fast"||it.lane==="slow"?it.lane:"";
+    const laneHtml=lane?`<span class="lane ${laneCls}">${lane}</span>`:"";
+    return `<div class="r1"><span class="name">${esc(name)}</span><span class="size">${esc(fmt(it.size))}</span></div>
+      <div class="${barCls}"><i style="width:${unknown?40:pct}%"></i></div>
+      <div class="r2"><span class="pct">${unknown?"…":pct+"%"} · ${esc(st)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>`;
+  }
   function renderUploads(items){
     const active=items.filter(i=>i.status==="receiving"||i.status==="uploading").length;
     badge.textContent=String(active);
     badge.dataset.n=String(active);
-    if(!items.length){ body.innerHTML='<div class="qd-empty">暂无上传任务</div>'; return; }
-    body.innerHTML=items.map(it=>{
-      const pct=Math.max(0,Math.min(100,Number(it.percent)||0));
-      const st=STATUS[it.status]||it.status;
-      const unknown=!it.size && (it.status==="receiving"||it.status==="uploading");
-      const barCls=unknown?"qd-bar indeterminate":"qd-bar";
-      // 实际上传速度：仅 uploading 阶段展示瞬时速度；接收中不冒充上传速。
-      let speed="—";
-      if(it.status==="uploading") speed=fmt(it.speed_bps)+"/s";
-      else if(it.status==="receiving") speed="接收中";
-      else if(it.avg_speed_bps) speed="均 "+fmt(it.avg_speed_bps)+"/s";
-      const name=it.name||String(it.path||"").split("/").filter(Boolean).pop()||it.path;
-      const lane=LANE[it.lane]||"";
-      const laneCls=it.lane==="fast"||it.lane==="slow"?it.lane:"";
-      const laneHtml=lane?`<span class="lane ${laneCls}">${lane}</span>`:"";
-      return `<div class="qd-item" data-path="${esc(it.path)}" title="${esc(it.path)}">
-        <div class="r1"><span class="name">${esc(name)}</span><span class="size">${esc(fmt(it.size))}</span></div>
-        <div class="${barCls}"><i style="width:${unknown?40:pct}%"></i></div>
-        <div class="r2"><span class="pct">${unknown?"…":pct+"%"} · ${esc(st)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>
-      </div>`;
-    }).join("");
+    if(!items.length){
+      order.length=0;
+      body.innerHTML='<div class="qd-empty">暂无上传任务</div>';
+      return;
+    }
+    const byPath=new Map(items.map(it=>[it.path,it]));
+    // 去掉服务端已消失的项，保留既有顺序。
+    for(let i=order.length-1;i>=0;i--){
+      if(!byPath.has(order[i])) order.splice(i,1);
+    }
+    for(const it of items){
+      if(!order.includes(it.path)) order.push(it.path);
+    }
+    const empty=body.querySelector(".qd-empty");
+    if(empty) empty.remove();
+    const seen=new Set();
+    for(const path of order){
+      const it=byPath.get(path);
+      if(!it) continue;
+      seen.add(path);
+      let el=[...body.querySelectorAll(".qd-item")].find(e=>e.dataset.path===path);
+      if(!el){
+        el=document.createElement("div");
+        el.className="qd-item";
+        el.dataset.path=path;
+        body.appendChild(el);
+      }
+      el.title=path;
+      el.innerHTML=itemHtml(it);
+    }
+    for(const el of [...body.querySelectorAll(".qd-item")]){
+      if(!seen.has(el.dataset.path)) el.remove();
+    }
   }
 
   let timer=null;
@@ -918,18 +971,18 @@ fn console_float_html() -> &'static str {
     const q=document.getElementById("qdHistQ").value.trim();
     const qs=new URLSearchParams({kind,result,limit:"100"});
     if(q) qs.set("q",q);
-    histBody.innerHTML='<tr><td colspan="5" style="text-align:center;color:#888;padding:24px">加载中…</td></tr>';
+    histBody.innerHTML='<tr class="empty-row"><td colspan="5">加载中…</td></tr>';
     try{
       const r=await fetch("/__history.json?"+qs.toString(),{credentials:"same-origin",headers:{Accept:"application/json"}});
       const data=await r.json();
       const rows=data.entries||[];
-      if(!rows.length){ histBody.innerHTML='<tr><td colspan="5" style="text-align:center;color:#888;padding:24px">没有匹配记录</td></tr>'; return; }
+      if(!rows.length){ histBody.innerHTML='<tr class="empty-row"><td colspan="5">没有匹配记录</td></tr>'; return; }
       histBody.innerHTML=rows.map(e=>{
         const rc=String(e.result||"").startsWith("error")?"bad":"ok";
         return `<tr><td>${esc(e.time)}</td><td>${esc(e.kind)}</td><td class="${rc}">${esc(e.result)}</td><td>${esc(e.size)}</td><td class="path">${esc(e.path)}</td></tr>`;
       }).join("");
     }catch(err){
-      histBody.innerHTML=`<tr><td colspan="5" class="bad" style="padding:16px">加载失败：${esc(err)}</td></tr>`;
+      histBody.innerHTML=`<tr class="empty-row"><td colspan="5" class="bad">加载失败：${esc(err)}</td></tr>`;
     }
   }
   document.getElementById("qdHistReload").addEventListener("click",loadHist);

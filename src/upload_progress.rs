@@ -240,7 +240,7 @@ impl UploadTracker {
             });
     }
 
-    /// 列出条目：进行中在前，其余按更新时间倒序；顺带丢掉过期已结束项。
+    /// 列出条目：按开始时间升序固定位置，避免进度刷新时上下跳动。
     pub fn list(&self) -> Vec<ProgressEntry> {
         let now = now_ms();
         // 已结束超过 1 小时的从内存表摘掉，避免无限涨。
@@ -250,12 +250,11 @@ impl UploadTracker {
             active || now.saturating_sub(e.updated_ms) < DONE_TTL_MS
         });
         let mut items: Vec<_> = self.inner.iter().map(|e| e.value().clone()).collect();
+        // 同一文件始终同一槽位：只按 started_ms，不用 updated_ms 重排。
         items.sort_by(|a, b| {
-            let a_active = matches!(a.status.as_str(), "receiving" | "uploading");
-            let b_active = matches!(b.status.as_str(), "receiving" | "uploading");
-            b_active
-                .cmp(&a_active)
-                .then_with(|| b.updated_ms.cmp(&a.updated_ms))
+            a.started_ms
+                .cmp(&b.started_ms)
+                .then_with(|| a.path.cmp(&b.path))
         });
         items
     }
