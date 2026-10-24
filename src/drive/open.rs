@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
+use bytes::Bytes;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
@@ -684,8 +685,9 @@ impl OpenClient {
                     .read_at(offset, this_size as usize)
                     .await
                     .with_context(|| format!("读取上传分片 {} 失败", item.part_number))?;
+                // Bytes 引用计数克隆，重试时不再整片 memcpy。
                 let etag = self
-                    .upload_part_with_retry(client, item, &common_headers, buf)
+                    .upload_part_with_retry(client, item, &common_headers, Bytes::from(buf))
                     .await
                     .with_context(|| format!("上传分片 {} 失败", item.part_number))?;
                 etags[idx] = Some(etag);
@@ -731,7 +733,7 @@ impl OpenClient {
         client: &ClientWithMiddleware,
         item: &UploadUrlItem,
         headers: &CommonOssHeaders,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     ) -> Result<String> {
         let mut last_err = None;
         for attempt in 0..3u32 {
@@ -760,7 +762,7 @@ impl OpenClient {
         client: &ClientWithMiddleware,
         item: &UploadUrlItem,
         headers: &CommonOssHeaders,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     ) -> Result<String> {
         let mut hdrs = HeaderMap::new();
         hdrs.insert(

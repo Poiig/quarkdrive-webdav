@@ -15,7 +15,13 @@ services:
       QUARK_TOKEN_FILE: /data/quark-token.json
       WEBDAV_AUTH_USER: admin
       WEBDAV_AUTH_PASSWORD: admin
-      UPLOAD_MEMORY_LIMIT: 512MB
+      # 仅限制「上传接收」内存池，不是容器总内存；过大反而更容易顶满 RSS
+      UPLOAD_MEMORY_LIMIT: 64MB
+      UPLOAD_MAX_CONCURRENT: "2"
+      CHUNK_CACHE_MB: "64"
+      PREFETCH_CHUNK_MB: "8"
+      PREFETCH_AHEAD: "2"
+      DIR_CACHE_BYTES: 32MB
       OP_LOG_DIR: /app/logs
       OP_LOG_RETENTION_DAYS: "7"
       # WECOM_WEBHOOK_KEY: 你的企微机器人key

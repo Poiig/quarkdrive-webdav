@@ -70,7 +70,7 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录�
 | `QUARK_OPEN` | `true` 启用 Open 模式 | `false` |
 | `QUARK_TOKEN_FILE` | Open token 落盘路径 | `./quark-token.json` |
 | `QUARK_REFRESH_TOKEN` | 可选，已有 refresh token 时可直接填 | 空 |
-| `UPLOAD_MEMORY_LIMIT` | 上传内存上限（Cookie/Open 共用），如 `64MB`/`1GB`；`0`=始终落盘 | `64MB` |
+| `UPLOAD_MEMORY_LIMIT` | **仅**限制「接收上传内容」的内存池（并行合计，超限落盘）；**不是**容器/进程 RSS 上限；`0`=始终落盘 | `64MB` |
 | `UPLOAD_MAX_CONCURRENT` | 同时后台上传数上限 | `4` |
 | `DIR_CACHE_SIZE` | 目录缓存最多目录数 | `1000` |
 | `DIR_CACHE_BYTES` | 目录缓存字节上限，如 `64MB` | `64MB` |
@@ -84,6 +84,18 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录�
 | `PORT` | 端口 | `8080` |
 
 低配机器可参考：`UPLOAD_MEMORY_LIMIT=64MB UPLOAD_MAX_CONCURRENT=2 DIR_CACHE_BYTES=32MB CHUNK_CACHE_MB=64 PREFETCH_CHUNK_MB=8 PREFETCH_AHEAD=2`。
+
+### 内存说明（为何 RSS 会高于 `UPLOAD_MEMORY_LIMIT`）
+
+进程占用 ≈ 上传接收池 + 目录缓存 + 播放预取缓存 + 进行中的分片缓冲 + Rust/HTTP 基线，大约：
+
+- `UPLOAD_MEMORY_LIMIT`（默认 64MB，示例 compose 勿设太大）
+- `DIR_CACHE_BYTES`（默认 64MB）
+- `CHUNK_CACHE_MB`（默认 **128MB**）
+- 预取在途：约 `PREFETCH_AHEAD × PREFETCH_CHUNK_MB`（默认 4×16 ≈ **64MB**/活跃下载）
+- Open 大文件上传：为满足 part list≤256 会抬高单片，峰值约「并发上传数 × 单片大小」
+
+因此把 `UPLOAD_MEMORY_LIMIT` 调到 512MB **不会**把总内存钉在 512MB，反而更容易抬高 RSS。容器若要用 `mem_limit`/`deploy.resources`，请按上面几项之和留余量（低配建议总限额 ≥512MB～1GB）。
 
 ## 免责声明
 
