@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Local, NaiveDate};
+use chrono::{Duration as ChronoDuration, NaiveDate};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-use crate::util::format_bytes;
+use crate::util::{format_bytes, now_shanghai};
 
 #[derive(Debug, Clone)]
 pub struct OpLog {
@@ -64,7 +64,8 @@ impl OpLog {
     }
 
     async fn write_line(&self, body: &str) {
-        let now = Local::now();
+        // 固定 Asia/Shanghai，避免 Docker 默认 UTC 导致日志日期错位。
+        let now = now_shanghai();
         let stamped = format!("{} {}", now.format("%Y-%m-%d %H:%M:%S %z"), body);
 
         // 同步打到控制台，便于 docker logs / 群晖容器日志查看。
@@ -99,7 +100,7 @@ impl OpLog {
         let Ok(mut entries) = fs::read_dir(&self.dir).await else {
             return;
         };
-        let cutoff = Local::now().date_naive()
+        let cutoff = now_shanghai().date_naive()
             - ChronoDuration::days(self.retention_days as i64);
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();

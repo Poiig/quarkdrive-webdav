@@ -33,6 +33,15 @@ mod vfs;
 mod webdav;
 use tokio::time::interval;
 
+/// tracing 时间戳固定为 Asia/Shanghai（UTC+8），不依赖容器 TZ。
+struct ShanghaiTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for ShanghaiTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", util::now_shanghai().format("%Y-%m-%d %H:%M:%S %z"))
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "quarkdrive-webdav", about, version, author)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -229,10 +238,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    // 输出到 stdout，Docker / 群晖容器控制台可直接看。
+    // 输出到 stdout，Docker / 群晖容器控制台可直接看；时间固定 Asia/Shanghai。
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
-        .with_timer(tracing_subscriber::fmt::time::time())
+        .with_timer(ShanghaiTimer)
         .with_ansi(false)
         .with_writer(std::io::stdout)
         .init();

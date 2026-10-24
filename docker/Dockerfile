@@ -4,7 +4,8 @@ FROM alpine:3.19
 
 ARG TARGETARCH
 
-RUN apk add --no-cache cronie findutils && rm -rf /var/cache/apk/*
+RUN apk add --no-cache cronie findutils tzdata && rm -rf /var/cache/apk/*
+ENV TZ=Asia/Shanghai
 RUN addgroup -S app && adduser -S app -G app -s /bin/sh
 WORKDIR /app
 

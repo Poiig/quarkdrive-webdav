@@ -1,6 +1,17 @@
 //! 通用小工具：人类可读容量解析等。
 
 use anyhow::{bail, Result};
+use chrono::{DateTime, FixedOffset, Utc};
+
+/// 中国标准时间 UTC+8（Asia/Shanghai，无夏令时）。
+pub fn shanghai_offset() -> FixedOffset {
+    FixedOffset::east_opt(8 * 3600).expect("UTC+8")
+}
+
+/// 当前 Asia/Shanghai 时间，不依赖容器 TZ。
+pub fn now_shanghai() -> DateTime<FixedOffset> {
+    Utc::now().with_timezone(&shanghai_offset())
+}
 
 /// 把字节数格式化为可读容量，如 `1.5 MB`、`320 KB`。
 pub fn format_bytes(size: u64) -> String {
@@ -67,6 +78,12 @@ pub fn parse_byte_size(input: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shanghai_offset_is_utc8() {
+        let now = now_shanghai();
+        assert_eq!(now.offset().local_minus_utc(), 8 * 3600);
+    }
 
     #[test]
     fn test_parse_byte_size() {

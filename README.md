@@ -27,6 +27,7 @@ Cookie 模式改 compose 里的环境变量即可（文件内有注释示例）�
 
 ```bash
 docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
+  -e TZ=Asia/Shanghai \
   -e QUARK_COOKIE='你的cookie' \
   -e WEBDAV_AUTH_USER=admin \
   -e WEBDAV_AUTH_PASSWORD=admin \
@@ -41,6 +42,7 @@ docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
 
 ```bash
 docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
+  -e TZ=Asia/Shanghai \
   -e QUARK_OPEN=true \
   -e QUARK_TOKEN_FILE=/data/quark-token.json \
   -e WEBDAV_AUTH_USER=admin \
