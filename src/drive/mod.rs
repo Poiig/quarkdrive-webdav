@@ -304,6 +304,7 @@ impl QuarkDrive {
         source: &open::UploadSource,
         progress: Option<(&crate::upload_progress::UploadTracker, &str)>,
         smart: Option<&crate::upload_schedule::SmartUploadPermit>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         let open = self
             .open
@@ -320,6 +321,7 @@ impl QuarkDrive {
             source,
             progress,
             smart,
+            cancel,
         )
         .await
     }

@@ -3,6 +3,7 @@
 //! 用 AppId/SignKey 签请求头，并用 refresh_token 续期 access_token。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -597,6 +598,7 @@ impl OpenClient {
         source: &UploadSource,
         progress: Option<(&crate::upload_progress::UploadTracker, &str)>,
         smart: Option<&crate::upload_schedule::SmartUploadPermit>,
+        cancel: Option<&AtomicBool>,
     ) -> Result<()> {
         let pathname = "/open/v1/file/upload_pre";
         let (tm, x_pan_token, req_id) =
@@ -672,6 +674,9 @@ impl OpenClient {
                 );
             }
             for item in items {
+                if cancel.map(|c| c.load(Ordering::Acquire)).unwrap_or(false) {
+                    bail!("上传已取消");
+                }
                 let idx = (item.part_number.max(1) as u64 - 1) as usize;
                 if idx >= part_info.len() {
                     bail!("get_upload_urls 返回非法 part_number={}", item.part_number);

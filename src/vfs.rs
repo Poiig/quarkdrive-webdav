@@ -186,6 +186,28 @@ impl QuarkDriveFileSystem {
         &self.upload_tracker
     }
 
+    /// 控制台取消上传：标 cancelled、abort 后台任务，并摘掉 PROPFIND 占位。
+    pub fn cancel_upload(&self, path: &str) -> bool {
+        if !self.upload_tracker.request_cancel(path) {
+            return false;
+        }
+        let pb = Path::new(path);
+        if let (Some(name), Some(parent)) = (
+            pb.file_name().and_then(|s| s.to_str()),
+            pb.parent().map(|p| {
+                let s = p.to_string_lossy();
+                if s.is_empty() {
+                    "".to_string()
+                } else {
+                    s.into_owned()
+                }
+            }),
+        ) {
+            self.remove_uploading_file(&parent, name);
+        }
+        true
+    }
+
     /// 供 Web 页读取操作日志。
     pub fn oplog(&self) -> &Arc<OpLog> {
         &self.oplog
@@ -1100,6 +1122,12 @@ impl QuarkDavFile {
 
     async fn do_flush(&mut self) -> Result<(), FsError> {
         let size = self.upload_state.size;
+        let log_path_early = self.upload_log_path();
+        // 接收阶段点了取消：不再开 OSS，直接收尾。
+        if self.fs.upload_tracker.is_cancel_requested(&log_path_early) {
+            info!(path = %log_path_early, "skip flush: upload cancelled");
+            return self.abandon_duplicate_retry_upload().await;
+        }
         if let Some(ref parent) = self.file.parent_path {
             self.fs
                 .update_uploading_file(parent, &self.file.file_name, size);
@@ -1264,12 +1292,15 @@ impl QuarkDavFile {
         let tracker = self.fs.upload_tracker.clone();
         let progress_path = log_path.clone();
 
+        let cancel_flag = self.fs.upload_tracker.arm_cancel(&log_path);
+        let abort_path = log_path.clone();
         let handle = tokio::spawn(async move {
             // 与后台任务同寿：提前返回给客户端后仍占坑，直到 OSS 传完。
             let _inflight_guard = inflight_guard;
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
             // 大文件 FIFO 快车道：队首全速，其余限速慢传且不可插队。
             let smart = crate::upload_schedule::join(size).await;
+            let _path_bind = smart.bind_path(&progress_path);
             tracker.set_lane(&progress_path, smart.lane().as_str());
             let _memory_guard = UploadMemoryGuard {
                 pool: fs.upload_memory.clone(),
@@ -1289,6 +1320,9 @@ impl QuarkDavFile {
                 let upload_url = &upload_state.upload_url;
 
                 for chunk_idx in 1..=chunk_count {
+                    if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(FsError::GeneralFailure);
+                    }
                     let bytes_to_read = if chunk_idx == chunk_count {
                         let remaining_bytes =
                             upload_state.size as usize - ((chunk_idx - 1) as usize * chunk_size);
@@ -1385,32 +1419,45 @@ impl QuarkDavFile {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
 
-            match result {
-                Ok(_) => {
-                    tracker.finish(&progress_path, "ok", "");
-                    fs.oplog
-                        .log_upload(&log_path, log_size, log_mode, "ok")
-                        .await;
-                    // 等夸克列表可见后再摘占位，避免 CloudSync PUT 后 PROPFIND 404。
-                    fs.wait_until_remote_visible(
-                        parent_dir.as_path(),
-                        &file_name,
-                        log_size,
-                        &parent_path,
-                    )
+            let cancelled = cancel_flag.load(std::sync::atomic::Ordering::Acquire);
+            if cancelled {
+                // request_cancel 已写入 cancelled；此处只做清理。
+                fs.remove_uploading_file(&parent_path, &file_name);
+                fs.oplog
+                    .log_upload(&log_path, log_size, log_mode, "cancelled")
                     .await;
-                    Ok::<(), FsError>(())
-                }
-                Err(err) => {
-                    tracker.finish(&progress_path, "error", &format!("{err:?}"));
-                    fs.remove_uploading_file(&parent_path, &file_name);
-                    fs.oplog
-                        .log_upload(&log_path, log_size, log_mode, "error")
+                Ok::<(), FsError>(())
+            } else {
+                match result {
+                    Ok(_) => {
+                        tracker.finish(&progress_path, "ok", "");
+                        fs.oplog
+                            .log_upload(&log_path, log_size, log_mode, "ok")
+                            .await;
+                        // 等夸克列表可见后再摘占位，避免 CloudSync PUT 后 PROPFIND 404。
+                        fs.wait_until_remote_visible(
+                            parent_dir.as_path(),
+                            &file_name,
+                            log_size,
+                            &parent_path,
+                        )
                         .await;
-                    Err(err)
+                        Ok(())
+                    }
+                    Err(err) => {
+                        tracker.finish(&progress_path, "error", &format!("{err:?}"));
+                        fs.remove_uploading_file(&parent_path, &file_name);
+                        fs.oplog
+                            .log_upload(&log_path, log_size, log_mode, "error")
+                            .await;
+                        Err(err)
+                    }
                 }
             }
         });
+        self.fs
+            .upload_tracker
+            .bind_abort(&abort_path, handle.abort_handle());
 
         // Wait for upload to complete, but return early if upload_wait_timeout is reached
         // to avoid client timeout. The spawned task continues uploading in the background.
@@ -1420,13 +1467,15 @@ impl QuarkDavFile {
                 std::time::Duration::from_secs(upload_wait_timeout),
                 handle,
             ).await {
-                Ok(result) => {
-                    // Upload finished within timeout, return real result
-                    result.map_err(|err| {
+                Ok(result) => match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(err),
+                    Err(join_err) if join_err.is_cancelled() => {}
+                    Err(err) => {
                         error!(file_name = %self.file.file_name, error = %err, "upload task join failed");
-                        FsError::GeneralFailure
-                    })??;
-                }
+                        return Err(FsError::GeneralFailure);
+                    }
+                },
                 Err(_) => {
                     // Timeout reached, upload continues in background；占位仍在 uploading。
                     info!(file_name = %self.file.file_name, timeout_secs = upload_wait_timeout,
@@ -1434,11 +1483,16 @@ impl QuarkDavFile {
                 }
             }
         } else {
-            // Wait indefinitely
-            handle.await.map_err(|err| {
-                error!(file_name = %self.file.file_name, error = %err, "upload task join failed");
-                FsError::GeneralFailure
-            })??;
+            // Wait indefinitely；控制台取消会 abort，按成功收尾避免误报失败。
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(join_err) if join_err.is_cancelled() => {}
+                Err(err) => {
+                    error!(file_name = %self.file.file_name, error = %err, "upload task join failed");
+                    return Err(FsError::GeneralFailure);
+                }
+            }
         }
 
         self.upload_state.is_finished = true;
@@ -1510,11 +1564,14 @@ impl QuarkDavFile {
         self.fs.upload_tracker.mark_uploading(&log_path, size);
         let tracker = self.fs.upload_tracker.clone();
         let progress_path = log_path.clone();
+        let cancel_flag = self.fs.upload_tracker.arm_cancel(&log_path);
+        let abort_path = log_path.clone();
 
         let handle = tokio::spawn(async move {
             let _inflight_guard = inflight_guard;
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
             let smart = crate::upload_schedule::join(size).await;
+            let _path_bind = smart.bind_path(&progress_path);
             tracker.set_lane(&progress_path, smart.lane().as_str());
             let _memory_guard = UploadMemoryGuard {
                 pool: fs.upload_memory.clone(),
@@ -1530,37 +1587,50 @@ impl QuarkDavFile {
                     &source,
                     Some((&tracker, progress_path.as_str())),
                     Some(&smart),
+                    Some(cancel_flag.as_ref()),
                 )
                 .await;
             if !temp_path.is_empty() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
-            match result {
-                Ok(()) => {
-                    tracker.finish(&progress_path, "ok", "");
-                    fs.oplog
-                        .log_upload(&log_path, size, log_mode, "ok")
-                        .await;
-                    fs.wait_until_remote_visible(
-                        parent_dir.as_path(),
-                        &file_name,
-                        size,
-                        &parent_path,
-                    )
+            let cancelled = cancel_flag.load(std::sync::atomic::Ordering::Acquire);
+            if cancelled {
+                fs.remove_uploading_file(&parent_path, &file_name);
+                fs.oplog
+                    .log_upload(&log_path, size, log_mode, "cancelled")
                     .await;
-                    Ok::<(), FsError>(())
-                }
-                Err(err) => {
-                    error!(file_name = %file_name, error = %err, "open upload failed");
-                    tracker.finish(&progress_path, "error", &format!("{err:#}"));
-                    fs.remove_uploading_file(&parent_path, &file_name);
-                    fs.oplog
-                        .log_upload(&log_path, size, log_mode, &format!("error:{err:#}"))
+                Ok::<(), FsError>(())
+            } else {
+                match result {
+                    Ok(()) => {
+                        tracker.finish(&progress_path, "ok", "");
+                        fs.oplog
+                            .log_upload(&log_path, size, log_mode, "ok")
+                            .await;
+                        fs.wait_until_remote_visible(
+                            parent_dir.as_path(),
+                            &file_name,
+                            size,
+                            &parent_path,
+                        )
                         .await;
-                    Err(FsError::GeneralFailure)
+                        Ok(())
+                    }
+                    Err(err) => {
+                        error!(file_name = %file_name, error = %err, "open upload failed");
+                        tracker.finish(&progress_path, "error", &format!("{err:#}"));
+                        fs.remove_uploading_file(&parent_path, &file_name);
+                        fs.oplog
+                            .log_upload(&log_path, size, log_mode, &format!("error:{err:#}"))
+                            .await;
+                        Err(FsError::GeneralFailure)
+                    }
                 }
             }
         });
+        self.fs
+            .upload_tracker
+            .bind_abort(&abort_path, handle.abort_handle());
 
         let upload_wait_timeout = self.fs.upload_wait_timeout;
         if upload_wait_timeout > 0 {
@@ -1570,22 +1640,30 @@ impl QuarkDavFile {
             )
             .await
             {
-                Ok(result) => {
-                    result.map_err(|err| {
+                Ok(result) => match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(err),
+                    Err(join_err) if join_err.is_cancelled() => {}
+                    Err(err) => {
                         error!(file_name = %self.file.file_name, error = %err, "open upload task join failed");
-                        FsError::GeneralFailure
-                    })??;
-                }
+                        return Err(FsError::GeneralFailure);
+                    }
+                },
                 Err(_) => {
                     info!(file_name = %self.file.file_name, timeout_secs = upload_wait_timeout,
                           "open upload still in progress, returning early to avoid client timeout");
                 }
             }
         } else {
-            handle.await.map_err(|err| {
-                error!(file_name = %self.file.file_name, error = %err, "open upload task join failed");
-                FsError::GeneralFailure
-            })??;
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(join_err) if join_err.is_cancelled() => {}
+                Err(err) => {
+                    error!(file_name = %self.file.file_name, error = %err, "open upload task join failed");
+                    return Err(FsError::GeneralFailure);
+                }
+            }
         }
 
         self.upload_state.is_finished = true;

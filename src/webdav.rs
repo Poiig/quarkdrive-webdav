@@ -199,6 +199,8 @@ impl QuarkDriveWebDav {
         path == "/__uploads"
             || path == "/__uploads.json"
             || path == "/__uploads/clear"
+            || path == "/__uploads/cancel"
+            || path == "/__uploads/promote"
             || path == "/__history"
             || path == "/__history.json"
             || path.starts_with("/__history/")
@@ -600,6 +602,29 @@ impl QuarkDriveWebDav {
             return json_response(serde_json::json!({ "cleared": n }));
         }
 
+        // 取消进行中任务：?path=
+        if path == "/__uploads/cancel" {
+            let Some(target) = params.get("path").map(|s| s.as_str()).filter(|s| !s.is_empty())
+            else {
+                return json_response(serde_json::json!({ "ok": false, "error": "missing path" }));
+            };
+            let ok = self.fs.cancel_upload(target);
+            return json_response(serde_json::json!({ "ok": ok, "path": target }));
+        }
+
+        // 慢传手动提升全速：?path=
+        if path == "/__uploads/promote" {
+            let Some(target) = params.get("path").map(|s| s.as_str()).filter(|s| !s.is_empty())
+            else {
+                return json_response(serde_json::json!({ "ok": false, "error": "missing path" }));
+            };
+            let ok = crate::upload_schedule::promote_path(target);
+            if ok {
+                self.fs.upload_tracker().set_lane(target, "fast");
+            }
+            return json_response(serde_json::json!({ "ok": ok, "path": target }));
+        }
+
         if path == "/__uploads.json" {
             let items = self.fs.upload_tracker().list();
             let list: Vec<serde_json::Value> = items
@@ -619,6 +644,7 @@ impl QuarkDriveWebDav {
                         "lane": e.lane,
                         "updated_ms": e.updated_ms,
                         "started_ms": e.started_ms,
+                        "elapsed_ms": e.elapsed_ms(),
                     })
                 })
                 .collect();
@@ -790,16 +816,16 @@ fn console_float_css() -> &'static str {
 .qd-float-bd{display:none;overflow:auto;padding:4px 0;flex:1;min-height:0}
 .qd-float.open .qd-float-bd{display:block}
 .qd-empty{padding:22px 16px;text-align:center;color:var(--muted);font-size:13px}
-.qd-item{padding:12px 14px 10px;border-bottom:1px solid var(--line)}
+.qd-item{padding:12px 14px 10px;border-bottom:1px solid var(--line);position:relative}
 .qd-item:last-child{border-bottom:0}
 .qd-item .r1,.qd-item .r2{
-  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
 }
 .qd-item .name{
   font-size:13px;font-weight:600;color:var(--ink);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1;
 }
-.qd-item .size,.qd-item .speed,.qd-item .pct{
+.qd-item .size,.qd-item .speed,.qd-item .pct,.qd-item .dur{
   font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;
 }
 .qd-item .pct{font-weight:700;color:var(--ink)}
@@ -809,6 +835,22 @@ fn console_float_css() -> &'static str {
 }
 .qd-item .lane.fast{color:var(--ok);border-color:#99f6e4;background:#f0fdfa}
 .qd-item .lane.slow{color:var(--run);border-color:#fde68a;background:#fffbeb}
+.qd-item .acts{display:flex;align-items:center;gap:4px;flex-shrink:0}
+.qd-item .act{
+  appearance:none;border:1px solid var(--line);background:#fff;color:var(--muted);
+  width:22px;height:22px;padding:0;line-height:1;font-size:13px;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;
+}
+.qd-item .act:hover{color:var(--accent);border-color:var(--accent)}
+.qd-item .act.cancel:hover{color:var(--bad);border-color:#fecaca}
+.qd-item .act.promote{font-size:12px;font-weight:700}
+.qd-item.is-error,.qd-item.is-error .name,.qd-item.is-error .size,
+.qd-item.is-error .pct,.qd-item.is-error .speed,.qd-item.is-error .dur,
+.qd-item.is-error .lane{
+  color:var(--bad)!important;
+}
+.qd-item.is-error .lane{border-color:#fecaca;background:#fff5f5}
+.qd-item.is-error .qd-bar>i{background:var(--bad)!important}
 .qd-bar{height:6px;background:#e2e8f0;overflow:hidden;margin:8px 0 6px;position:relative}
 .qd-bar>i{
   display:block;height:100%;width:0;background:linear-gradient(90deg,#0e7490,#14b8a6);
@@ -908,13 +950,22 @@ fn console_float_html() -> &'static str {
 </div>
 <script>
 (function(){
-  const STATUS={receiving:"接收中",uploading:"上传中",ok:"完成",error:"失败",skip:"跳过"};
+  const STATUS={receiving:"接收中",uploading:"上传中",ok:"完成",error:"失败",skip:"跳过",cancelled:"已取消"};
   const LANE={fast:"全速",slow:"慢传",small:""};
   const fmt=b=>{
     b=Number(b)||0; if(b<1024) return b+" B";
     const u=["KB","MB","GB","TB"]; let i=-1; let n=b;
     do{n/=1024;i++}while(n>=1024&&i<u.length-1);
     return n.toFixed(n>=10||i===0?1:2)+" "+u[i];
+  };
+  const fmtDur=ms=>{
+    ms=Math.max(0,Number(ms)||0);
+    const s=Math.floor(ms/1000);
+    if(s<60) return s+"s";
+    const m=Math.floor(s/60), r=s%60;
+    if(m<60) return m+"m"+String(r).padStart(2,"0")+"s";
+    const h=Math.floor(m/60), m2=m%60;
+    return h+"h"+String(m2).padStart(2,"0")+"m";
   };
   const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
   const floatEl=document.getElementById("qdFloat");
@@ -940,12 +991,33 @@ fn console_float_html() -> &'static str {
     }catch(_){ floatHint.textContent="清除失败"; }
     finally{ clearBtn.disabled=false; }
   });
+  body.addEventListener("click",async (e)=>{
+    const btn=e.target.closest(".act");
+    if(!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const item=btn.closest(".qd-item");
+    const path=item&&item.dataset.path;
+    if(!path) return;
+    const q=new URLSearchParams({path});
+    btn.disabled=true;
+    try{
+      if(btn.classList.contains("cancel")){
+        await fetch("/__uploads/cancel?"+q,{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}});
+      }else if(btn.classList.contains("promote")){
+        await fetch("/__uploads/promote?"+q,{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}});
+      }
+      await poll();
+    }catch(_){ floatHint.textContent="操作失败"; }
+    finally{ btn.disabled=false; }
+  });
 
   // 进行中按开始时间新→旧置顶；已完成沉底。同组内 started_ms 不变故不跳动。
   function itemHtml(it){
     const pct=Math.max(0,Math.min(100,Number(it.percent)||0));
     const st=STATUS[it.status]||it.status;
-    const unknown=!it.size && (it.status==="receiving"||it.status==="uploading");
+    const active=isActive(it);
+    const unknown=!it.size && active;
     const barCls=unknown?"qd-bar indeterminate":"qd-bar";
     let speed="—";
     if(it.status==="uploading") speed=fmt(it.speed_bps)+"/s";
@@ -958,14 +1030,22 @@ fn console_float_html() -> &'static str {
     // 失败时把简短原因挂到 title，便于对照日志（完整 detail 仍在 JSON）。
     const detail=String(it.detail||"").replace(/\s+/g," ").trim();
     const detailShort=detail.length>80?detail.slice(0,80)+"…":detail;
-    const stText=it.status==="error"&&detailShort?`${st}（${detailShort}）`:st;
+    const stText=(it.status==="error"||it.status==="cancelled")&&detailShort?`${st}（${detailShort}）`:st;
     const title=detail?` title="${esc(detail)}"`:"";
     // 接收阶段进度条保持 0，不显示假的一半进度。
     const barPct=it.status==="receiving"?0:(unknown?40:pct);
     const pctText=it.status==="receiving"?"0%":(unknown?"…":pct+"%");
-    return `<div class="r1"${title}><span class="name">${esc(name)}</span><span class="size">${esc(fmt(it.size))}</span></div>
+    const done=!active;
+    const durMs=Number(it.elapsed_ms)||Math.max(0,(Number(it.updated_ms)||0)-(Number(it.started_ms)||0));
+    const durHtml=done?`<span class="dur">耗时 ${esc(fmtDur(durMs))}</span>`:"";
+    const promoteHtml=active&&it.lane==="slow"
+      ?`<button type="button" class="act promote" title="提升为全速" aria-label="提升为全速">↑</button>`:"";
+    const cancelHtml=active
+      ?`<button type="button" class="act cancel" title="取消上传" aria-label="取消上传">×</button>`:"";
+    const acts=active?`<span class="acts">${promoteHtml}${cancelHtml}</span>`:"";
+    return `<div class="r1"${title}><span class="name">${esc(name)}</span><span class="size">${esc(fmt(it.size))}</span>${acts}</div>
       <div class="${barCls}"><i style="width:${barPct}%"></i></div>
-      <div class="r2"><span class="pct">${pctText} · ${esc(stText)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>`;
+      <div class="r2"><span class="pct">${pctText} · ${esc(stText)}</span><span class="speed">${esc(speed)}</span>${durHtml}${laneHtml}</div>`;
   }
   function isActive(it){ return it.status==="receiving"||it.status==="uploading"; }
   function renderUploads(items, maxItems){
@@ -1001,9 +1081,9 @@ fn console_float_html() -> &'static str {
       if(el) reuse.delete(it.path);
       else{
         el=document.createElement("div");
-        el.className="qd-item";
         el.dataset.path=it.path;
       }
+      el.className="qd-item"+(it.status==="error"||it.status==="cancelled"?" is-error":"");
       el.title=it.path;
       el.innerHTML=itemHtml(it);
       frag.appendChild(el);

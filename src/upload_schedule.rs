@@ -2,12 +2,14 @@
 //!
 //! 多路大文件同时上传时，只让队列最前的一个吃满带宽；后面的缓慢推进，
 //! 新任务只能排到队尾，不能插队。小文件不进此队列，避免拖慢目录里的零碎文件。
+//! 控制台可对慢传任务「手动提升全速」（插到队首并抢走快车道）。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use tokio::sync::Notify;
 use tracing::debug;
 
@@ -30,7 +32,14 @@ struct SmartScheduler {
     notify: Notify,
 }
 
+/// 路径 → 票号/快慢标志，供控制台手动提升全速。
+struct LaneBinding {
+    ticket: u64,
+    is_fast: Arc<AtomicBool>,
+}
+
 static SCHEDULER: OnceLock<Arc<SmartScheduler>> = OnceLock::new();
+static PATH_LANES: OnceLock<DashMap<String, LaneBinding>> = OnceLock::new();
 
 /// 进程启动时配置阈值与慢传速率；可重复调用（仅首次生效）。
 pub fn init(large_threshold: u64, slow_bps: u64) {
@@ -68,6 +77,10 @@ fn scheduler() -> Arc<SmartScheduler> {
     })
 }
 
+fn path_lanes() -> &'static DashMap<String, LaneBinding> {
+    PATH_LANES.get_or_init(DashMap::new)
+}
+
 /// 上传车道：小文件 / 大文件快车道 / 大文件慢传。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadLane {
@@ -90,7 +103,7 @@ impl UploadLane {
 pub struct SmartUploadPermit {
     sched: Arc<SmartScheduler>,
     ticket: Option<u64>,
-    is_fast: AtomicBool,
+    is_fast: Arc<AtomicBool>,
     /// 慢传令牌桶：上次结算时刻与已透支字节。
     pace_lock: Mutex<PaceState>,
     slow_bps: u64,
@@ -101,13 +114,24 @@ struct PaceState {
     debt_ns: u64,
 }
 
+/// `bind_path` 的 RAII：任务结束时摘掉路径绑定，避免手动提升点到已结束任务。
+pub struct PathBindGuard {
+    path: String,
+}
+
+impl Drop for PathBindGuard {
+    fn drop(&mut self) {
+        path_lanes().remove(&self.path);
+    }
+}
+
 impl SmartUploadPermit {
     /// 小文件：不限速、不占快车道。
     fn small() -> Self {
         Self {
             sched: scheduler(),
             ticket: None,
-            is_fast: AtomicBool::new(false),
+            is_fast: Arc::new(AtomicBool::new(false)),
             pace_lock: Mutex::new(PaceState {
                 last: Instant::now(),
                 debt_ns: 0,
@@ -129,6 +153,21 @@ impl SmartUploadPermit {
 
     pub fn is_fast(&self) -> bool {
         self.ticket.is_none() || self.is_fast.load(Ordering::Acquire)
+    }
+
+    /// 把路径挂到本票号上，供控制台「提升全速」。
+    pub fn bind_path(&self, path: &str) -> Option<PathBindGuard> {
+        let ticket = self.ticket?;
+        path_lanes().insert(
+            path.to_string(),
+            LaneBinding {
+                ticket,
+                is_fast: self.is_fast.clone(),
+            },
+        );
+        Some(PathBindGuard {
+            path: path.to_string(),
+        })
     }
 
     /// 每传完一段字节调用：慢传则按目标速率休眠；快车道一空闲立刻被唤醒晋升。
@@ -228,6 +267,43 @@ impl Drop for SmartUploadPermit {
     }
 }
 
+/// 控制台手动把指定路径插到队首并抢走快车道；已是全速/小文件则返回 false。
+pub fn promote_path(path: &str) -> bool {
+    let map = path_lanes();
+    let Some(binding) = map.get(path) else {
+        return false;
+    };
+    let ticket = binding.ticket;
+    let mine = binding.is_fast.clone();
+    if mine.load(Ordering::Acquire) {
+        return false;
+    }
+    drop(binding);
+
+    let sched = scheduler();
+    let mut st = sched.state.lock().unwrap_or_else(|e| e.into_inner());
+    if !st.order.iter().any(|t| *t == ticket) {
+        return false;
+    }
+    st.order.retain(|t| *t != ticket);
+    st.order.push_front(ticket);
+    if let Some(old) = st.fast_holder {
+        if old != ticket {
+            for e in map.iter() {
+                if e.ticket == old {
+                    e.is_fast.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
+    st.fast_holder = Some(ticket);
+    mine.store(true, Ordering::Release);
+    drop(st);
+    sched.notify.notify_waiters();
+    debug!(ticket, path, "upload manually promoted to fast lane");
+    true
+}
+
 /// 加入智能调度：大文件拿 FIFO 票并立即尝试占快车道；小文件直接放行。
 pub async fn join(size: u64) -> SmartUploadPermit {
     let sched = scheduler();
@@ -246,7 +322,7 @@ pub async fn join(size: u64) -> SmartUploadPermit {
             let permit = SmartUploadPermit {
                 sched: sched.clone(),
                 ticket: Some(t),
-                is_fast: AtomicBool::new(true),
+                is_fast: Arc::new(AtomicBool::new(true)),
                 pace_lock: Mutex::new(PaceState {
                     last: Instant::now(),
                     debt_ns: 0,
@@ -261,7 +337,7 @@ pub async fn join(size: u64) -> SmartUploadPermit {
     SmartUploadPermit {
         sched,
         ticket: Some(ticket),
-        is_fast: AtomicBool::new(false),
+        is_fast: Arc::new(AtomicBool::new(false)),
         pace_lock: Mutex::new(PaceState {
             last: Instant::now(),
             debt_ns: 0,

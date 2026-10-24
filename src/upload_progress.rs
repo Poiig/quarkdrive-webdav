@@ -3,10 +3,12 @@
 //! 与 `uploading` 占位（给 CloudSync PROPFIND）分开：这里面向人看的进度，
 //! 含接收字节、传到夸克的字节，以及按实际上传耗时估算的上行速率。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use tokio::task::AbortHandle;
 
 use crate::util::format_bytes;
 
@@ -17,7 +19,7 @@ pub struct ProgressEntry {
     pub size: u64,
     pub received: u64,
     pub uploaded: u64,
-    /// receiving | uploading | ok | error | skip
+    /// receiving | uploading | ok | error | skip | cancelled
     pub status: String,
     pub detail: String,
     pub updated_ms: u64,
@@ -119,6 +121,11 @@ impl ProgressEntry {
         };
     }
 
+    /// 任务耗时（开始 → 最后更新），供成功/失败展示。
+    pub fn elapsed_ms(&self) -> u64 {
+        self.updated_ms.saturating_sub(self.started_ms)
+    }
+
     /// 一行可读摘要：百分比、体积、速度分项写清，避免混成「一个百分比」。
     pub fn summary(&self) -> String {
         let active = matches!(self.status.as_str(), "receiving" | "uploading");
@@ -152,16 +159,85 @@ fn now_ms() -> u64 {
 }
 
 /// 进程内进度表（按 path 覆盖更新）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UploadTracker {
     inner: Arc<DashMap<String, ProgressEntry>>,
+    /// 控制台取消：分片循环轮询此标志。
+    cancels: Arc<DashMap<String, Arc<AtomicBool>>>,
+    /// 控制台取消：直接 abort 后台 tokio 任务。
+    aborts: Arc<DashMap<String, AbortHandle>>,
+}
+
+impl Default for UploadTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UploadTracker {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
+            cancels: Arc::new(DashMap::new()),
+            aborts: Arc::new(DashMap::new()),
         }
+    }
+
+    /// 为路径装上取消标志（接收/上传开始时调用）；已有则复用，避免后台持有的 Arc 失效。
+    pub fn arm_cancel(&self, path: &str) -> Arc<AtomicBool> {
+        if let Some(existing) = self.cancels.get(path) {
+            return existing.clone();
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        self.cancels.insert(path.to_string(), flag.clone());
+        flag
+    }
+
+    /// 绑定后台任务 AbortHandle，便于控制台立即打断。
+    pub fn bind_abort(&self, path: &str, handle: AbortHandle) {
+        self.aborts.insert(path.to_string(), handle);
+    }
+
+    /// 是否已请求取消（或已标为 cancelled）。
+    pub fn is_cancel_requested(&self, path: &str) -> bool {
+        if self
+            .cancels
+            .get(path)
+            .map(|f| f.load(Ordering::Acquire))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.inner
+            .get(path)
+            .map(|e| e.status == "cancelled")
+            .unwrap_or(false)
+    }
+
+    /// 控制台取消进行中任务：置标志、abort、标 cancelled。
+    pub fn request_cancel(&self, path: &str) -> bool {
+        let active = self
+            .inner
+            .get(path)
+            .map(|e| Self::is_active(&e.status))
+            .unwrap_or(false);
+        if !active {
+            return false;
+        }
+        if let Some(f) = self.cancels.get(path) {
+            f.store(true, Ordering::Release);
+        }
+        if let Some((_, handle)) = self.aborts.remove(path) {
+            handle.abort();
+        }
+        self.finish(path, "cancelled", "已取消");
+        true
+    }
+
+    /// 任务结束时清掉取消控制，避免泄漏。
+    pub fn clear_control(&self, path: &str) {
+        self.cancels.remove(path);
+        self.aborts.remove(path);
     }
 
     /// 是否仍在向网盘上传（供重试 PUT 判断，勿与 receiving 混淆）。
@@ -188,6 +264,7 @@ impl UploadTracker {
         }
         self.inner
             .insert(path.to_string(), ProgressEntry::new(path.to_string(), size, "receiving"));
+        let _ = self.arm_cancel(path);
     }
 
     /// 更新已从客户端接收的字节数。
@@ -204,7 +281,7 @@ impl UploadTracker {
                 // 重试 PUT 的 received 从 0 累加，不能覆盖上传期已记的满收值。
                 e.received = e.received.max(received);
                 if e.status == "uploading"
-                    || matches!(e.status.as_str(), "ok" | "error" | "skip")
+                    || matches!(e.status.as_str(), "ok" | "error" | "skip" | "cancelled")
                 {
                     e.updated_ms = now;
                     return;
@@ -247,6 +324,7 @@ impl UploadTracker {
                 e.upload_started_ms = now;
                 e
             });
+        let _ = self.arm_cancel(path);
     }
 
     /// 更新智能调度车道标签（fast/slow/small）。
@@ -273,12 +351,17 @@ impl UploadTracker {
         }
     }
 
-    /// 结束：ok / error / skip。
+    /// 结束：ok / error / skip / cancelled。
     pub fn finish(&self, path: &str, status: &str, detail: &str) {
         let now = now_ms();
         self.inner
             .entry(path.to_string())
             .and_modify(|e| {
+                // 已取消后，后台任务收尾勿再覆盖成 error/ok。
+                if e.status == "cancelled" && status != "cancelled" {
+                    e.updated_ms = now;
+                    return;
+                }
                 e.status = status.into();
                 e.detail = detail.into();
                 e.updated_ms = now;
@@ -295,6 +378,7 @@ impl UploadTracker {
                 e.detail = detail.into();
                 e
             });
+        self.clear_control(path);
         // 完成后顺带裁剪，避免列表无限涨。
         self.prune();
     }
@@ -403,6 +487,19 @@ mod tests {
         let e = t.list().into_iter().next().unwrap();
         assert_eq!(e.speed_bps, 2_000);
         assert!(e.speed_bps < 50_000, "must not treat full received size as one sample");
+    }
+
+    #[test]
+    fn cancel_marks_cancelled_and_keeps_elapsed() {
+        let t = UploadTracker::new();
+        t.start_receiving("/c.bin", 1000);
+        t.mark_uploading("/c.bin", 1000);
+        t.add_uploaded("/c.bin", 100, 100);
+        assert!(t.request_cancel("/c.bin"));
+        let e = t.list().into_iter().next().unwrap();
+        assert_eq!(e.status, "cancelled");
+        assert!(e.elapsed_ms() < 60_000);
+        assert!(!t.request_cancel("/c.bin"), "already finished");
     }
 
     #[test]
