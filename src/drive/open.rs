@@ -381,6 +381,8 @@ pub struct OpenClient {
     pub creds: OpenCredentials,
     pub api_base: String,
     alert: Alert,
+    /// 授权探测成功后的短缓存，避免每次浏览都打 user/info。
+    auth_ok_until: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl OpenClient {
@@ -389,6 +391,7 @@ impl OpenClient {
             creds,
             api_base: OPEN_API_BASE.to_string(),
             alert,
+            auth_ok_until: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -569,7 +572,8 @@ impl OpenClient {
             "l_created_at": now_ms,
             "l_updated_at": now_ms,
             "pdir_fid": pdir_fid,
-            "same_path_reuse": true,
+            // 重复上传走本项目 VFS「先删后传」，不用 OpenList 的同路径复用。
+            "same_path_reuse": false,
             "proof_version": proof_version,
             "proof_seed1": proof_seed1,
             "proof_seed2": proof_seed2,
@@ -967,14 +971,32 @@ impl OpenClient {
         if !self.creds.has_refresh_token().await
             && self.creds.access_token.read().await.is_empty()
         {
+            *self.auth_ok_until.lock().await = None;
             return Ok(false);
+        }
+        {
+            let guard = self.auth_ok_until.lock().await;
+            if let Some(until) = *guard {
+                if std::time::Instant::now() < until {
+                    return Ok(true);
+                }
+            }
         }
         match self
             .request::<UserInfoResp>(client, "/open/v1/user/info", "GET", None, None)
             .await
         {
-            Ok(resp) => Ok(!resp.data.user_id.is_empty()),
+            Ok(resp) => {
+                let ok = !resp.data.user_id.is_empty();
+                *self.auth_ok_until.lock().await = if ok {
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(60))
+                } else {
+                    None
+                };
+                Ok(ok)
+            }
             Err(err) => {
+                *self.auth_ok_until.lock().await = None;
                 let msg = err.to_string();
                 if msg.contains("缺少 refresh_token")
                     || msg.contains("令牌")
@@ -983,7 +1005,9 @@ impl OpenClient {
                 {
                     Ok(false)
                 } else {
-                    Err(err)
+                    // 瞬时网络错误不当成未授权，避免误跳扫码页。
+                    warn!(error = %err, "Open 授权探测失败（非 token），暂视为仍有效");
+                    Ok(true)
                 }
             }
         }

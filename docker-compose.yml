@@ -15,14 +15,19 @@ services:
       WEBDAV_AUTH_USER: admin
       WEBDAV_AUTH_PASSWORD: admin
       UPLOAD_MEMORY_LIMIT: 512MB
+      OP_LOG_DIR: /app/logs
+      OP_LOG_RETENTION_DAYS: "7"
       # WECOM_WEBHOOK_KEY: 你的企微机器人key
     volumes:
       - ./data:/data
+      - ./logs:/app/logs
 
-# Cookie 模式示例（替换上面 environment / 去掉 volumes 即可）:
+# Cookie 模式示例（替换上面 environment 即可）:
 #   environment:
 #     QUARK_COOKIE: 你的cookie
 #     WEBDAV_AUTH_USER: admin
 #     WEBDAV_AUTH_PASSWORD: admin
 #     UPLOAD_MEMORY_LIMIT: 64MB
+#     OP_LOG_DIR: /app/logs
+#     OP_LOG_RETENTION_DAYS: "7"
 #     # WECOM_WEBHOOK_KEY: 你的企微机器人key

@@ -333,9 +333,11 @@ impl QuarkDrive {
                         | StatusCode::GATEWAY_TIMEOUT),
                     ) => {
                         time::sleep(Duration::from_secs(1)).await;
+                        let cookie = self.resolve_cookies().await;
                         let res = self
                             .client
                             .get(url.clone())
+                            .header("Cookie", cookie)
                             .send()
                             .await?;
                         if res.status() == StatusCode::NO_CONTENT {
@@ -425,6 +427,17 @@ impl QuarkDrive {
             Err(err) => {
                 let err_msg = res.text().await?;
                 debug!(error = %err_msg, url = %url, "request failed");
+                if matches!(
+                    err.status(),
+                    Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                ) {
+                    self.alert
+                        .notify(
+                            "Cookie API 鉴权失败",
+                            &format!("HTTP {:?} url={url} body={err_msg}", err.status()),
+                        )
+                        .await;
+                }
                 match err.status() {
                     Some(
                         _status_code
@@ -440,9 +453,13 @@ impl QuarkDrive {
                         | StatusCode::GATEWAY_TIMEOUT),
                     ) => {
                         time::sleep(Duration::from_secs(2)).await;
+                        let cookie = self.resolve_cookies().await;
                         let res = self
                             .client
                             .post(url)
+                            .json(r)
+                            .header("Content-Type", "application/json")
+                            .header("Cookie", cookie)
                             .send()
                             .await?
                             .error_for_status()?;

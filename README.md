@@ -32,6 +32,8 @@ docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
   -e WEBDAV_AUTH_PASSWORD=admin \
   -e UPLOAD_MEMORY_LIMIT=64MB \
   -e WECOM_WEBHOOK_KEY='企微机器人key' \
+  -e OP_LOG_RETENTION_DAYS=7 \
+  -v $(pwd)/logs:/app/logs \
   ghcr.io/poiig/quarkdrive-webdav:latest
 ```
 
@@ -45,7 +47,9 @@ docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
   -e WEBDAV_AUTH_PASSWORD=admin \
   -e UPLOAD_MEMORY_LIMIT=512MB \
   -e WECOM_WEBHOOK_KEY='企微机器人key' \
+  -e OP_LOG_RETENTION_DAYS=7 \
   -v $(pwd)/data:/data \
+  -v $(pwd)/logs:/app/logs \
   ghcr.io/poiig/quarkdrive-webdav:latest
 ```
 
@@ -64,8 +68,10 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。
 | `QUARK_OPEN` | `true` 启用 Open 模式 | `false` |
 | `QUARK_TOKEN_FILE` | Open token 落盘路径 | `./quark-token.json` |
 | `QUARK_REFRESH_TOKEN` | 可选，已有 refresh token 时可直接填 | 空 |
-| `UPLOAD_MEMORY_LIMIT` | 上传内存上限（并行合计），如 `64MB`/`1GB`；`0`=始终落盘 | `64MB` |
+| `UPLOAD_MEMORY_LIMIT` | 上传内存上限（Cookie/Open 共用），如 `64MB`/`1GB`；`0`=始终落盘 | `64MB` |
 | `WECOM_WEBHOOK_KEY` | 企业微信机器人 key；过期/报错时推送 | — |
+| `OP_LOG_DIR` | 上传/删除操作日志目录 | `./logs` |
+| `OP_LOG_RETENTION_DAYS` | 操作日志保留天数 | `7` |
 | `WEBDAV_AUTH_USER` / `WEBDAV_AUTH_PASSWORD` | WebDAV 账号密码 | — |
 | `PORT` | 端口 | `8080` |
 

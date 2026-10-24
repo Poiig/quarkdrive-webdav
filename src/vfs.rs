@@ -20,6 +20,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     cache::Cache,
     drive::{QuarkDrive, QuarkFile, UploadSource},
+    oplog::OpLog,
 };
 use bytes::BufMut;
 
@@ -120,6 +121,7 @@ pub struct QuarkDriveFileSystem {
     skip_upload_same_size: bool,
     prefer_http_download: bool,
     upload_wait_timeout: u64,
+    oplog: Arc<OpLog>,
 }
 
 impl QuarkDriveFileSystem {
@@ -146,6 +148,7 @@ impl QuarkDriveFileSystem {
             skip_upload_same_size: false,
             prefer_http_download: false,
             upload_wait_timeout: 280,
+            oplog: Arc::new(OpLog::new("./logs", 7)),
         })
     }
 
@@ -190,6 +193,20 @@ impl QuarkDriveFileSystem {
         self.upload_wait_timeout = upload_wait_timeout;
         self
     }
+
+    pub fn set_oplog(&mut self, oplog: Arc<OpLog>) -> &mut Self {
+        self.oplog = oplog;
+        self
+    }
+
+    fn drive_mode(&self) -> &'static str {
+        if self.drive.is_open_mode() {
+            "open"
+        } else {
+            "cookie"
+        }
+    }
+
     fn list_uploading_files(&self, parent_file_path: &str) -> Vec<QuarkFile> {
         self.uploading
             .get(parent_file_path)
@@ -540,13 +557,22 @@ impl DavFileSystem for QuarkDriveFileSystem {
             if !file.dir {
                 return Err(FsError::Forbidden);
             }
-            self.drive
-                .remove_file(&file.fid, !self.no_trash)
-                .await
-                .map_err(|err| {
+            let mode = self.drive_mode();
+            let path_str = path.display().to_string();
+            match self.drive.remove_file(&file.fid, !self.no_trash).await {
+                Ok(()) => {
+                    self.oplog
+                        .log_delete(&path_str, true, mode, "ok")
+                        .await;
+                }
+                Err(err) => {
                     error!(path = %path.display(), error = %err, "remove directory failed");
-                    FsError::GeneralFailure
-                })?;
+                    self.oplog
+                        .log_delete(&path_str, true, mode, &format!("error:{err:#}"))
+                        .await;
+                    return Err(FsError::GeneralFailure);
+                }
+            }
             // sleep 1s for quark server to update cache
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             self.dir_cache.invalidate(&path).await;
@@ -571,13 +597,22 @@ impl DavFileSystem for QuarkDriveFileSystem {
             if !file.file {
                 return Err(FsError::Forbidden);
             }
-            self.drive
-                .remove_file(&file.fid, !self.no_trash)
-                .await
-                .map_err(|err| {
+            let mode = self.drive_mode();
+            let path_str = path.display().to_string();
+            match self.drive.remove_file(&file.fid, !self.no_trash).await {
+                Ok(()) => {
+                    self.oplog
+                        .log_delete(&path_str, false, mode, "ok")
+                        .await;
+                }
+                Err(err) => {
                     error!(path = %path.display(), error = %err, "remove file failed");
-                    FsError::GeneralFailure
-                })?;
+                    self.oplog
+                        .log_delete(&path_str, false, mode, &format!("error:{err:#}"))
+                        .await;
+                    return Err(FsError::GeneralFailure);
+                }
+            }
             // sleep 1s for quark server to update cache
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             self.dir_cache.invalidate_parent(&path).await;
@@ -870,6 +905,21 @@ impl QuarkDavFile {
         }
     }
 
+    fn upload_log_path(&self) -> String {
+        format!(
+            "{}/{}",
+            self.file.parent_path.as_deref().unwrap_or(""),
+            self.file.file_name
+        )
+    }
+
+    async fn log_upload_result(&self, size: u64, result: &str) {
+        self.fs
+            .oplog
+            .log_upload(&self.upload_log_path(), size, self.fs.drive_mode(), result)
+            .await;
+    }
+
     async fn do_flush(&mut self) -> Result<(), FsError> {
         let size = self.upload_state.size;
 
@@ -877,34 +927,45 @@ impl QuarkDavFile {
         let sha1 = format!("{:x}", self.sha1_ctx.clone().finalize());
         let md5 = format!("{:x}", self.md5_ctx.clone().compute());
 
-        // If old file exists, compare hash before deleting
+        // 本项目重复上传逻辑：hash/同尺寸可跳过；否则先删再传（Cookie/Open 共用）。
         if !self.file.fid.is_empty() {
-            // Fetch the cloud file's MD5 via download API and compare
-            match self.fs.drive.get_file_md5(&self.file.fid).await {
-                Ok(Some(cloud_md5)) if cloud_md5.eq_ignore_ascii_case(&md5) => {
-                    debug!(file_name = %self.file.file_name, md5 = %md5,
-                           "skip uploading: content hash unchanged");
-                    self.upload_state.is_finished = true;
-                    self.after_flush().await?;
-                    return Ok(());
-                }
-                Ok(_) => {
-                    // MD5 differs or not available, proceed with upload
-                }
-                Err(err) => {
-                    // Failed to get MD5, proceed with upload anyway
-                    debug!(file_name = %self.file.file_name, error = %err,
-                           "failed to get cloud file md5, proceeding with upload");
+            let mut skip = false;
+            // 列表里的 content_hash（多为 sha1）Open/Cookie 都能用，优先比对。
+            if let Some(ref cloud_hash) = self.file.content_hash {
+                if cloud_hash.eq_ignore_ascii_case(&sha1)
+                    || cloud_hash.eq_ignore_ascii_case(&md5)
+                {
+                    debug!(file_name = %self.file.file_name, hash = %cloud_hash,
+                           "skip uploading: content_hash unchanged");
+                    skip = true;
                 }
             }
-            if self.fs.skip_upload_same_size && self.file.size == size {
+            if !skip {
+                match self.fs.drive.get_file_md5(&self.file.fid).await {
+                    Ok(Some(cloud_md5)) if cloud_md5.eq_ignore_ascii_case(&md5) => {
+                        debug!(file_name = %self.file.file_name, md5 = %md5,
+                               "skip uploading: content hash unchanged");
+                        skip = true;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        debug!(file_name = %self.file.file_name, error = %err,
+                               "failed to get cloud file md5, proceeding with upload");
+                    }
+                }
+            }
+            if !skip && self.fs.skip_upload_same_size && self.file.size == size {
                 debug!(file_name = %self.file.file_name, size = size,
                        "skip uploading: same size");
+                skip = true;
+            }
+            if skip {
                 self.upload_state.is_finished = true;
+                self.log_upload_result(size, "skip").await;
                 self.after_flush().await?;
                 return Ok(());
             }
-            // Content is different, now delete old file before uploading
+            // 内容不同：先删旧文件再上传（不用 OpenList same_path_reuse）。
             if let Err(err) = self.fs.drive
                 .remove_file(&self.file.fid, !self.fs.no_trash).await
             {
@@ -932,6 +993,7 @@ impl QuarkDavFile {
         if res.data.finish {
             // 秒传
             self.upload_state.is_finished = true;
+            self.log_upload_result(size, "ok:rapid").await;
             self.after_flush().await?;
             return Ok(());
         }
@@ -970,6 +1032,7 @@ impl QuarkDavFile {
         })?;
         if res.data.finish {
             self.upload_state.is_finished = true;
+            self.log_upload_result(size, "ok:rapid").await;
             self.after_flush().await?;
             return Ok(());
         }
@@ -988,6 +1051,9 @@ impl QuarkDavFile {
         let parent_path = self.file.parent_path.as_ref().unwrap().clone();
         let parent_dir = self.parent_dir.clone();
         let fs = self.fs.clone();
+        let log_path = self.upload_log_path();
+        let log_size = size;
+        let log_mode = self.fs.drive_mode();
 
         let handle = tokio::spawn(async move {
             let _memory_guard = UploadMemoryGuard {
@@ -1053,6 +1119,9 @@ impl QuarkDavFile {
                         let _ = tokio::fs::remove_file(&temp_path).await;
                     }
                     fs.remove_uploading_file(&parent_path, &file_name);
+                    fs.oplog
+                        .log_upload(&log_path, log_size, log_mode, "ok")
+                        .await;
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     fs.dir_cache.invalidate(parent_dir.as_path()).await;
                     return Ok(());
@@ -1080,6 +1149,9 @@ impl QuarkDavFile {
                 error!(file_name = %file_name, error = %err, "finish upload failed");
                 FsError::GeneralFailure
             })?;
+            fs.oplog
+                .log_upload(&log_path, log_size, log_mode, "ok")
+                .await;
 
             if !temp_path.is_empty() && tokio::fs::metadata(&temp_path).await.is_ok() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
@@ -1167,13 +1239,15 @@ impl QuarkDavFile {
         self.upload_state.memory_data.clear();
         let md5 = md5.to_string();
         let sha1 = sha1.to_string();
+        let log_path = self.upload_log_path();
+        let log_mode = self.fs.drive_mode();
 
         let handle = tokio::spawn(async move {
             let _memory_guard = UploadMemoryGuard {
                 pool: fs.upload_memory.clone(),
                 reserved: memory_reserved,
             };
-            drive
+            match drive
                 .upload_open_file(
                     &file_name,
                     size,
@@ -1183,10 +1257,20 @@ impl QuarkDavFile {
                     &source,
                 )
                 .await
-                .map_err(|err| {
+            {
+                Ok(()) => {
+                    fs.oplog
+                        .log_upload(&log_path, size, log_mode, "ok")
+                        .await;
+                }
+                Err(err) => {
                     error!(file_name = %file_name, error = %err, "open upload failed");
-                    FsError::GeneralFailure
-                })?;
+                    fs.oplog
+                        .log_upload(&log_path, size, log_mode, &format!("error:{err:#}"))
+                        .await;
+                    return Err(FsError::GeneralFailure);
+                }
+            }
             if !temp_path.is_empty() && tokio::fs::metadata(&temp_path).await.is_ok() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }

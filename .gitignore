@@ -25,3 +25,4 @@ temp
 # Open 模式 token / compose 数据目录
 /data/
 quark-token.json
+/logs/

@@ -17,6 +17,7 @@ use alert::Alert;
 use cache::Cache;
 use drive::open::{OpenCredentials, OPEN_API_BASE};
 use drive::*;
+use oplog::OpLog;
 use util::parse_byte_size;
 use vfs::QuarkDriveFileSystem;
 use webdav::WebDavServer;
@@ -24,6 +25,7 @@ use webdav::WebDavServer;
 mod alert;
 mod cache;
 mod drive;
+mod oplog;
 mod prefetch;
 mod util;
 mod vfs;
@@ -76,9 +78,15 @@ struct Opt {
     /// Upload buffer size in bytes, defaults to 16MB
     #[arg(long, default_value = "16777216")]
     upload_buffer_size: usize,
-    /// 上传内存上限，支持 64MB / 1GB；并行合计，超限落盘。0=始终落盘
+    /// 上传内存上限，支持 64MB / 1GB；并行合计，超限落盘。0=始终落盘（Cookie/Open 通用）
     #[arg(long, env = "UPLOAD_MEMORY_LIMIT", default_value = "64MB")]
     upload_memory_limit: String,
+    /// 上传/删除操作日志目录
+    #[arg(long, env = "OP_LOG_DIR", default_value = "./logs")]
+    op_log_dir: String,
+    /// 操作日志保留天数，默认 7；未设置即为 7
+    #[arg(long, env = "OP_LOG_RETENTION_DAYS", default_value_t = 7)]
+    op_log_retention_days: u64,
     /// Directory entries cache size
     #[arg(long, default_value = "1000")]
     cache_size: u64,
@@ -245,6 +253,17 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let _ = drive.check_cookie_auth().await;
     }
+    let oplog = Arc::new(OpLog::new(
+        &opt.op_log_dir,
+        opt.op_log_retention_days,
+    ));
+    info!(
+        op_log_dir = %oplog.dir().display(),
+        retention_days = oplog.retention_days(),
+        "operation log enabled"
+    );
+    oplog.start_prune_task();
+
     let mut fs = QuarkDriveFileSystem::new(drive, opt.root, opt.cache_size, opt.cache_ttl)?;
     fs.set_no_trash(opt.no_trash)
         .set_read_only(opt.read_only)
@@ -253,7 +272,8 @@ async fn main() -> anyhow::Result<()> {
         .set_skip_upload_same_size(opt.skip_upload_same_size)
         .set_prefer_http_download(opt.prefer_http_download)
         .set_upload_wait_timeout(opt.upload_wait_timeout)
-        .set_chunk_cache_bytes(opt.chunk_cache_mb * 1024 * 1024);
+        .set_chunk_cache_bytes(opt.chunk_cache_mb * 1024 * 1024)
+        .set_oplog(oplog);
     let cache = Arc::new(fs.dir_cache.clone());
     start_periodic_invalidate(cache.clone(), opt.refresh_cache_secs_interval);
     let fs_for_browser = fs.clone();
