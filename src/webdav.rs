@@ -906,7 +906,9 @@ fn console_float_css() -> &'static str {
 .qd-modal th,.qd-modal td{
   padding:11px 12px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:top;
 }
-.qd-modal th:first-child,.qd-modal td:first-child{padding-left:8px}
+.qd-modal th:first-child,.qd-modal td:first-child{
+  padding-left:8px;white-space:nowrap;font-variant-numeric:tabular-nums;
+}
 .qd-modal th:last-child,.qd-modal td:last-child{padding-right:8px}
 .qd-modal th{color:var(--muted);font-weight:600;background:#fff;position:sticky;top:0}
 .qd-modal .path{word-break:break-all;color:var(--ink)}

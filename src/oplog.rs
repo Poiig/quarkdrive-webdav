@@ -77,9 +77,9 @@ impl OpLog {
     }
 
     async fn write_line(&self, body: &str) {
-        // 固定 Asia/Shanghai，避免 Docker 默认 UTC 导致日志日期错位。
+        // 固定 Asia/Shanghai（北京时间）；不再附带 +0800，历史表更易读、少被截断。
         let now = now_shanghai();
-        let stamped = format!("{} {}", now.format("%Y-%m-%d %H:%M:%S %z"), body);
+        let stamped = format!("{} {}", now.format("%Y-%m-%d %H:%M:%S"), body);
 
         // 同步打到控制台（须用模块 target，才能过 RUST_LOG=quarkdrive_webdav=info）。
         info!("{stamped}");
@@ -249,7 +249,8 @@ async fn list_op_log_files(dir: &Path) -> Vec<(PathBuf, NaiveDate, String)> {
 
 /// 解析一行控制台/文件日志。格式：`时间 upload|delete ...`
 fn parse_op_line(line: &str, file: &str) -> Option<OpLogEntry> {
-    // `2026-10-24 14:22:15 +0800 upload result=ok mode=open size=1.8 MB path=/a/b`
+    // 新：`2026-10-24 14:22:15 upload result=ok ...`
+    // 旧：`2026-10-24 14:22:15 +0800 upload result=ok ...`（兼容）
     let rest = line.trim();
     let (time, body) = if let Some(i) = rest.find(" upload ") {
         (&rest[..i], &rest[i + 1..])
@@ -258,6 +259,11 @@ fn parse_op_line(line: &str, file: &str) -> Option<OpLogEntry> {
     } else {
         return None;
     };
+    let time = time
+        .trim()
+        .trim_end_matches("+0800")
+        .trim_end_matches("UTC+8")
+        .trim();
     let kind = if body.starts_with("upload ") {
         "upload"
     } else if body.starts_with("delete ") {
@@ -303,7 +309,7 @@ fn parse_op_line(line: &str, file: &str) -> Option<OpLogEntry> {
         return None;
     }
     Some(OpLogEntry {
-        time: time.trim().to_string(),
+        time: time.to_string(),
         kind: kind.into(),
         result,
         mode,
@@ -332,5 +338,14 @@ mod tests {
         assert_eq!(e.result, "ok");
         assert_eq!(e.size, "1.8 MB");
         assert_eq!(e.path, "/我的备份/a.HEIC");
+        assert_eq!(e.time, "2026-10-24 14:22:15");
+    }
+
+    #[test]
+    fn parse_upload_line_without_offset() {
+        let line = "2026-10-24 21:19:25 upload result=ok mode=open size=3.9 MB path=/我的备份/a.MOV";
+        let e = parse_op_line(line, "op-2026-10-24.log").unwrap();
+        assert_eq!(e.time, "2026-10-24 21:19:25");
+        assert_eq!(e.result, "ok");
     }
 }

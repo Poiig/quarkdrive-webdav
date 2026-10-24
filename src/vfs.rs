@@ -306,32 +306,35 @@ impl QuarkDriveFileSystem {
         }
     }
 
-    /// 上传完成后等到父目录列表能看见该文件，再摘掉 uploading 占位。
-    /// 否则 CloudSync 会报「未找到远程文件」。
+    /// 上传完成后等到父目录列表能看见该文件。
+    /// 返回是否已在远端列表中见到；无论是否见到都先保留 uploading 占位一段时间，
+    /// 因为 CloudSync 常在 PUT 一返回就 PROPFIND，夸克列表/编码偶发滞后时占位能兜住「未找到远程文件」。
     async fn wait_until_remote_visible(
         &self,
         parent_dir: &Path,
         file_name: &str,
         size: u64,
         parent_key: &str,
-    ) {
+    ) -> bool {
         self.update_uploading_file(parent_key, file_name, size);
         self.dir_cache.invalidate(parent_dir).await;
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        // 90s：小文件也偶发列表延迟；超时仍保留占位。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
         let mut delay = std::time::Duration::from_millis(300);
         let key = Self::parent_cache_key(parent_dir);
+        let mut visible = false;
 
         loop {
             if let Some(files) = self.dir_cache.get_or_insert(&key).await {
-                if files.iter().any(|f| f.file_name == file_name) {
+                if files.iter().any(|f| file_names_equal(&f.file_name, file_name)) {
                     debug!(
                         parent = %parent_dir.display(),
                         file_name = %file_name,
                         "upload visible in remote listing"
                     );
-                    self.remove_uploading_file(parent_key, file_name);
-                    return;
+                    visible = true;
+                    break;
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -340,13 +343,27 @@ impl QuarkDriveFileSystem {
                     file_name = %file_name,
                     "remote listing still missing file after upload; keep uploading stub for PROPFIND"
                 );
-                // 不 remove：占位继续支撑后续 PROPFIND，避免 CloudSync 报未找到远程文件。
-                return;
+                break;
             }
             self.dir_cache.invalidate(parent_dir).await;
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(std::time::Duration::from_secs(2));
         }
+
+        // 延迟摘占位：给 CloudSync 紧接 PUT 的 PROPFIND 留窗口。
+        let fs = self.clone();
+        let parent_key = parent_key.to_string();
+        let file_name = file_name.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            fs.remove_uploading_file(&parent_key, &file_name);
+            debug!(
+                parent = %parent_key,
+                file_name = %file_name,
+                "deferred remove uploading stub"
+            );
+        });
+        visible
     }
 
     async fn find_in_cache(&self, path: &Path) -> Result<Option<QuarkFile>, FsError> {
@@ -359,7 +376,7 @@ impl QuarkDriveFileSystem {
                 .into_owned();
             let file = self.dir_cache.get_or_insert(&parent_str).await.and_then(|files| {
                 for file in &files {
-                    if file.file_name == file_name {
+                    if file_names_equal(&file.file_name, &file_name) {
                         return Some(file.clone());
                     }
                 }
@@ -387,7 +404,7 @@ impl QuarkDriveFileSystem {
             if let Some(f) = self
                 .list_uploading_files(&parent_key)
                 .into_iter()
-                .find(|f| f.file_name == want)
+                .find(|f| file_names_equal(&f.file_name, want))
             {
                 return Ok(Some(f));
             }
@@ -549,7 +566,10 @@ impl DavFileSystem for QuarkDriveFileSystem {
 
             // 合并正在上传的占位，避免 CloudSync 列目录时看不到刚 PUT 的文件。
             for up in self.list_uploading_files(&key) {
-                if !files.iter().any(|f| f.file_name == up.file_name) {
+                if !files
+                    .iter()
+                    .any(|f| file_names_equal(&f.file_name, &up.file_name))
+                {
                     files.push(up);
                 }
             }
@@ -1430,18 +1450,20 @@ impl QuarkDavFile {
             } else {
                 match result {
                     Ok(_) => {
-                        tracker.finish(&progress_path, "ok", "");
-                        fs.oplog
-                            .log_upload(&log_path, log_size, log_mode, "ok")
+                        // 先等列表/占位就绪再记 ok，避免「日志成功但群晖报未找到远程文件」。
+                        let visible = fs
+                            .wait_until_remote_visible(
+                                parent_dir.as_path(),
+                                &file_name,
+                                log_size,
+                                &parent_path,
+                            )
                             .await;
-                        // 等夸克列表可见后再摘占位，避免 CloudSync PUT 后 PROPFIND 404。
-                        fs.wait_until_remote_visible(
-                            parent_dir.as_path(),
-                            &file_name,
-                            log_size,
-                            &parent_path,
-                        )
-                        .await;
+                        let result = if visible { "ok" } else { "ok:list_pending" };
+                        tracker.finish(&progress_path, "ok", result);
+                        fs.oplog
+                            .log_upload(&log_path, log_size, log_mode, result)
+                            .await;
                         Ok(())
                     }
                     Err(err) => {
@@ -1603,17 +1625,19 @@ impl QuarkDavFile {
             } else {
                 match result {
                     Ok(()) => {
-                        tracker.finish(&progress_path, "ok", "");
-                        fs.oplog
-                            .log_upload(&log_path, size, log_mode, "ok")
+                        let visible = fs
+                            .wait_until_remote_visible(
+                                parent_dir.as_path(),
+                                &file_name,
+                                size,
+                                &parent_path,
+                            )
                             .await;
-                        fs.wait_until_remote_visible(
-                            parent_dir.as_path(),
-                            &file_name,
-                            size,
-                            &parent_path,
-                        )
-                        .await;
+                        let result = if visible { "ok" } else { "ok:list_pending" };
+                        tracker.finish(&progress_path, "ok", result);
+                        fs.oplog
+                            .log_upload(&log_path, size, log_mode, result)
+                            .await;
                         Ok(())
                     }
                     Err(err) => {
@@ -2261,6 +2285,26 @@ impl Drop for UploadMemoryGuard {
     fn drop(&mut self) {
         self.pool.release(self.reserved);
     }
+}
+
+/// 文件名比较：兼容 Unicode 组合差异（部分客户端 NFC、列表 NFD 时避免「看不到」）。
+fn file_names_equal(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    // 无第三方 normalize 时：去掉常见组合音标后再比（对中日韩路径基本等价于原串）。
+    // 仍相等失败则再比「去零宽字符」形式，兜住拷贝时夹带的不可见字符。
+    fn fold(s: &str) -> String {
+        s.chars()
+            .filter(|c| {
+                !matches!(
+                    c,
+                    '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}'
+                )
+            })
+            .collect()
+    }
+    fold(a) == fold(b)
 }
 
 /// 路径级上传互斥：任务结束（成功/失败/提前 return）时自动摘掉，允许合法重试。
