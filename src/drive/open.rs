@@ -743,23 +743,40 @@ impl OpenClient {
         offset: u64,
         len: u64,
     ) -> Result<String> {
+        // OSS 偶发 504/502 很常见（网关超时），多试几次；每次重开文件流。
+        const MAX_ATTEMPTS: u32 = 5;
         let mut last_err = None;
-        for attempt in 0..3u32 {
-            // 每次重试重新打开文件流（流只能消费一次）。
+        for attempt in 0..MAX_ATTEMPTS {
             match self
                 .upload_part(put_client, item, headers, source, offset, len)
                 .await
             {
-                Ok(etag) => return Ok(etag),
+                Ok(etag) => {
+                    if attempt > 0 {
+                        info!(
+                            part = item.part_number,
+                            attempt = attempt + 1,
+                            "open upload part succeeded after retry"
+                        );
+                    }
+                    return Ok(etag);
+                }
                 Err(err) => {
+                    let retryable = is_retryable_oss_put_error(&err);
                     warn!(
                         part = item.part_number,
                         attempt = attempt + 1,
+                        retryable = retryable,
                         error = %err,
                         "open upload part failed, retrying"
                     );
                     last_err = Some(err);
-                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                    if !retryable || attempt + 1 >= MAX_ATTEMPTS {
+                        break;
+                    }
+                    // 504 等多等一会再传，退避上限 30s。
+                    let delay = (1u64 << attempt).min(30);
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 }
             }
         }
@@ -1318,6 +1335,24 @@ pub async fn exchange_token_by_nonce(
         data.app_id,
         data.sign_key,
     ))
+}
+
+/// OSS 分片 PUT 是否值得重试（网关超时/限流/瞬时网络错误）。
+fn is_retryable_oss_put_error(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}").to_ascii_lowercase();
+    s.contains("504")
+        || s.contains("502")
+        || s.contains("503")
+        || s.contains("429")
+        || s.contains("408")
+        || s.contains("gateway time-out")
+        || s.contains("gateway timeout")
+        || s.contains("timed out")
+        || s.contains("timeout")
+        || s.contains("connection reset")
+        || s.contains("connection refused")
+        || s.contains("error sending request")
+        || s.contains("broken pipe")
 }
 
 /// 夸克 Open `get_upload_urls` / `upload_finish` 单次 part list 上限约 256。
