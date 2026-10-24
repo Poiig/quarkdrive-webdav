@@ -16,6 +16,14 @@ concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  # CI 优先速度：关 LTO，多 codegen unit（镜像体积略增可接受）
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,34 +32,28 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Rust 工具链
+      - name: 安装 Rust 工具链（仅 amd64 musl）
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl
 
       - name: 缓存 Cargo 依赖
         uses: Swatinem/rust-cache@v2
         with:
-          key: docker-musl
+          key: docker-musl-amd64
+          shared-key: docker-musl-amd64
 
-      - name: 安装交叉编译工具链
-        run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+      - name: 安装 musl + mold
+        run: sudo apt-get update && sudo apt-get install -y musl-tools mold
 
       - name: 编译 amd64
         run: cargo build --release --target x86_64-unknown-linux-musl
 
-      - name: 交叉编译 arm64
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target aarch64-unknown-linux-musl
-
-      - name: 准备二进制文件
+      - name: 准备二进制
         run: |
-          mkdir -p bin/amd64 bin/arm64
+          mkdir -p bin/amd64
           cp target/x86_64-unknown-linux-musl/release/quarkdrive-webdav bin/amd64/
-          cp target/aarch64-unknown-linux-musl/release/quarkdrive-webdav bin/arm64/
           strip bin/amd64/quarkdrive-webdav
-          aarch64-linux-gnu-strip bin/arm64/quarkdrive-webdav
 
       - name: 设置 Docker 镜像标签
         id: meta
@@ -77,13 +79,15 @@ jobs:
       - name: 设置 Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: 构建并推送多架构 Docker 镜像
+      - name: 构建并推送 amd64 镜像
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
+          # PR 时 load 到本地校验；push 时不需要
+          load: ${{ github.event_name == 'pull_request' }}

@@ -1,15 +1,13 @@
 # 运行阶段：极简 Alpine 镜像
-# 二进制文件由 CI 预先交叉编译，通过 TARGETARCH 自动选择对应架构
+# 暂只发布 amd64；二进制由 CI 预编译到 bin/amd64/
 FROM alpine:3.19
-
-ARG TARGETARCH
 
 RUN apk add --no-cache cronie findutils tzdata && rm -rf /var/cache/apk/*
 ENV TZ=Asia/Shanghai
 RUN addgroup -S app && adduser -S app -G app -s /bin/sh
 WORKDIR /app
 
-COPY bin/${TARGETARCH}/quarkdrive-webdav /usr/local/bin/quarkdrive-webdav
+COPY bin/amd64/quarkdrive-webdav /usr/local/bin/quarkdrive-webdav
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /usr/local/bin/quarkdrive-webdav /entrypoint.sh \
     && mkdir -p /data /app/logs \
