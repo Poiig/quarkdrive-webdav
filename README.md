@@ -87,15 +87,15 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录�
 
 ### 内存说明（为何 RSS 会高于 `UPLOAD_MEMORY_LIMIT`）
 
-进程占用 ≈ 上传接收池 + 目录缓存 + 播放预取缓存 + 进行中的分片缓冲 + Rust/HTTP 基线，大约：
+进程占用 ≈ 上传接收池 + 目录缓存 + 播放预取缓存 + 流式上传缓冲 + Rust/HTTP 基线，大约：
 
-- `UPLOAD_MEMORY_LIMIT`（默认 64MB，示例 compose 勿设太大）
+- `UPLOAD_MEMORY_LIMIT`（默认 64MB；只限「接收上传内容」，不是容器总内存）
 - `DIR_CACHE_BYTES`（默认 64MB）
 - `CHUNK_CACHE_MB`（默认 **128MB**）
 - 预取在途：约 `PREFETCH_AHEAD × PREFETCH_CHUNK_MB`（默认 4×16 ≈ **64MB**/活跃下载）
-- Open 大文件上传：为满足 part list≤256 会抬高单片，峰值约「并发上传数 × 单片大小」
+- **大文件上传**：分片 PUT 已改为**文件流式**（约 64KB 读缓冲），不再「并发 × 单片大小」；大于 8MB 会先落盘再传，低配也能传数 GB/数十 GB
 
-因此把 `UPLOAD_MEMORY_LIMIT` 调到 512MB **不会**把总内存钉在 512MB，反而更容易抬高 RSS。容器若要用 `mem_limit`/`deploy.resources`，请按上面几项之和留余量（低配建议总限额 ≥512MB～1GB）。
+因此不必为了传大文件把 `UPLOAD_MEMORY_LIMIT` 调到 512MB。容器若设 `mem_limit`，低配建议 ≥512MB～1GB（主要留给预取/目录缓存）。
 
 ## 免责声明
 

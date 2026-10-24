@@ -9,13 +9,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::RwLock;
+use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -681,13 +682,16 @@ impl OpenClient {
                     continue;
                 }
                 let offset = idx as u64 * part_size;
-                let buf = source
-                    .read_at(offset, this_size as usize)
-                    .await
-                    .with_context(|| format!("读取上传分片 {} 失败", item.part_number))?;
-                // Bytes 引用计数克隆，重试时不再整片 memcpy。
+                // 流式 PUT：单片可到数百 MB，整段进内存会在低配机器 OOM。
                 let etag = self
-                    .upload_part_with_retry(client, item, &common_headers, Bytes::from(buf))
+                    .upload_part_with_retry(
+                        client,
+                        item,
+                        &common_headers,
+                        source,
+                        offset,
+                        this_size,
+                    )
                     .await
                     .with_context(|| format!("上传分片 {} 失败", item.part_number))?;
                 etags[idx] = Some(etag);
@@ -733,12 +737,14 @@ impl OpenClient {
         client: &ClientWithMiddleware,
         item: &UploadUrlItem,
         headers: &CommonOssHeaders,
-        bytes: Bytes,
+        source: &UploadSource,
+        offset: u64,
+        len: u64,
     ) -> Result<String> {
         let mut last_err = None;
         for attempt in 0..3u32 {
             match self
-                .upload_part(client, item, headers, bytes.clone())
+                .upload_part(client, item, headers, source, offset, len)
                 .await
             {
                 Ok(etag) => return Ok(etag),
@@ -762,7 +768,9 @@ impl OpenClient {
         client: &ClientWithMiddleware,
         item: &UploadUrlItem,
         headers: &CommonOssHeaders,
-        bytes: Bytes,
+        source: &UploadSource,
+        offset: u64,
+        len: u64,
     ) -> Result<String> {
         let mut hdrs = HeaderMap::new();
         hdrs.insert(
@@ -778,10 +786,15 @@ impl OpenClient {
                 HeaderValue::from_str(&headers.x_oss_content_sha256)?,
             );
         }
+        hdrs.insert(CONTENT_LENGTH, HeaderValue::from(len));
+        let body = source
+            .upload_body(offset, len)
+            .await
+            .with_context(|| format!("打开分片 {} 数据流失败", item.part_number))?;
         let res = client
             .put(&item.upload_url)
             .headers(hdrs)
-            .body(bytes)
+            .body(body)
             .send()
             .await?
             .error_for_status()?;
@@ -1179,7 +1192,7 @@ pub enum UploadSource {
 }
 
 impl UploadSource {
-    /// 按偏移读取一段，供 proof / 分片上传复用。
+    /// 按偏移读取一段，供 proof 校验（通常只有几字节）。
     async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
@@ -1204,6 +1217,41 @@ impl UploadSource {
                 let mut buf = vec![0u8; len];
                 file.read_exact(&mut buf).await?;
                 Ok(buf)
+            }
+        }
+    }
+
+    /// 构造分片 PUT 请求体：路径源按块流式读，避免大单片整段进内存。
+    async fn upload_body(&self, offset: u64, len: u64) -> Result<reqwest::Body> {
+        if len == 0 {
+            return Ok(reqwest::Body::from(Bytes::new()));
+        }
+        match self {
+            UploadSource::Memory(data) => {
+                let start = offset as usize;
+                let end = start
+                    .checked_add(len as usize)
+                    .filter(|e| *e <= data.len())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "内存上传越界: offset={offset}, len={len}, size={}",
+                            data.len()
+                        )
+                    })?;
+                Ok(reqwest::Body::from(data.slice(start..end)))
+            }
+            UploadSource::Path(path) => {
+                // 64KB 读缓冲：单片再大也只占固定小内存，低配可传数 GB/数十 GB。
+                const STREAM_BUF: usize = 64 * 1024;
+                let mut file = tokio::fs::File::open(path)
+                    .await
+                    .with_context(|| format!("打开临时文件失败: {}", path.display()))?;
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .with_context(|| format!("定位分片 offset={offset} 失败"))?;
+                let reader = file.take(len);
+                let stream = ReaderStream::with_capacity(reader, STREAM_BUF);
+                Ok(reqwest::Body::wrap_stream(stream))
             }
         }
     }

@@ -258,7 +258,9 @@ async fn main() -> anyhow::Result<()> {
         "upload memory limit"
     );
     prefetch::init_prefetch_config(opt.prefetch_chunk_mb, opt.prefetch_ahead);
-    upload_limit::init_upload_concurrency(opt.upload_max_concurrent);
+    // 分片已流式读取：预算按「每任务 ~1MB」计，并结合可用内存收紧并发。
+    let stream_budget = upload_limit::resolve_stream_budget(upload_memory_limit);
+    upload_limit::init_upload_concurrency(opt.upload_max_concurrent, stream_budget);
 
     let drive_config = build_drive_config(&opt, alert)?;
     let auth_user = opt.auth_user;

@@ -20,9 +20,10 @@ dav-server = { version = "0.8.0", default-features = false, features = ["hyper"]
 tokio = { version = "1.45.1", features = ["full"] }
 futures-util = "0.3.31"
 clap = { version = "4.5.40", features = ["derive", "env", "wrap_help"] }
-reqwest = { version = "0.12.20", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12.20", default-features = false, features = ["rustls-tls", "stream"] }
 reqwest-middleware = { version = "0.4.2", features = ["json"] }
 reqwest-retry = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
 #reqwest-tracing = "0.5.7"
 serde = { version = "1.0.219", features = ["derive"] }
 anyhow = "1.0.98"

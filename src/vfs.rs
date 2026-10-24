@@ -1016,6 +1016,16 @@ impl QuarkDavFile {
         }
     }
 
+    /// 超过阈值则落盘：分片上传可走文件流，不把整片（甚至整文件）留在堆上。
+    async fn ensure_spill_for_stream_upload(&mut self, size: u64) -> Result<(), FsError> {
+        // 8MB：常见 API part_size；更大的文件即使接收池允许多，也改为流式。
+        const SPILL_THRESHOLD: u64 = 8 * 1024 * 1024;
+        if self.upload_state.use_memory && size > SPILL_THRESHOLD {
+            self.spill_memory_to_temp(&[]).await?;
+        }
+        Ok(())
+    }
+
     fn upload_log_path(&self) -> String {
         format!(
             "{}/{}",
@@ -1167,6 +1177,8 @@ impl QuarkDavFile {
         // We still await the result — if the client stays connected, it gets the real result.
         // If the client disconnects (e.g. timeout), the spawned task continues uploading.
         let drive = self.fs.drive.clone();
+        // 较大文件强制落盘，后续分片 PUT 走文件流，避免整片进内存。
+        self.ensure_spill_for_stream_upload(size).await?;
         let memory_reserved = self.upload_state.memory_reserved;
         // 配额交由后台任务归还，避免 self 清空时重复 release。
         self.upload_state.memory_reserved = 0;
@@ -1382,6 +1394,8 @@ impl QuarkDavFile {
             }
         }
 
+        // Open 大文件单片可达数百 MB：先落盘再流式 PUT，低内存也能传完。
+        self.ensure_spill_for_stream_upload(size).await?;
         let drive = self.fs.drive.clone();
         let file_name = self.file.file_name.clone();
         let parent_file_id = self.parent_file_id.clone();
