@@ -267,31 +267,49 @@ impl Drop for SmartUploadPermit {
     }
 }
 
-/// 控制台手动把指定路径插到队首并抢走快车道；已是全速/小文件则返回 false。
-pub fn promote_path(path: &str) -> bool {
+/// 控制台手动提升结果：是否成功，以及被挤回慢传的路径（用于刷新 UI）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromoteResult {
+    pub ok: bool,
+    pub demoted: Vec<String>,
+}
+
+/// 控制台手动把指定路径插到队首并抢走快车道；已是全速/小文件则失败。
+pub fn promote_path(path: &str) -> PromoteResult {
     let map = path_lanes();
     let Some(binding) = map.get(path) else {
-        return false;
+        return PromoteResult {
+            ok: false,
+            demoted: Vec::new(),
+        };
     };
     let ticket = binding.ticket;
     let mine = binding.is_fast.clone();
     if mine.load(Ordering::Acquire) {
-        return false;
+        return PromoteResult {
+            ok: false,
+            demoted: Vec::new(),
+        };
     }
     drop(binding);
 
     let sched = scheduler();
     let mut st = sched.state.lock().unwrap_or_else(|e| e.into_inner());
     if !st.order.iter().any(|t| *t == ticket) {
-        return false;
+        return PromoteResult {
+            ok: false,
+            demoted: Vec::new(),
+        };
     }
     st.order.retain(|t| *t != ticket);
     st.order.push_front(ticket);
+    let mut demoted = Vec::new();
     if let Some(old) = st.fast_holder {
         if old != ticket {
             for e in map.iter() {
                 if e.ticket == old {
                     e.is_fast.store(false, Ordering::Release);
+                    demoted.push(e.key().clone());
                 }
             }
         }
@@ -300,8 +318,8 @@ pub fn promote_path(path: &str) -> bool {
     mine.store(true, Ordering::Release);
     drop(st);
     sched.notify.notify_waiters();
-    debug!(ticket, path, "upload manually promoted to fast lane");
-    true
+    debug!(ticket, path, demoted = ?demoted, "upload manually promoted to fast lane");
+    PromoteResult { ok: true, demoted }
 }
 
 /// 加入智能调度：大文件拿 FIFO 票并立即尝试占快车道；小文件直接放行。
@@ -364,6 +382,50 @@ mod tests {
         assert!(p.ticket.is_none());
         assert_eq!(p.lane(), UploadLane::Small);
         assert!(p.is_fast());
+    }
+
+    #[test]
+    fn manual_promote_demotes_previous_fast() {
+        // 独立调度器快照：直接往 PATH_LANES / order 塞两票验证抢车道。
+        init(1, 64 * 1024);
+        let sched = scheduler();
+        let fast_flag = Arc::new(AtomicBool::new(true));
+        let slow_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut st = sched.state.lock().unwrap();
+            st.order.clear();
+            st.order.push_back(100);
+            st.order.push_back(200);
+            st.fast_holder = Some(100);
+            st.next_ticket = 201;
+        }
+        let map = path_lanes();
+        map.insert(
+            "/fast.bin".into(),
+            LaneBinding {
+                ticket: 100,
+                is_fast: fast_flag.clone(),
+            },
+        );
+        map.insert(
+            "/slow.bin".into(),
+            LaneBinding {
+                ticket: 200,
+                is_fast: slow_flag.clone(),
+            },
+        );
+
+        let result = promote_path("/slow.bin");
+        assert!(result.ok);
+        assert_eq!(result.demoted, vec!["/fast.bin".to_string()]);
+        assert!(slow_flag.load(Ordering::Acquire));
+        assert!(!fast_flag.load(Ordering::Acquire));
+        let st = sched.state.lock().unwrap();
+        assert_eq!(st.fast_holder, Some(200));
+        assert_eq!(st.order.front().copied(), Some(200));
+
+        map.remove("/fast.bin");
+        map.remove("/slow.bin");
     }
 
     fn pollster_join_small() -> SmartUploadPermit {

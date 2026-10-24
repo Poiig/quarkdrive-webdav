@@ -618,11 +618,19 @@ impl QuarkDriveWebDav {
             else {
                 return json_response(serde_json::json!({ "ok": false, "error": "missing path" }));
             };
-            let ok = crate::upload_schedule::promote_path(target);
-            if ok {
+            let result = crate::upload_schedule::promote_path(target);
+            if result.ok {
                 self.fs.upload_tracker().set_lane(target, "fast");
+                // 原全速立刻改标慢传，否则面板上会暂时出现两个「全速」。
+                for demoted in &result.demoted {
+                    self.fs.upload_tracker().set_lane(demoted, "slow");
+                }
             }
-            return json_response(serde_json::json!({ "ok": ok, "path": target }));
+            return json_response(serde_json::json!({
+                "ok": result.ok,
+                "path": target,
+                "demoted": result.demoted,
+            }));
         }
 
         if path == "/__uploads.json" {
@@ -1002,10 +1010,13 @@ fn console_float_html() -> &'static str {
     const q=new URLSearchParams({path});
     btn.disabled=true;
     try{
-      if(btn.classList.contains("cancel")){
-        await fetch("/__uploads/cancel?"+q,{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}});
-      }else if(btn.classList.contains("promote")){
-        await fetch("/__uploads/promote?"+q,{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}});
+      const url=btn.classList.contains("cancel")
+        ?("/__uploads/cancel?"+q)
+        :("/__uploads/promote?"+q);
+      const r=await fetch(url,{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}});
+      const data=await r.json().catch(()=>({}));
+      if(!r.ok || data.ok===false){
+        floatHint.textContent=btn.classList.contains("cancel")?"取消失败":"提升失败";
       }
       await poll();
     }catch(_){ floatHint.textContent="操作失败"; }
@@ -2348,7 +2359,8 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
                         .unwrap());
                 }
 
-                if is_browser {
+                // 控制台 API 含 POST（清除/取消/提升），不能只靠 is_browser（仅 GET/HEAD）。
+                if is_browser || Self::is_console_path(&req_path) {
                     if let Some(resp) = browser_handler.handle_browser_request(&req).await {
                         return Ok(resp);
                     }
@@ -2357,7 +2369,7 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
                 let config = DavConfig::new().principal(auth_user_val);
                 dav_server.handle_with(config, req).await
             } else {
-                if is_browser {
+                if is_browser || Self::is_console_path(&req_path) {
                     if let Some(resp) = browser_handler.handle_browser_request(&req).await {
                         return Ok(resp);
                     }
