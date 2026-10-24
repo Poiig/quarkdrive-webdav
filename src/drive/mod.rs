@@ -181,13 +181,13 @@ impl QuarkDrive {
 
         // 分片 PUT 必须用裸 Client：RetryTransientMiddleware 会 clone 请求，流式 body 会报
         // "Request object is not cloneable"。应用层已有 upload_part_with_retry。
-        // 家宽上行慢时单片 PUT 可能超过 5 分钟；过短会在服务端 504 之前先被本地掐断。
+        // 不设请求总超时：11G+ 在慢传/卡顿时单片可达数十分钟，固定 900s 会把仍在传的分片误判失败。
+        // 仅保留 connect_timeout；卡住的连接靠 OSS/对端关闭或应用层重试收敛。
         let oss_put_client = reqwest::Client::builder()
             .user_agent("quarkdrive-webdav/oss-put")
             .pool_idle_timeout(Duration::from_secs(50))
             .pool_max_idle_per_host(pool_size)
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(900))
             .build()?;
 
         let alert = config.alert.clone();
