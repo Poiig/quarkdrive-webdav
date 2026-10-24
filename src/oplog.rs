@@ -1,4 +1,4 @@
-//! 上传 / 删除操作审计日志，按天落盘并按保留天数清理。
+//! 上传 / 删除操作审计日志：写文件，同时打到 stdout（Docker / 群晖控制台可见）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,7 +7,9 @@ use std::time::Duration;
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+use crate::util::format_bytes;
 
 #[derive(Debug, Clone)]
 pub struct OpLog {
@@ -47,7 +49,8 @@ impl OpLog {
 
     pub async fn log_upload(&self, path: &str, size: u64, mode: &str, result: &str) {
         self.write_line(&format!(
-            "upload result={result} mode={mode} size={size} path={path}"
+            "upload result={result} mode={mode} size={} path={path}",
+            format_bytes(size)
         ))
         .await;
     }
@@ -61,15 +64,20 @@ impl OpLog {
     }
 
     async fn write_line(&self, body: &str) {
+        let now = Local::now();
+        let stamped = format!("{} {}", now.format("%Y-%m-%d %H:%M:%S %z"), body);
+
+        // 同步打到控制台，便于 docker logs / 群晖容器日志查看。
+        info!(target: "oplog", "{body}");
+
         if let Err(err) = fs::create_dir_all(&self.dir).await {
             warn!(error = %err, dir = %self.dir.display(), "create op log dir failed");
             return;
         }
-        let now = Local::now();
         let file = self
             .dir
             .join(format!("op-{}.log", now.format("%Y-%m-%d")));
-        let line = format!("{} {}\n", now.format("%Y-%m-%d %H:%M:%S %z"), body);
+        let line = format!("{stamped}\n");
         match OpenOptions::new()
             .create(true)
             .append(true)

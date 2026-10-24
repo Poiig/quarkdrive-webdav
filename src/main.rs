@@ -228,9 +228,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // 输出到 stdout，Docker / 群晖容器控制台可直接看。
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_timer(tracing_subscriber::fmt::time::time())
+        .with_ansi(false)
+        .with_writer(std::io::stdout)
         .init();
 
     let alert = Alert::new(opt.wecom_webhook_key.clone());

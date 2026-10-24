@@ -2,6 +2,26 @@
 
 use anyhow::{bail, Result};
 
+/// 把字节数格式化为可读容量，如 `1.5 MB`、`320 KB`。
+pub fn format_bytes(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    const TB: u64 = 1024 * GB;
+
+    if size >= TB {
+        format!("{:.1} TB", size as f64 / TB as f64)
+    } else if size >= GB {
+        format!("{:.1} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.1} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.1} KB", size as f64 / KB as f64)
+    } else {
+        format!("{size} B")
+    }
+}
+
 /// 解析 `64MB` / `1GB` / `512MiB` / 纯数字（按字节）为 u64。
 pub fn parse_byte_size(input: &str) -> Result<u64> {
     let s = input.trim().replace('_', "").replace(' ', "");
@@ -57,5 +77,13 @@ mod tests {
         assert_eq!(parse_byte_size("1GiB").unwrap(), 1024 * 1024 * 1024);
         assert_eq!(parse_byte_size("1.5GB").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
         assert_eq!(parse_byte_size("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(64 * 1024 * 1024), "64.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
     }
 }
