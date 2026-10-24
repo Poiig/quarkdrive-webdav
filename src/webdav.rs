@@ -158,17 +158,13 @@ impl QuarkDriveWebDav {
         let fs_path = self.compute_fs_path(req_path);
         debug!(req_path = %req_path, fs_path = %fs_path.display(), "browser: checking path");
 
+        // 仅目录走 HTML 列表；文件或列目录失败时返回 None，交给 WebDAV 处理下载。
+        // 不要把「路径不是目录」误判成授权失效去扫码页。
         match self.fs.dir_cache.get_or_insert(&fs_path.to_string_lossy()).await {
             Some(files) => {
                 debug!(req_path = %req_path, count = files.len(), "browser: directory listing");
                 let html = render_directory_html(req_path, &files);
                 Some(html_response(200, html))
-            }
-            None if self.fs.drive.is_open_mode() => {
-                Some(html_response(
-                    200,
-                    render_open_login_page(false, Some("无法列出目录，请重新扫码授权")),
-                ))
             }
             None => None,
         }
