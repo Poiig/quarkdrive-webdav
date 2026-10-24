@@ -149,6 +149,33 @@ pub fn resolve_stream_budget(configured: u64) -> u64 {
     }
 }
 
+/// 收紧「上传接收」内存池，避免 `UPLOAD_MEMORY_LIMIT=1GB` 在 2GB 容器里直接被 cgroup OOMKill。
+///
+/// `configured==0` 表示始终落盘，原样返回。内核 OOMKill 是 SIGKILL，进程来不及打 error 日志。
+pub fn resolve_upload_memory_limit(configured: u64) -> u64 {
+    if configured == 0 {
+        return 0;
+    }
+    const FLOOR: u64 = 8 * 1024 * 1024;
+    match detect_available_memory_bytes() {
+        Some(avail) => {
+            // 接收池最多占可用内存 1/4，给预取缓存/目录缓存/基线留余量。
+            let auto = (avail / 4).max(FLOOR);
+            let limited = configured.min(auto);
+            if limited < configured {
+                tracing::warn!(
+                    configured = configured,
+                    available = avail,
+                    effective = limited,
+                    "UPLOAD_MEMORY_LIMIT tightened by available memory (cgroup OOMKill has no app-level error log)"
+                );
+            }
+            limited
+        }
+        None => configured,
+    }
+}
+
 /// 拿到名额后再开后台上传；流式路径默认占用 [`STREAM_PEAK_BYTES`]。
 pub async fn acquire_upload_slot() -> UploadPermit {
     acquire_upload_slot_with_peak(STREAM_PEAK_BYTES).await
@@ -190,5 +217,10 @@ mod tests {
     fn test_resolve_stream_budget_floor() {
         let b = resolve_stream_budget(100);
         assert!(b >= STREAM_PEAK_BYTES || b == 100.max(STREAM_PEAK_BYTES));
+    }
+
+    #[test]
+    fn test_resolve_upload_memory_zero_means_spill() {
+        assert_eq!(resolve_upload_memory_limit(0), 0);
     }
 }

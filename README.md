@@ -95,7 +95,15 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录�
 - 预取在途：约 `PREFETCH_AHEAD × PREFETCH_CHUNK_MB`（默认 4×16 ≈ **64MB**/活跃下载）
 - **大文件上传**：分片 PUT 已改为**文件流式**（约 64KB 读缓冲），不再「并发 × 单片大小」；大于 8MB 会先落盘再传，低配也能传数 GB/数十 GB
 
-因此不必为了传大文件把 `UPLOAD_MEMORY_LIMIT` 调到 512MB。容器若设 `mem_limit`，低配建议 ≥512MB～1GB（主要留给预取/目录缓存）。
+因此不必为了传大文件把 `UPLOAD_MEMORY_LIMIT` 调到 512MB/1GB——过大更容易在收文件阶段把容器打满。  
+启动时若配置值超过「可用内存的约 1/4」，会自动收紧并打 warn。
+
+**关于「重启了但没有 OOM 异常」**：Linux cgroup **OOMKill 发送 SIGKILL**，进程来不及打 Rust error/panic；Docker `restart: unless-stopped` 会静默拉起，日志里只看到重新 `listening`。可到宿主机查：
+
+```bash
+docker inspect quarkdrive-webdav --format '{{.State.OOMKilled}} {{.RestartCount}}'
+dmesg -T | grep -i -E 'oom|killed process' | tail
+```
 
 ## 免责声明
 

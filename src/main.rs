@@ -251,15 +251,25 @@ async fn main() -> anyhow::Result<()> {
         info!("已启用企业微信告警");
     }
 
-    let upload_memory_limit = parse_byte_size(&opt.upload_memory_limit)?;
+    let upload_memory_configured = parse_byte_size(&opt.upload_memory_limit)?;
+    // 按容器可用内存收紧接收池，防止把 UPLOAD_MEMORY_LIMIT 设很大时被 OOMKill 静默重启。
+    let upload_memory_limit =
+        upload_limit::resolve_upload_memory_limit(upload_memory_configured);
     info!(
         upload_memory_limit = %opt.upload_memory_limit,
-        upload_memory_bytes = upload_memory_limit,
+        upload_memory_configured = upload_memory_configured,
+        upload_memory_effective = upload_memory_limit,
         "upload memory limit"
     );
     prefetch::init_prefetch_config(opt.prefetch_chunk_mb, opt.prefetch_ahead);
     // 分片已流式读取：预算按「每任务 ~1MB」计，并结合可用内存收紧并发。
-    let stream_budget = upload_limit::resolve_stream_budget(upload_memory_limit);
+    let stream_budget = upload_limit::resolve_stream_budget(
+        if upload_memory_limit > 0 {
+            upload_memory_limit
+        } else {
+            upload_memory_configured.max(64 * 1024 * 1024)
+        },
+    );
     upload_limit::init_upload_concurrency(opt.upload_max_concurrent, stream_budget);
 
     let drive_config = build_drive_config(&opt, alert)?;
