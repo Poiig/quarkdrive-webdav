@@ -108,8 +108,8 @@ impl QuarkDrive {
         let cpu_count = num_cpus::get();
         let pool_size: usize = min(cpu_count.saturating_mul(2), 16).max(3);
 
-        // 下载池按预取窗口定并发（AHEAD），与 CPU 核数无关；堆空闲连接可能触发按连接限速。
-        let download_pool_size: usize = crate::prefetch::AHEAD + 2;
+        // 下载池按预取窗口定并发，与 CPU 核数无关；堆空闲连接可能触发按连接限速。
+        let download_pool_size: usize = crate::prefetch::prefetch_config().download_slots;
 
         let client = reqwest::Client::builder()
             .user_agent(UA)

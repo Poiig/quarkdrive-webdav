@@ -27,6 +27,7 @@ mod cache;
 mod drive;
 mod oplog;
 mod prefetch;
+mod upload_limit;
 mod util;
 mod vfs;
 mod webdav;
@@ -96,6 +97,15 @@ struct Opt {
     /// 分块预取缓存上限（MB）。0 关闭
     #[arg(long, env = "CHUNK_CACHE_MB", default_value = "128")]
     chunk_cache_mb: u64,
+    /// 预取分块大小（MB），实测 16 为拐点；低配可降到 8
+    #[arg(long, env = "PREFETCH_CHUNK_MB", default_value_t = 16)]
+    prefetch_chunk_mb: u64,
+    /// 预取并发窗口（1–8），默认 4；低配可降到 2
+    #[arg(long, env = "PREFETCH_AHEAD", default_value_t = 4)]
+    prefetch_ahead: usize,
+    /// 同时进行的后台上传上限，防止多客户端打满内存/连接
+    #[arg(long, env = "UPLOAD_MAX_CONCURRENT", default_value_t = 4)]
+    upload_max_concurrent: usize,
     /// Root directory path
     #[arg(long, env = "WEBDAV_ROOT", default_value = "/")]
     root: String,
@@ -231,6 +241,8 @@ async fn main() -> anyhow::Result<()> {
         upload_memory_bytes = upload_memory_limit,
         "upload memory limit"
     );
+    prefetch::init_prefetch_config(opt.prefetch_chunk_mb, opt.prefetch_ahead);
+    upload_limit::init_upload_concurrency(opt.upload_max_concurrent);
 
     let drive_config = build_drive_config(&opt, alert)?;
     let auth_user = opt.auth_user;

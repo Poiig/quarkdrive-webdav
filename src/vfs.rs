@@ -910,6 +910,17 @@ impl QuarkDavFile {
         }
     }
 
+    /// 交接给后台任务时拿走内存，避免 clone 造成峰值翻倍。
+    fn take_upload_source(&mut self) -> UploadSource {
+        if self.upload_state.use_memory {
+            let data = std::mem::take(&mut self.upload_state.memory_data);
+            self.upload_state.use_memory = false;
+            UploadSource::Memory(data.freeze())
+        } else {
+            UploadSource::Path(PathBuf::from(&self.upload_state.temp_file_path))
+        }
+    }
+
     fn upload_log_path(&self) -> String {
         format!(
             "{}/{}",
@@ -1057,13 +1068,11 @@ impl QuarkDavFile {
         // We still await the result — if the client stays connected, it gets the real result.
         // If the client disconnects (e.g. timeout), the spawned task continues uploading.
         let drive = self.fs.drive.clone();
-        let upload_state = self.upload_state.clone();
-        let source = self.upload_source();
         let memory_reserved = self.upload_state.memory_reserved;
         // 配额交由后台任务归还，避免 self 清空时重复 release。
         self.upload_state.memory_reserved = 0;
-        self.upload_state.use_memory = false;
-        self.upload_state.memory_data.clear();
+        let source = self.take_upload_source();
+        let upload_state = self.upload_state.clone();
         let file_name = self.file.file_name.clone();
         let parent_path = self.file.parent_path.as_ref().unwrap().clone();
         let parent_dir = self.parent_dir.clone();
@@ -1073,6 +1082,7 @@ impl QuarkDavFile {
         let log_mode = self.fs.drive_mode();
 
         let handle = tokio::spawn(async move {
+            let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
             let _memory_guard = UploadMemoryGuard {
                 pool: fs.upload_memory.clone(),
                 reserved: memory_reserved,
@@ -1272,18 +1282,17 @@ impl QuarkDavFile {
         let parent_path = self.file.parent_path.as_ref().unwrap().clone();
         let parent_dir = self.parent_dir.clone();
         let fs = self.fs.clone();
-        let source = self.upload_source();
-        let temp_path = self.upload_state.temp_file_path.clone();
         let memory_reserved = self.upload_state.memory_reserved;
         self.upload_state.memory_reserved = 0;
-        self.upload_state.use_memory = false;
-        self.upload_state.memory_data.clear();
+        let source = self.take_upload_source();
+        let temp_path = self.upload_state.temp_file_path.clone();
         let md5 = md5.to_string();
         let sha1 = sha1.to_string();
         let log_path = self.upload_log_path();
         let log_mode = self.fs.drive_mode();
 
         let handle = tokio::spawn(async move {
+            let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
             let _memory_guard = UploadMemoryGuard {
                 pool: fs.upload_memory.clone(),
                 reserved: memory_reserved,

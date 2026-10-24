@@ -69,11 +69,17 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。
 | `QUARK_TOKEN_FILE` | Open token 落盘路径 | `./quark-token.json` |
 | `QUARK_REFRESH_TOKEN` | 可选，已有 refresh token 时可直接填 | 空 |
 | `UPLOAD_MEMORY_LIMIT` | 上传内存上限（Cookie/Open 共用），如 `64MB`/`1GB`；`0`=始终落盘 | `64MB` |
+| `UPLOAD_MAX_CONCURRENT` | 同时后台上传数上限 | `4` |
+| `CHUNK_CACHE_MB` | 播放预取块缓存（MB），`0` 关闭 | `128` |
+| `PREFETCH_CHUNK_MB` | 预取分块大小（MB） | `16` |
+| `PREFETCH_AHEAD` | 预取并发窗口（1–8） | `4` |
 | `WECOM_WEBHOOK_KEY` | 企业微信机器人 key；过期/报错时推送 | — |
 | `OP_LOG_DIR` | 上传/删除操作日志目录 | `./logs` |
 | `OP_LOG_RETENTION_DAYS` | 操作日志保留天数 | `7` |
 | `WEBDAV_AUTH_USER` / `WEBDAV_AUTH_PASSWORD` | WebDAV 账号密码 | — |
 | `PORT` | 端口 | `8080` |
+
+低配机器可参考：`UPLOAD_MEMORY_LIMIT=64MB UPLOAD_MAX_CONCURRENT=2 CHUNK_CACHE_MB=64 PREFETCH_CHUNK_MB=8 PREFETCH_AHEAD=2`。
 
 ## 免责声明
 
