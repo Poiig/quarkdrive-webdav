@@ -56,15 +56,20 @@ impl ProgressEntry {
     }
 
     /// 给页面用的综合进度 0–100。
+    /// 接收与上传各占一半，避免「收完就 100%」但 OSS 还在传。
     pub fn percent(&self) -> u8 {
-        if self.size == 0 {
-            return if matches!(self.status.as_str(), "ok" | "skip") {
-                100
-            } else {
-                0
-            };
+        if matches!(self.status.as_str(), "ok" | "skip") {
+            return 100;
         }
-        ((self.done_bytes().saturating_mul(100)) / self.size).min(100) as u8
+        if self.size == 0 {
+            return 0;
+        }
+        let half = self.size;
+        let recv = self.received.min(half);
+        let up = self.uploaded.min(half);
+        // (recv + up) / (2 * size) → 接收满 50%，上传满再 50%
+        (((recv + up).saturating_mul(100)) / (half.saturating_mul(2)))
+            .min(100) as u8
     }
 
     /// 自开始以来的平均速度（字节/秒）。
@@ -86,22 +91,22 @@ impl ProgressEntry {
         }
     }
 
-    /// 一行可读摘要（含进度与速度）。
+    /// 一行可读摘要：百分比、体积、速度分项写清，避免混成「一个百分比」。
     pub fn summary(&self) -> String {
         let active = matches!(self.status.as_str(), "receiving" | "uploading");
         let speed = if active {
             format!(
-                " · {}/s（均 {}/s）",
+                " · 速度 {}/s（均 {}/s）",
                 format_bytes(self.speed_bps),
                 format_bytes(self.avg_speed_bps())
             )
         } else if self.started_ms > 0 && self.updated_ms > self.started_ms {
-            format!(" · 均 {}/s", format_bytes(self.avg_speed_bps()))
+            format!(" · 均速 {}/s", format_bytes(self.avg_speed_bps()))
         } else {
             String::new()
         };
         format!(
-            "{}% · 接收 {} / 上传 {} / 共 {}{}",
+            "进度 {}% · 体积 收{}/{}/共{}{}",
             self.percent(),
             format_bytes(self.received),
             format_bytes(self.uploaded),
@@ -169,6 +174,8 @@ impl UploadTracker {
                 e.status = "uploading".into();
                 if size > 0 {
                     e.size = size;
+                    // 进入上传阶段时接收侧已结束，按满值计入进度前半段。
+                    e.received = e.received.max(size);
                 }
                 // 切换阶段时重置采样窗口，速度反映 OSS 上传而非接收。
                 e.sample_bytes = e.uploaded;
@@ -253,7 +260,14 @@ mod tests {
         t.start_receiving("/a.bin", 1000);
         t.set_received("/a.bin", 500, 1000);
         let e = t.list().into_iter().next().unwrap();
-        assert_eq!(e.percent(), 50);
+        // 接收一半 → 总进度 25%（接收阶段最多 50%）
+        assert_eq!(e.percent(), 25);
         assert_eq!(e.status, "receiving");
+
+        t.mark_uploading("/a.bin", 1000);
+        t.add_uploaded("/a.bin", 500);
+        let e = t.list().into_iter().next().unwrap();
+        // 收满 + 上传一半 → 75%
+        assert_eq!(e.percent(), 75);
     }
 }

@@ -58,7 +58,7 @@ docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
 启动后浏览器打开 `http://主机:8080`（若配置了 `WEBDAV_AUTH_*`，会进入 **`/__login` 登录页**，不再弹浏览器 Basic 对话框）：
 
 1. 在登录页输入 WebDAV 账号密码后：若夸克已授权 → 浏览网盘；未授权/过期 → 再进入扫码页  
-2. 控制台：`/__uploads` 上传进度（含百分比与速度），`/__history` 操作历史（筛选/清除）；导航栏可「退出」  
+2. 目录页**右上角**：上传进度面板（默认展开，约 0.5s 轮询动态进度条/速度）、「历史」弹窗（筛选/清除）；另有授权 / 退出  
 3. WebDAV 客户端仍走协议 Basic；OAuth 回调 `/__quark_auth/callback` 仍跳过鉴权（夸克重定向不会带账号）
 
 Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录必须对容器可写，否则扫码成功也无法落盘，重启后需重新登录。

@@ -194,11 +194,12 @@ impl QuarkDriveWebDav {
         path == "/__login" || path == "/__logout"
     }
 
-    /// 控制台：上传进度 / 历史。
+    /// 控制台 API：进度 JSON / 历史 JSON（HTML 独立页已并入目录右上角）。
     fn is_console_path(path: &str) -> bool {
         path == "/__uploads"
             || path == "/__uploads.json"
             || path == "/__history"
+            || path == "/__history.json"
             || path.starts_with("/__history/")
     }
 
@@ -580,10 +581,12 @@ impl QuarkDriveWebDav {
         }
     }
 
-    /// Web 控制台：上传进度与操作历史（须已通过浏览器会话或 Basic）。
+    /// Web 控制台 API：进度/历史 JSON；旧 HTML 路径重定向回目录。
     async fn handle_console(&self, req: &Request<hyper::body::Incoming>) -> Response<Body> {
         let path = req.uri().path();
         let query = req.uri().query().unwrap_or("");
+        let params = parse_query(query);
+
         if path == "/__uploads.json" {
             let items = self.fs.upload_tracker().list();
             let list: Vec<serde_json::Value> = items
@@ -599,47 +602,42 @@ impl QuarkDriveWebDav {
                         "percent": e.percent(),
                         "speed_bps": e.speed_bps,
                         "avg_speed_bps": e.avg_speed_bps(),
-                        "summary": e.summary(),
                         "updated_ms": e.updated_ms,
                     })
                 })
                 .collect();
-            let body = serde_json::to_string(&serde_json::json!({ "items": list }))
-                .unwrap_or_else(|_| r#"{"items":[]}"#.into());
+            return json_response(serde_json::json!({ "items": list }));
+        }
+
+        // 旧独立进度页 → 目录（右上角面板）。
+        if path == "/__uploads" {
             return Response::builder()
-                .status(200)
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Cache-Control", "no-store")
-                .body(Body::from(body))
+                .status(302)
+                .header("Location", "/")
+                .body(Body::from("moved"))
                 .unwrap();
         }
-        if path == "/__uploads" {
-            return html_response(200, render_uploads_page(&self.fs.upload_tracker().list()));
-        }
-        if path == "/__history" {
-            let params = parse_query(query);
-            if req.method() == Method::POST
-                || params.get("clear").map(|v| v == "1" || v == "true").unwrap_or(false)
+
+        if path == "/__history.json"
+            || (path == "/__history"
+                && req
+                    .headers()
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|a| a.contains("application/json"))
+                    .unwrap_or(false))
+        {
+            if params.get("clear").map(|v| v == "1" || v == "true").unwrap_or(false)
+                || req.method() == Method::POST
             {
                 let date = params.get("date").map(|s| s.as_str()).filter(|s| !s.is_empty());
-                match self.fs.oplog().clear(date).await {
-                    Ok(n) => {
-                        return Response::builder()
-                            .status(302)
-                            .header(
-                                "Location",
-                                format!("/__history?cleared={n}&kind=all&result=all"),
-                            )
-                            .body(Body::from("cleared"))
-                            .unwrap();
-                    }
-                    Err(err) => {
-                        return html_response(
-                            400,
-                            render_history_page(vec![], &params, Some(&err)),
-                        );
-                    }
-                }
+                return match self.fs.oplog().clear(date).await {
+                    Ok(n) => json_response(serde_json::json!({ "cleared": n })),
+                    Err(err) => json_response_status(
+                        400,
+                        serde_json::json!({ "error": err.to_string() }),
+                    ),
+                };
             }
             let kind = params.get("kind").map(|s| s.as_str()).unwrap_or("upload");
             let result = params.get("result").map(|s| s.as_str()).unwrap_or("all");
@@ -647,7 +645,7 @@ impl QuarkDriveWebDav {
             let limit = params
                 .get("limit")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(200usize);
+                .unwrap_or(100usize);
             let entries = self
                 .fs
                 .oplog()
@@ -658,10 +656,47 @@ impl QuarkDriveWebDav {
                     q.filter(|s| !s.is_empty()),
                 )
                 .await;
-            return html_response(200, render_history_page(entries, &params, None));
+            let list: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "time": e.time,
+                        "kind": e.kind,
+                        "result": e.result,
+                        "size": e.size,
+                        "path": e.path,
+                    })
+                })
+                .collect();
+            return json_response(serde_json::json!({ "entries": list }));
         }
+
+        if path == "/__history" {
+            return Response::builder()
+                .status(302)
+                .header("Location", "/")
+                .body(Body::from("moved"))
+                .unwrap();
+        }
+
         html_response(404, "<p>not found</p>".into())
     }
+}
+
+/// JSON 200 响应。
+fn json_response(value: serde_json::Value) -> Response<Body> {
+    json_response_status(200, value)
+}
+
+/// JSON 响应（可带状态码）。
+fn json_response_status(status: u16, value: serde_json::Value) -> Response<Body> {
+    let body = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(Body::from(body))
+        .unwrap()
 }
 
 /// 解析 `a=1&b=2` 查询串。
@@ -685,6 +720,227 @@ fn html_response(status: u16, html: String) -> Response<Body> {
         .header("Content-Type", "text/html; charset=utf-8")
         .body(Body::from(html))
         .unwrap()
+}
+
+/// 右上角进度面板 + 历史弹窗的样式（嵌入目录/授权页）。
+fn console_float_css() -> &'static str {
+    r#"
+.qd-actions{display:flex;align-items:center;gap:8px;margin-left:auto}
+.qd-actions a,.qd-actions button{
+  appearance:none;border:1px solid var(--line);background:#fff;color:var(--ink);
+  font:inherit;font-size:13px;padding:7px 12px;cursor:pointer;text-decoration:none;
+}
+.qd-actions a:hover,.qd-actions button:hover{border-color:var(--accent);color:var(--accent);text-decoration:none}
+.qd-actions .ghost{background:transparent}
+.qd-float{
+  position:fixed;top:64px;right:16px;z-index:40;width:min(380px,calc(100vw - 24px));
+  background:rgba(255,255,255,.96);border:1px solid var(--line);
+  box-shadow:0 18px 40px rgba(20,34,43,.14);backdrop-filter:blur(12px);
+}
+.qd-float-hd{
+  display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;user-select:none;
+  border-bottom:1px solid transparent;
+}
+.qd-float.open .qd-float-hd{border-bottom-color:var(--line)}
+.qd-float-hd strong{font-size:13px;font-weight:700}
+.qd-badge{
+  min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:var(--accent);
+  color:#fff;font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;
+}
+.qd-badge[data-n="0"]{background:#94a3b8}
+.qd-float-hd .chev{margin-left:auto;color:var(--muted);font-size:12px;transition:transform .2s}
+.qd-float.open .qd-float-hd .chev{transform:rotate(180deg)}
+.qd-float-bd{display:none;max-height:min(52vh,420px);overflow:auto;padding:8px 10px 12px}
+.qd-float.open .qd-float-bd{display:block}
+.qd-empty{padding:18px 10px;text-align:center;color:var(--muted);font-size:13px}
+.qd-item{padding:10px;border:1px solid var(--line);background:#f8fbfc;margin-bottom:8px}
+.qd-item:last-child{margin-bottom:0}
+.qd-item .name{font-size:13px;font-weight:600;word-break:break-all;margin:0 0 8px}
+.qd-item .meta{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted);margin-top:6px}
+.qd-item .st{font-weight:600}
+.qd-item .st.run{color:var(--run)} .qd-item .st.ok{color:var(--ok)} .qd-item .st.bad{color:var(--bad)}
+.qd-bar{height:8px;background:#e2e8f0;overflow:hidden;position:relative}
+.qd-bar>i{
+  display:block;height:100%;width:0;background:linear-gradient(90deg,#0e7490,#14b8a6);
+  transition:width .35s ease;
+}
+.qd-bar.indeterminate>i{
+  width:40%!important;animation:qd-slide 1.1s ease-in-out infinite;
+}
+@keyframes qd-slide{0%{transform:translateX(-120%)}100%{transform:translateX(280%)}}
+.qd-pct{font-variant-numeric:tabular-nums;font-weight:700;color:var(--ink)}
+.qd-speed{font-variant-numeric:tabular-nums;white-space:nowrap}
+.qd-modal{
+  position:fixed;inset:0;z-index:50;display:none;align-items:center;justify-content:center;
+  background:rgba(15,23,32,.45);padding:16px;
+}
+.qd-modal.open{display:flex}
+.qd-modal-card{
+  width:min(820px,100%);max-height:min(80vh,720px);background:#fff;border:1px solid var(--line);
+  display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.25);
+}
+.qd-modal-hd{
+  display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line);
+}
+.qd-modal-hd h2{margin:0;font-size:16px;flex:1}
+.qd-modal-hd button{border:1px solid var(--line);background:#fff;padding:6px 10px;cursor:pointer;font:inherit;font-size:13px}
+.qd-modal-tools{
+  display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);background:#f8fafb;
+}
+.qd-modal-tools label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)}
+.qd-modal-tools input,.qd-modal-tools select{padding:6px 8px;border:1px solid var(--line);font:inherit;font-size:13px;min-width:110px}
+.qd-modal-tools button{align-self:end;padding:7px 12px;border:1px solid var(--line);background:#fff;cursor:pointer;font:inherit;font-size:13px}
+.qd-modal-tools button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.qd-modal-tools button.danger{color:var(--bad);border-color:#fecaca}
+.qd-modal-bd{overflow:auto;padding:0}
+.qd-modal table{width:100%;border-collapse:collapse;font-size:13px}
+.qd-modal th,.qd-modal td{padding:9px 12px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:top}
+.qd-modal th{color:var(--muted);font-weight:600;background:#fafcfd;position:sticky;top:0}
+.qd-modal .path{word-break:break-all}
+.qd-modal .ok{color:var(--ok)} .qd-modal .bad{color:var(--bad)}
+@media (max-width:720px){
+  .qd-float{top:auto;bottom:12px;right:12px;left:12px;width:auto}
+}
+"#
+}
+
+/// 右上角进度面板（默认展开）+ 历史弹窗 markup 与轮询脚本。
+fn console_float_html() -> &'static str {
+    r#"
+<aside class="qd-float open" id="qdFloat" aria-live="polite">
+  <div class="qd-float-hd" id="qdFloatToggle" title="展开/收起上传进度">
+    <strong>上传进度</strong>
+    <span class="qd-badge" id="qdBadge" data-n="0">0</span>
+    <span class="chev">▾</span>
+  </div>
+  <div class="qd-float-bd" id="qdFloatBody"><div class="qd-empty">暂无上传任务</div></div>
+</aside>
+<div class="qd-modal" id="qdHistModal" role="dialog" aria-modal="true" aria-labelledby="qdHistTitle">
+  <div class="qd-modal-card">
+    <div class="qd-modal-hd">
+      <h2 id="qdHistTitle">操作历史</h2>
+      <button type="button" id="qdHistClose">关闭</button>
+    </div>
+    <div class="qd-modal-tools">
+      <label>类型<select id="qdHistKind"><option value="upload">上传</option><option value="delete">删除</option><option value="all">全部</option></select></label>
+      <label>结果<select id="qdHistResult"><option value="all">全部</option><option value="ok">成功</option><option value="error">失败</option></select></label>
+      <label>路径包含<input id="qdHistQ" placeholder="关键词"/></label>
+      <button type="button" class="primary" id="qdHistReload">筛选</button>
+      <button type="button" class="danger" id="qdHistClear">清除日志</button>
+    </div>
+    <div class="qd-modal-bd"><table><thead><tr><th>时间</th><th>类型</th><th>结果</th><th>大小</th><th>路径</th></tr></thead><tbody id="qdHistBody"></tbody></table></div>
+  </div>
+</div>
+<script>
+(function(){
+  const STATUS={receiving:"接收中",uploading:"上传中",ok:"完成",error:"失败",skip:"跳过"};
+  const fmt=b=>{
+    b=Number(b)||0; if(b<1024) return b+" B";
+    const u=["KB","MB","GB","TB"]; let i=-1; let n=b;
+    do{n/=1024;i++}while(n>=1024&&i<u.length-1);
+    return n.toFixed(n>=10||i===0?1:2)+" "+u[i];
+  };
+  const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  const floatEl=document.getElementById("qdFloat");
+  const body=document.getElementById("qdFloatBody");
+  const badge=document.getElementById("qdBadge");
+  document.getElementById("qdFloatToggle").addEventListener("click",()=>floatEl.classList.toggle("open"));
+
+  function renderUploads(items){
+    const active=items.filter(i=>i.status==="receiving"||i.status==="uploading").length;
+    badge.textContent=String(active);
+    badge.dataset.n=String(active);
+    if(!items.length){ body.innerHTML='<div class="qd-empty">暂无上传任务</div>'; return; }
+    body.innerHTML=items.map(it=>{
+      const pct=Math.max(0,Math.min(100,Number(it.percent)||0));
+      const st=STATUS[it.status]||it.status;
+      const stc=(it.status==="ok"||it.status==="skip")?"ok":it.status==="error"?"bad":"run";
+      const unknown=!it.size && (it.status==="receiving"||it.status==="uploading");
+      const barCls=unknown?"qd-bar indeterminate":"qd-bar";
+      const speed=(it.status==="receiving"||it.status==="uploading")
+        ? (fmt(it.speed_bps)+"/s · 均 "+fmt(it.avg_speed_bps)+"/s")
+        : ("均 "+fmt(it.avg_speed_bps)+"/s");
+      const sizeLine="收 "+fmt(it.received)+" · 传 "+fmt(it.uploaded)+" · 共 "+fmt(it.size);
+      const name=String(it.path||"").split("/").filter(Boolean).pop()||it.path;
+      return `<div class="qd-item" data-path="${esc(it.path)}">
+        <div class="name">${esc(name)}</div>
+        <div class="${barCls}"><i style="width:${unknown?40:pct}%"></i></div>
+        <div class="meta"><span class="qd-pct">${unknown?"…":pct+"%"} · <span class="st ${stc}">${esc(st)}</span></span><span class="qd-speed">${esc(speed)}</span></div>
+        <div class="meta"><span>${esc(sizeLine)}</span><span>${esc(it.detail||"")}</span></div>
+      </div>`;
+    }).join("");
+  }
+
+  let timer=null;
+  async function poll(){
+    try{
+      const r=await fetch("/__uploads.json",{credentials:"same-origin",cache:"no-store"});
+      if(!r.ok) return;
+      const data=await r.json();
+      renderUploads(data.items||[]);
+    }catch(_){}
+  }
+  poll();
+  timer=setInterval(poll,500);
+  document.addEventListener("visibilitychange",()=>{
+    if(document.hidden){ clearInterval(timer); timer=null; }
+    else if(!timer){ poll(); timer=setInterval(poll,500); }
+  });
+
+  const modal=document.getElementById("qdHistModal");
+  const histBody=document.getElementById("qdHistBody");
+  function openHist(){ modal.classList.add("open"); loadHist(); }
+  function closeHist(){ modal.classList.remove("open"); }
+  document.querySelectorAll("[data-qd-history]").forEach(el=>el.addEventListener("click",e=>{e.preventDefault();openHist();}));
+  document.getElementById("qdHistClose").addEventListener("click",closeHist);
+  modal.addEventListener("click",e=>{ if(e.target===modal) closeHist(); });
+  document.addEventListener("keydown",e=>{ if(e.key==="Escape") closeHist(); });
+
+  async function loadHist(){
+    const kind=document.getElementById("qdHistKind").value;
+    const result=document.getElementById("qdHistResult").value;
+    const q=document.getElementById("qdHistQ").value.trim();
+    const qs=new URLSearchParams({kind,result,limit:"100"});
+    if(q) qs.set("q",q);
+    histBody.innerHTML='<tr><td colspan="5" style="text-align:center;color:#888;padding:24px">加载中…</td></tr>';
+    try{
+      const r=await fetch("/__history.json?"+qs.toString(),{credentials:"same-origin",headers:{Accept:"application/json"}});
+      const data=await r.json();
+      const rows=data.entries||[];
+      if(!rows.length){ histBody.innerHTML='<tr><td colspan="5" style="text-align:center;color:#888;padding:24px">没有匹配记录</td></tr>'; return; }
+      histBody.innerHTML=rows.map(e=>{
+        const rc=String(e.result||"").startsWith("error")?"bad":"ok";
+        return `<tr><td>${esc(e.time)}</td><td>${esc(e.kind)}</td><td class="${rc}">${esc(e.result)}</td><td>${esc(e.size)}</td><td class="path">${esc(e.path)}</td></tr>`;
+      }).join("");
+    }catch(err){
+      histBody.innerHTML=`<tr><td colspan="5" class="bad" style="padding:16px">加载失败：${esc(err)}</td></tr>`;
+    }
+  }
+  document.getElementById("qdHistReload").addEventListener("click",loadHist);
+  document.getElementById("qdHistClear").addEventListener("click",async()=>{
+    if(!confirm("确认清除操作日志？不可恢复")) return;
+    const date=prompt("只清除某一天？留空=全部（YYYY-MM-DD）","")||"";
+    const qs=new URLSearchParams({clear:"1"});
+    if(date.trim()) qs.set("date",date.trim());
+    const r=await fetch("/__history.json?"+qs.toString(),{credentials:"same-origin",headers:{Accept:"application/json"}});
+    const data=await r.json();
+    if(data.error) alert(data.error); else { alert("已清除 "+(data.cleared||0)+" 个日志文件"); loadHist(); }
+  });
+})();
+</script>
+"#
+}
+
+/// 顶栏右侧：历史弹窗入口、授权、退出。
+fn console_actions_html(active_auth: bool) -> String {
+    let auth_cls = if active_auth { " class=\"active\"" } else { "" };
+    format!(
+        r#"<div class="qd-actions">
+<button type="button" data-qd-history>历史</button>
+<a href="/__quark_auth"{auth_cls}>授权</a>
+<a class="ghost" href="/__logout">退出</a>
+</div>"#
+    )
 }
 
 /// 由账号密码派生会话令牌；改密后旧 Cookie 自动失效，无需服务端存会话。
@@ -809,14 +1065,48 @@ button:hover{{background:var(--accent-hover)}}
     )
 }
 
-/// Open 模式登录/状态页：有效则提示正常，无效则引导扫码。
+/// 浏览页共用 CSS 变量（目录 / 授权）。
+fn browse_base_css() -> &'static str {
+    r#"
+:root{
+  --bg:#e8eef2; --panel:#fff; --ink:#14222b; --muted:#5b6f7a; --line:#d5dee4;
+  --accent:#0e7490; --accent-soft:rgba(14,116,144,.12); --ok:#0f766e; --bad:#b91c1c; --run:#b45309;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  min-height:100vh;color:var(--ink);
+  font-family:"Segoe UI","PingFang SC","Noto Sans SC",sans-serif;
+  background:
+    radial-gradient(900px 420px at 0% 0%, rgba(14,116,144,.14), transparent 55%),
+    linear-gradient(180deg,#f3f7f9 0%, var(--bg) 42%, #e4ebf0 100%);
+}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.top{
+  position:sticky;top:0;z-index:30;
+  background:rgba(255,255,255,.9);backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);
+}
+.top-inner{
+  max-width:1100px;margin:0 auto;padding:12px 20px;
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+}
+.brand{font-weight:700;font-size:15px;color:var(--ink);text-decoration:none;letter-spacing:.02em}
+.brand:hover{text-decoration:none;color:var(--accent)}
+.brand span{color:var(--accent);font-weight:800}
+.qd-actions a.active{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+.wrap{max-width:1100px;margin:0 auto;padding:20px 20px 48px}
+"#
+}
+
+/// Open 模式授权状态页；右上角同样挂进度面板与历史弹窗。
 fn render_open_login_page(ok: bool, error: Option<&str>) -> String {
     let status = if ok {
         r#"<p class="ok">授权有效，可正常使用 WebDAV / 浏览文件。</p>
-           <p><a href="/">进入网盘目录</a></p>"#
+           <p><a class="btn" href="/">进入网盘目录</a></p>"#
     } else {
         r#"<p class="bad">授权无效或未登录。</p>
-           <p>请点击下方按钮，用夸克账号完成扫码/登录授权。</p>
+           <p class="hint">请用夸克账号完成扫码授权。</p>
            <p><a class="btn" href="/__quark_auth/start">扫码授权</a></p>"#
     };
     let err = error
@@ -824,196 +1114,39 @@ fn render_open_login_page(ok: bool, error: Option<&str>) -> String {
         .unwrap_or_default();
     format!(
         r#"<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>夸克 Open 授权</title>
-<style>
-body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.6}}
-.ok{{color:#0a7}} .bad{{color:#c33}} .err{{background:#f6f6f6;padding:12px;overflow:auto}}
-.btn{{display:inline-block;background:#1677ff;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none}}
-.nav a{{margin-right:12px;color:#2563eb}}
-</style></head><body>
-<p class="nav"><a href="/">目录</a><a href="/__uploads">上传进度</a><a href="/__history">上传历史</a><a href="/__quark_auth">授权</a><a href="/__logout">退出</a></p>
-<h1>夸克 Open 授权</h1>
-{status}
-{err}
-<p><a href="/__quark_auth">刷新状态</a></p>
-</body></html>"#
-    )
-}
-
-/// 上传进度页：每 2 秒刷新，展示文件、百分比与速度。
-fn render_uploads_page(items: &[crate::upload_progress::ProgressEntry]) -> String {
-    let mut rows = String::new();
-    if items.is_empty() {
-        rows.push_str(r#"<tr><td colspan="5" class="empty">当前没有进行中的上传</td></tr>"#);
-    }
-    for e in items {
-        let pct = e.percent();
-        let status_class = match e.status.as_str() {
-            "ok" | "skip" => "ok",
-            "error" => "bad",
-            "uploading" | "receiving" => "run",
-            _ => "",
-        };
-        let speed = format!(
-            "{}/s<br/><span class=\"avg\">均 {}/s</span>",
-            html_escape(&crate::util::format_bytes(e.speed_bps)),
-            html_escape(&crate::util::format_bytes(e.avg_speed_bps()))
-        );
-        rows.push_str(&format!(
-            r#"<tr>
-<td class="path">{path}</td>
-<td class="status {status_class}">{status}</td>
-<td class="pct"><div class="bar"><i style="width:{pct}%"></i></div>{pct}% · 收 {recv} / 传 {up} / 共 {total}</td>
-<td class="speed">{speed}</td>
-<td class="detail">{detail}</td>
-</tr>"#,
-            path = html_escape(&e.path),
-            status = html_escape(&e.status),
-            status_class = status_class,
-            pct = pct,
-            recv = html_escape(&crate::util::format_bytes(e.received)),
-            up = html_escape(&crate::util::format_bytes(e.uploaded)),
-            total = html_escape(&crate::util::format_bytes(e.size)),
-            speed = speed,
-            detail = html_escape(&e.detail),
-        ));
-    }
-    format!(
-        r#"<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<meta http-equiv="refresh" content="2"/>
-<title>上传进度</title>
+<title>授权 · QuarkDrive</title>
 <style>
-body{{font-family:system-ui,sans-serif;max-width:1100px;margin:24px auto;padding:0 16px;color:#222;background:#f7f7f5}}
-.nav a{{margin-right:14px;color:#1d4ed8;text-decoration:none}}
-h1{{font-size:1.25rem;margin:12px 0 16px}}
-table{{width:100%;border-collapse:collapse;background:#fff}}
-th,td{{padding:10px 12px;border-bottom:1px solid #eee;text-align:left;font-size:14px;vertical-align:top}}
-th{{color:#666;font-weight:600}}
-.path{{word-break:break-all;max-width:320px}}
-.status.ok{{color:#0a7}} .status.bad{{color:#c33}} .status.run{{color:#b45309}}
-.bar{{height:8px;background:#eee;margin-bottom:4px;overflow:hidden}}
-.bar i{{display:block;height:100%;background:#2563eb}}
-.speed{{white-space:nowrap;font-variant-numeric:tabular-nums}}
-.speed .avg{{color:#888;font-size:12px}}
-.empty{{color:#888;text-align:center}}
-.detail{{color:#666;font-size:12px;max-width:200px;word-break:break-all}}
+{base}
+{float}
+.card{{background:var(--panel);border:1px solid var(--line);padding:28px 24px;max-width:520px}}
+h1{{font-size:1.2rem;margin:0 0 12px}}
+.ok{{color:var(--ok);margin:0 0 12px}} .bad{{color:var(--bad);margin:0 0 12px}}
+.hint{{color:var(--muted);margin:0 0 14px;font-size:14px}}
+.err{{background:#f8fafc;padding:12px;overflow:auto;font-size:12px;margin:12px 0}}
+.btn{{display:inline-block;background:var(--accent);color:#fff;padding:10px 16px;text-decoration:none;font-weight:600}}
+.btn:hover{{filter:brightness(1.05);text-decoration:none}}
+.link{{display:inline-block;margin-top:14px;font-size:13px}}
 </style></head><body>
-<p class="nav"><a href="/">目录</a><a href="/__uploads">上传进度</a><a href="/__history">上传历史</a><a href="/__quark_auth">授权</a><a href="/__logout">退出</a></p>
-<h1>上传进度 <span style="font-size:13px;color:#888;font-weight:400">每 2 秒刷新 · 含瞬时/平均速度</span></h1>
-<table>
-<thead><tr><th>文件</th><th>状态</th><th>进度</th><th>速度</th><th>备注</th></tr></thead>
-<tbody>{rows}</tbody>
-</table>
-</body></html>"#
-    )
-}
-
-/// 操作历史页：支持 kind/result/path 筛选与清除。
-fn render_history_page(
-    entries: Vec<crate::oplog::OpLogEntry>,
-    params: &std::collections::HashMap<String, String>,
-    error: Option<&str>,
-) -> String {
-    let kind = params.get("kind").map(|s| s.as_str()).unwrap_or("upload");
-    let result = params.get("result").map(|s| s.as_str()).unwrap_or("all");
-    let q = params.get("q").cloned().unwrap_or_default();
-    let cleared = params.get("cleared").cloned().unwrap_or_default();
-    let err = error
-        .map(|e| format!(r#"<p class="bad">{}</p>"#, html_escape(e)))
-        .unwrap_or_default();
-    let notice = if !cleared.is_empty() {
-        format!(r#"<p class="ok">已清除 {cleared} 个日志文件</p>"#)
-    } else {
-        String::new()
-    };
-    let mut rows = String::new();
-    if entries.is_empty() {
-        rows.push_str(r#"<tr><td colspan="5" class="empty">没有匹配的记录</td></tr>"#);
-    }
-    for e in &entries {
-        let rc = if e.result.starts_with("error") {
-            "bad"
-        } else {
-            "ok"
-        };
-        rows.push_str(&format!(
-            r#"<tr>
-<td class="time">{time}</td>
-<td>{kind}</td>
-<td class="{rc}">{result}</td>
-<td>{size}</td>
-<td class="path">{path}</td>
-</tr>"#,
-            time = html_escape(&e.time),
-            kind = html_escape(&e.kind),
-            rc = rc,
-            result = html_escape(&e.result),
-            size = html_escape(&e.size),
-            path = html_escape(&e.path),
-        ));
-    }
-    let sel = |cur: &str, want: &str| if cur == want { " selected" } else { "" };
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>上传历史</title>
-<style>
-body{{font-family:system-ui,sans-serif;max-width:1100px;margin:24px auto;padding:0 16px;color:#222;background:#f7f7f5}}
-.nav a{{margin-right:14px;color:#1d4ed8;text-decoration:none}}
-h1{{font-size:1.25rem;margin:12px 0}}
-form.filters{{display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin:12px 0 16px;background:#fff;padding:12px}}
-form.filters label{{display:flex;flex-direction:column;font-size:12px;color:#666;gap:4px}}
-form.filters input,form.filters select{{padding:6px 8px;font-size:14px}}
-form.filters button,.btn{{padding:7px 12px;font-size:14px;border:1px solid #ccc;background:#fff;cursor:pointer}}
-form.filters button.primary{{background:#2563eb;color:#fff;border-color:#2563eb}}
-table{{width:100%;border-collapse:collapse;background:#fff}}
-th,td{{padding:8px 10px;border-bottom:1px solid #eee;text-align:left;font-size:13px}}
-th{{color:#666}}
-.path{{word-break:break-all}}
-.ok{{color:#0a7}} .bad{{color:#c33}} .empty{{color:#888;text-align:center}}
-.danger{{color:#b91c1c}}
-</style></head><body>
-<p class="nav"><a href="/">目录</a><a href="/__uploads">上传进度</a><a href="/__history">上传历史</a><a href="/__quark_auth">授权</a><a href="/__logout">退出</a></p>
-<h1>操作历史</h1>
-{err}{notice}
-<form class="filters" method="get" action="/__history">
-  <label>类型<select name="kind">
-    <option value="all"{k_all}>全部</option>
-    <option value="upload"{k_up}>上传</option>
-    <option value="delete"{k_del}>删除</option>
-  </select></label>
-  <label>结果<select name="result">
-    <option value="all"{r_all}>全部</option>
-    <option value="ok"{r_ok}>成功/跳过</option>
-    <option value="error"{r_err}>失败</option>
-  </select></label>
-  <label>路径包含<input name="q" value="{q}" placeholder="关键词"/></label>
-  <button class="primary" type="submit">筛选</button>
-</form>
-<form class="filters" method="get" action="/__history" onsubmit="return confirm('确认清除？不可恢复');">
-  <input type="hidden" name="clear" value="1"/>
-  <label>清除日期（空=全部）<input name="date" placeholder="YYYY-MM-DD"/></label>
-  <button class="danger" type="submit">清除日志</button>
-</form>
-<table>
-<thead><tr><th>时间</th><th>类型</th><th>结果</th><th>大小</th><th>路径</th></tr></thead>
-<tbody>{rows}</tbody>
-</table>
+<header class="top"><div class="top-inner">
+  <a class="brand" href="/">Quark<span>Drive</span> WebDAV</a>
+  {actions}
+</div></header>
+<div class="wrap"><div class="card">
+  <h1>夸克 Open 授权</h1>
+  {status}
+  {err}
+  <a class="link" href="/__quark_auth">刷新状态</a>
+</div></div>
+{float_html}
 </body></html>"#,
+        base = browse_base_css(),
+        float = console_float_css(),
+        actions = console_actions_html(true),
+        status = status,
         err = err,
-        notice = notice,
-        k_all = sel(kind, "all"),
-        k_up = sel(kind, "upload"),
-        k_del = sel(kind, "delete"),
-        r_all = sel(result, "all"),
-        r_ok = sel(result, "ok"),
-        r_err = sel(result, "error"),
-        q = html_escape(&q),
-        rows = rows,
+        float_html = console_float_html(),
     )
 }
 
@@ -1062,22 +1195,23 @@ fn render_directory_html(req_path: &str, files: &[crate::drive::QuarkFile]) -> S
         format!("{}/", req_path)
     };
 
-    // Build breadcrumbs
-    let mut breadcrumbs = String::from(r#"<a href="/">根目录</a>"#);
+    // 面包屑：片状路径，当前目录不加链接。
+    let mut breadcrumbs = String::from(r#"<a class="crumb" href="/">根目录</a>"#);
     if display_path != "/" {
         let parts: Vec<&str> = display_path.trim_matches('/').split('/').collect();
         let mut href = String::new();
         for (i, part) in parts.iter().enumerate() {
             href.push('/');
             href.push_str(&percent_encode_path(part));
+            breadcrumbs.push_str(r#"<span class="sep">/</span>"#);
             if i == parts.len() - 1 {
                 breadcrumbs.push_str(&format!(
-                    r#" / <span class="current">{}</span>"#,
+                    r#"<span class="crumb current">{}</span>"#,
                     html_escape(part)
                 ));
             } else {
                 breadcrumbs.push_str(&format!(
-                    r#" / <a href="{}">{}</a>"#,
+                    r#"<a class="crumb" href="{}">{}</a>"#,
                     html_escape(&format!("{}/", href)),
                     html_escape(part)
                 ));
@@ -1085,17 +1219,16 @@ fn render_directory_html(req_path: &str, files: &[crate::drive::QuarkFile]) -> S
         }
     }
 
-    // Separate dirs and files, sort by name
     let mut dirs: Vec<&crate::drive::QuarkFile> = files.iter().filter(|f| f.dir).collect();
     let mut regular_files: Vec<&crate::drive::QuarkFile> = files.iter().filter(|f| f.file).collect();
     dirs.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
     regular_files.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
 
     let mut rows = String::new();
-
-    // Parent directory link
     if display_path != "/" {
-        rows.push_str(r#"<tr class="parent"><td class="icon">📁</td><td class="name"><a href="../">..</a></td><td class="size">-</td><td class="date">-</td></tr>"#);
+        rows.push_str(
+            r#"<tr class="parent"><td class="icon">↑</td><td class="name"><a href="../">上级目录</a></td><td class="size">-</td><td class="date">-</td></tr>"#,
+        );
     }
 
     for dir in &dirs {
@@ -1104,19 +1237,29 @@ fn render_directory_html(req_path: &str, files: &[crate::drive::QuarkFile]) -> S
         let date = format_timestamp(dir.updated_at);
         rows.push_str(&format!(
             r#"<tr class="dir"><td class="icon">📁</td><td class="name"><a href="{}">{}</a></td><td class="size">-</td><td class="date">{}</td></tr>"#,
-            html_escape(&href), name, date
+            html_escape(&href),
+            name,
+            date
         ));
     }
 
     for file in &regular_files {
         let name = html_escape(&file.file_name);
-        let href = format!("{}{}", req_path_normalized, percent_encode_path(&file.file_name));
+        let href = format!(
+            "{}{}",
+            req_path_normalized,
+            percent_encode_path(&file.file_name)
+        );
         let size = format_size(file.size);
         let date = format_timestamp(file.updated_at);
         let icon = file_icon(&file.file_name);
         rows.push_str(&format!(
             r#"<tr class="file"><td class="icon">{}</td><td class="name"><a href="{}">{}</a></td><td class="size">{}</td><td class="date">{}</td></tr>"#,
-            icon, html_escape(&href), name, size, date
+            icon,
+            html_escape(&href),
+            name,
+            size,
+            date
         ));
     }
 
@@ -1124,69 +1267,76 @@ fn render_directory_html(req_path: &str, files: &[crate::drive::QuarkFile]) -> S
 
     format!(
         r#"<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>QuarkDrive - {title}</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%232563eb'/%3E%3Ctext x='32' y='40' font-family='Arial,Helvetica,sans-serif' font-size='26' font-weight='bold' fill='white' text-anchor='middle'%3EQW%3C/text%3E%3C/svg%3E">
+<html lang="zh-CN"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{title} · QuarkDrive</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230e7490'/%3E%3Ctext x='32' y='42' font-family='Arial,Helvetica,sans-serif' font-size='28' font-weight='bold' fill='white' text-anchor='middle'%3EQ%3C/text%3E%3C/svg%3E"/>
 <style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }}
-.container {{ max-width: 960px; margin: 0 auto; padding: 20px; }}
-.header {{ background: #fff; border-radius: 8px; padding: 16px 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-.header h1 {{ font-size: 18px; font-weight: 600; color: #1a1a1a; margin-bottom: 8px; }}
-.breadcrumb {{ font-size: 14px; color: #666; }}
-.breadcrumb a {{ color: #2563eb; text-decoration: none; }}
-.breadcrumb a:hover {{ text-decoration: underline; }}
-.breadcrumb .current {{ color: #333; font-weight: 500; }}
-.content {{ background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); overflow: hidden; }}
-table {{ width: 100%; border-collapse: collapse; }}
-thead {{ background: #fafafa; }}
-th {{ text-align: left; padding: 12px 16px; font-size: 13px; font-weight: 600; color: #666; border-bottom: 1px solid #eee; }}
-td {{ padding: 10px 16px; border-bottom: 1px solid #f0f0f0; font-size: 14px; }}
-tr:hover {{ background: #f8fafc; }}
-tr.parent:hover {{ background: #f0f7ff; }}
-tr.dir:hover {{ background: #f0f7ff; }}
-.icon {{ width: 32px; text-align: center; }}
-.name {{ word-break: break-all; }}
-.name a {{ color: #1a1a1a; text-decoration: none; }}
-.name a:hover {{ color: #2563eb; text-decoration: underline; }}
-.dir .name a {{ font-weight: 500; }}
-.size {{ width: 100px; text-align: right; color: #888; white-space: nowrap; }}
-.date {{ width: 160px; color: #888; white-space: nowrap; }}
-.footer {{ text-align: center; padding: 16px; font-size: 12px; color: #aaa; }}
-.footer a {{ color: #aaa; text-decoration: none; }}
-.footer a:hover {{ color: #2563eb; text-decoration: underline; }}
-@media (max-width: 640px) {{
-  .container {{ padding: 10px; }}
-  .date {{ display: none; }}
-  th:last-child {{ display: none; }}
-  .size {{ width: 80px; }}
+{base}
+{float}
+.pathbar{{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  margin-bottom:14px;
 }}
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="header">
-    <h1><a href="https://github.com/chenqimiao/quarkdrive-webdav" target="_blank" style="color:inherit;text-decoration:none;">QuarkDrive WebDAV</a></h1>
-    <div class="breadcrumb">{breadcrumbs}</div>
-    <div style="margin-top:8px;font-size:13px"><a href="/__uploads" style="color:#2563eb;margin-right:12px">上传进度</a><a href="/__history" style="color:#2563eb;margin-right:12px">上传历史</a><a href="/__quark_auth" style="color:#2563eb;margin-right:12px">授权</a><a href="/__logout" style="color:#2563eb">退出</a></div>
+.crumbs{{display:flex;align-items:center;flex-wrap:wrap;gap:6px;font-size:13px}}
+.crumb{{
+  display:inline-block;padding:5px 10px;background:var(--panel);border:1px solid var(--line);
+  color:var(--ink);text-decoration:none;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}}
+.crumb:hover{{border-color:var(--accent);color:var(--accent);text-decoration:none}}
+.crumb.current{{background:var(--accent-soft);border-color:rgba(14,116,144,.25);font-weight:600}}
+.sep{{color:#94a3b8;font-size:12px}}
+.count{{color:var(--muted);font-size:13px;white-space:nowrap}}
+.panel{{background:var(--panel);border:1px solid var(--line);overflow:hidden}}
+table{{width:100%;border-collapse:collapse}}
+thead{{background:#f7fafb}}
+th{{text-align:left;padding:11px 16px;font-size:12px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--line)}}
+td{{padding:11px 16px;border-bottom:1px solid #eef2f5;font-size:14px}}
+tr:last-child td{{border-bottom:0}}
+tr:hover{{background:#f4fafb}}
+tr.parent:hover,tr.dir:hover{{background:#eef8f9}}
+.icon{{width:40px;text-align:center}}
+.name{{word-break:break-all}}
+.name a{{color:var(--ink);text-decoration:none}}
+.name a:hover{{color:var(--accent)}}
+.dir .name a{{font-weight:600}}
+.size{{width:110px;text-align:right;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}}
+.date{{width:150px;color:var(--muted);white-space:nowrap}}
+.footer{{margin-top:14px;text-align:center;font-size:12px;color:#94a3b8}}
+.footer a{{color:#94a3b8}}
+@media (max-width:720px){{
+  .date,th.date{{display:none}}
+  .wrap{{padding:14px 12px 80px}}
+}}
+</style></head><body>
+<header class="top"><div class="top-inner">
+  <a class="brand" href="/">Quark<span>Drive</span> WebDAV</a>
+  {actions}
+</div></header>
+<main class="wrap">
+  <div class="pathbar">
+    <nav class="crumbs" aria-label="路径">{breadcrumbs}</nav>
+    <div class="count">{total} 项</div>
   </div>
-  <div class="content">
+  <div class="panel">
     <table>
       <thead><tr><th class="icon"></th><th>名称</th><th class="size">大小</th><th class="date">修改时间</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
   </div>
-  <div class="footer">{total} 个项目 · <a href="https://github.com/chenqimiao/quarkdrive-webdav" target="_blank">GitHub</a></div>
-</div>
-</body>
-</html>"#,
+  <div class="footer"><a href="https://github.com/Poiig/quarkdrive-webdav" target="_blank" rel="noopener">GitHub</a></div>
+</main>
+{float_html}
+</body></html>"#,
         title = html_escape(&display_path),
+        base = browse_base_css(),
+        float = console_float_css(),
+        actions = console_actions_html(false),
         breadcrumbs = breadcrumbs,
-        rows = rows,
         total = total,
+        rows = rows,
+        float_html = console_float_html(),
     )
 }
 
@@ -1607,7 +1757,9 @@ mod tests {
         let files: Vec<crate::drive::QuarkFile> = vec![];
         let html = render_directory_html("/", &files);
         assert!(html.contains("QuarkDrive"));
-        assert!(html.contains("0 个项目"));
+        assert!(html.contains("0 项"));
+        assert!(html.contains("qdFloat"));
+        assert!(html.contains("data-qd-history"));
         // root should not have parent link
         assert!(!html.contains("href=\"../\""));
     }
@@ -1649,7 +1801,7 @@ mod tests {
             },
         ];
         let html = render_directory_html("/docs", &files);
-        assert!(html.contains("2 个项目"));
+        assert!(html.contains("2 项"));
         // subdirectory should have parent link
         assert!(html.contains("href=\"../\""));
         // should contain the directory and file names
@@ -1657,6 +1809,10 @@ mod tests {
         assert!(html.contains("test.txt"));
         // file size should be formatted
         assert!(html.contains("1.0 KB"));
+        // 进度面板默认展开；历史走弹窗而非独立页链接主导航
+        assert!(html.contains("qd-float open"));
+        assert!(html.contains("/__uploads.json"));
+        assert!(!html.contains("href=\"/__uploads\""));
     }
 
     #[test]
