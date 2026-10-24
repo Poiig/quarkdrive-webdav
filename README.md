@@ -37,14 +37,14 @@ quarkdrive-webdav \
   -U '用户名' -W '密码' -p 8080
 ```
 
-Docker（需先按 `docker/Dockerfile` 自行构建镜像）：
+Docker（`main` / tag 推送后由 CI 自动构建到 GHCR）：
 
 ```bash
 docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
   -e QUARK_COOKIE='your quark cookie' \
   -e WEBDAV_AUTH_USER=admin \
   -e WEBDAV_AUTH_PASSWORD=admin \
-  quarkdrive-webdav:local
+  ghcr.io/poiig/quarkdrive-webdav:latest
 ```
 
 ## Open 模式（推荐，对齐 OpenList）
@@ -92,7 +92,7 @@ Docker Compose：
 ```yaml
 services:
   quarkdrive-webdav:
-    image: quarkdrive-webdav:local
+    image: ghcr.io/poiig/quarkdrive-webdav:latest
     container_name: quarkdrive-webdav
     restart: unless-stopped
     ports:
@@ -110,6 +110,15 @@ services:
       - WEBDAV_AUTH_PASSWORD=admin
       - CHUNK_CACHE_MB=128
 ```
+
+镜像由 `.github/workflows/docker.yml` 自动构建：
+
+- push `main` → `ghcr.io/poiig/quarkdrive-webdav:latest` + `sha-xxxxxxx`
+- push `v*` tag → 对应版本号标签
+- PR → 只构建不推送
+- 也可在 Actions 里手动 `workflow_dispatch`
+
+GHCR 私有包需先登录：`echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin`，并在包设置里授权自己的账号读取。
 
 启动后用 WebDAV 客户端或浏览器访问 `http://主机:8080`。
 
