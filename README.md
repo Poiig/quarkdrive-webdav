@@ -58,7 +58,7 @@ docker run -d --name=quarkdrive-webdav --restart=unless-stopped -p 8080:8080 \
 1. 若已授权 → 直接浏览网盘  
 2. 若未授权/过期 → 页面提示扫码，点「扫码授权」完成登录  
 
-Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。
+Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录必须对容器可写，否则扫码成功也无法落盘，重启后需重新登录。
 
 ## 常用环境变量
 

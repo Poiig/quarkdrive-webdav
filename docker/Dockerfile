@@ -9,11 +9,13 @@ RUN addgroup -S app && adduser -S app -G app -s /bin/sh
 WORKDIR /app
 
 COPY bin/${TARGETARCH}/quarkdrive-webdav /usr/local/bin/quarkdrive-webdav
-RUN chmod +x /usr/local/bin/quarkdrive-webdav
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /usr/local/bin/quarkdrive-webdav /entrypoint.sh \
+    && mkdir -p /data /app/logs \
+    && chown -R app:app /data /app/logs
 
-# 添加定时清理任务
+# 临时文件定时清理
 RUN echo "0 3 * * * find /tmp -type f -amin +15 -mmin +15 -cmin +15 -delete" > /etc/crontabs/root
 
-# 用 root 用户启动 cron 和主程序
 USER root
-CMD crond && su -s /bin/sh app -c "/usr/local/bin/quarkdrive-webdav"
+ENTRYPOINT ["/entrypoint.sh"]

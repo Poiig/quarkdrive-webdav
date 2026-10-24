@@ -15,7 +15,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::alert::Alert;
@@ -118,13 +118,27 @@ impl OpenCredentials {
             sign_key: Some(self.sign_key.clone()),
         };
         let json = serde_json::to_string_pretty(&data)?;
-        if let Some(parent) = Path::new(path).parent() {
+        let path_obj = Path::new(path);
+        if let Some(parent) = path_obj.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "创建 token 目录失败: {}（请检查挂载卷权限，Docker 需可写）",
+                        parent.display()
+                    )
+                })?;
             }
         }
-        std::fs::write(path, json)
-            .with_context(|| format!("写入 token 文件失败: {path}"))?;
+        // 先写临时文件再 rename，避免写一半崩溃留下空文件。
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, &json).with_context(|| {
+            format!(
+                "写入 token 文件失败: {tmp}（常见原因：容器用户对目录无写权限，请 chown/chmod 挂载目录）"
+            )
+        })?;
+        std::fs::rename(&tmp, path).with_context(|| {
+            format!("落盘 token 文件失败: {path}（rename 权限不足？）")
+        })?;
         Ok(())
     }
 }
@@ -388,6 +402,8 @@ pub struct OpenClient {
     alert: Alert,
     /// 授权探测成功后的短缓存，避免每次浏览都打 user/info。
     auth_ok_until: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    /// 刷新 token 单飞，避免并发请求把日志刷爆。
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl OpenClient {
@@ -397,7 +413,23 @@ impl OpenClient {
             api_base: OPEN_API_BASE.to_string(),
             alert,
             auth_ok_until: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// 确保有可用 access_token：全空则直接提示扫码，不打 Open API。
+    async fn ensure_access_token(&self, client: &ClientWithMiddleware) -> Result<()> {
+        if !self.creds.access_token.read().await.is_empty() {
+            return Ok(());
+        }
+        if !self.creds.has_refresh_token().await {
+            bail!("尚未授权，请打开 Web 页扫码登录");
+        }
+        let _guard = self.refresh_lock.lock().await;
+        if !self.creds.access_token.read().await.is_empty() {
+            return Ok(());
+        }
+        self.refresh_token(client).await
     }
 
     /// 启动时拉 user/info，缓存 user_id（上传 proof_seed1 需要）。
@@ -719,16 +751,31 @@ impl OpenClient {
     where
         T: for<'de> Deserialize<'de>,
     {
+        // 未扫码时 access/refresh 皆空：直接失败，禁止空 token 打 API / 刷刷新日志。
+        if let Err(err) = self.ensure_access_token(client).await {
+            return Err(err);
+        }
+
         match self
             .request_once::<T>(client, pathname, method, body.as_ref(), manual, false)
             .await
         {
             Ok(v) => Ok(v),
             Err(err) if is_token_expired_error(&err) => {
+                let _guard = self.refresh_lock.lock().await;
+                // 其他请求可能已刷新成功，先用新 token 再试；仍失败再真正 refresh。
+                if let Ok(v) = self
+                    .request_once::<T>(client, pathname, method, body.as_ref(), manual, true)
+                    .await
+                {
+                    return Ok(v);
+                }
                 warn!(error = %err, "access_token 失效，尝试刷新后重试");
                 if let Err(refresh_err) = self.refresh_token(client).await {
                     let msg = format!("{refresh_err:#}");
-                    self.alert.notify("Open Token 刷新失败", &msg).await;
+                    if !msg.contains("尚未授权") && !msg.contains("缺少 refresh_token") {
+                        self.alert.notify("Open Token 刷新失败", &msg).await;
+                    }
                     return Err(refresh_err);
                 }
                 self.request_once(client, pathname, method, body.as_ref(), manual, true)
@@ -736,6 +783,9 @@ impl OpenClient {
             }
             Err(err) => {
                 let msg = err.to_string();
+                if msg.contains("尚未授权") || msg.contains("缺少 refresh_token") {
+                    return Err(err);
+                }
                 if msg.contains("errno")
                     || msg.contains("Open API")
                     || msg.contains("令牌")
@@ -796,6 +846,12 @@ impl OpenClient {
         debug!(pathname = %pathname, http_status = %status, body = %text, "open api response");
 
         if let Ok(err_body) = serde_json::from_str::<OpenErrorBody>(&text) {
+            // 「不能为空」是未登录，不是过期；避免误走 refresh 风暴。
+            if err_body.error_info.contains("access_token不能为空")
+                || err_body.error_info.contains("access_token 不能为空")
+            {
+                bail!("尚未授权，请打开 Web 页扫码登录");
+            }
             if err_body.status == -1
                 && (err_body.errno == 11001
                     || (err_body.errno == 14001
@@ -1023,11 +1079,19 @@ impl OpenClient {
     }
 
     async fn apply_tokens(&self, access: String, refresh: String) -> Result<()> {
-        info!("Open API token 已刷新");
+        info!("Open API token 已更新");
         *self.creds.access_token.write().await = access;
         *self.creds.refresh_token.write().await = refresh;
+        *self.auth_ok_until.lock().await = None;
         if let Err(err) = self.creds.persist_tokens().await {
-            warn!(error = %err, "刷新后写 token 文件失败");
+            // 落盘失败则重启会丢登录；必须醒目提示，不要只 warn 一句。
+            let msg = format!("{err:#}");
+            error!(error = %msg, "token 落盘失败，重启后需重新扫码");
+            self.alert
+                .notify("Token 落盘失败", &msg)
+                .await;
+        } else if let Some(ref path) = self.creds.token_file {
+            info!(path = %path, "token 已写入文件");
         }
         Ok(())
     }
