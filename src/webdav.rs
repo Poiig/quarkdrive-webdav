@@ -61,7 +61,16 @@ impl WebDavServer {
                     .serve_connection(io, service)
                     .await
                 {
-                    error!("HTTP serve error: {}", e);
+                    // 客户端（如 CloudSync）等不及 PUT 完成就断开时很常见，不是服务故障。
+                    let msg = e.to_string();
+                    if msg.contains("connection closed before message completed")
+                        || msg.contains("connection reset")
+                        || msg.contains("broken pipe")
+                    {
+                        debug!("HTTP client disconnected: {}", msg);
+                    } else {
+                        error!("HTTP serve error: {}", e);
+                    }
                 }
             });
         }
