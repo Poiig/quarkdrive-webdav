@@ -1345,6 +1345,7 @@ dependencies = [
  "headers",
  "hex",
  "htmlescape",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "md5",

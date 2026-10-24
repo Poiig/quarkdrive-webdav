@@ -37,6 +37,7 @@ url = "2.5.4"
 #path-slash = "0.2.1"
 headers = "0.4.1"
 hyper = {version = "1.6.0", features = ["full"]}
+http-body-util = "0.1"
 #http = "0.2.10"
 hyper-util = { version = "0.1.14", features = ["server"] }
 rustls-pemfile = {version = "2.2.0", optional = true}
