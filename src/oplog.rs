@@ -68,8 +68,8 @@ impl OpLog {
         let now = now_shanghai();
         let stamped = format!("{} {}", now.format("%Y-%m-%d %H:%M:%S %z"), body);
 
-        // 同步打到控制台（target 走模块路径，才能过 RUST_LOG=quarkdrive_webdav=info）。
-        info!(%stamped, "op");
+        // 同步打到控制台（须用模块 target，才能过 RUST_LOG=quarkdrive_webdav=info）。
+        info!("{stamped}");
 
         if let Err(err) = fs::create_dir_all(&self.dir).await {
             warn!(error = %err, dir = %self.dir.display(), "create op log dir failed");
