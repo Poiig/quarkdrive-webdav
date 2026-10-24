@@ -1848,7 +1848,14 @@ mod tests {
 
         // Step 4: Test VFS-level duplicate prevention
         // create_dir checks get_file() first → returns Exists if already there
-        let fs = crate::vfs::QuarkDriveFileSystem::new(drive.clone(), "/".to_string(), 100, 60).unwrap();
+        let fs = crate::vfs::QuarkDriveFileSystem::new(
+            drive.clone(),
+            "/".to_string(),
+            100,
+            64 * 1024 * 1024,
+            60,
+        )
+        .unwrap();
         use dav_server::davpath::DavPath;
         use dav_server::fs::DavFileSystem;
 

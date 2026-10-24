@@ -70,6 +70,8 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。
 | `QUARK_REFRESH_TOKEN` | 可选，已有 refresh token 时可直接填 | 空 |
 | `UPLOAD_MEMORY_LIMIT` | 上传内存上限（Cookie/Open 共用），如 `64MB`/`1GB`；`0`=始终落盘 | `64MB` |
 | `UPLOAD_MAX_CONCURRENT` | 同时后台上传数上限 | `4` |
+| `DIR_CACHE_SIZE` | 目录缓存最多目录数 | `1000` |
+| `DIR_CACHE_BYTES` | 目录缓存字节上限，如 `64MB` | `64MB` |
 | `CHUNK_CACHE_MB` | 播放预取块缓存（MB），`0` 关闭 | `128` |
 | `PREFETCH_CHUNK_MB` | 预取分块大小（MB） | `16` |
 | `PREFETCH_AHEAD` | 预取并发窗口（1–8） | `4` |
@@ -79,7 +81,7 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。
 | `WEBDAV_AUTH_USER` / `WEBDAV_AUTH_PASSWORD` | WebDAV 账号密码 | — |
 | `PORT` | 端口 | `8080` |
 
-低配机器可参考：`UPLOAD_MEMORY_LIMIT=64MB UPLOAD_MAX_CONCURRENT=2 CHUNK_CACHE_MB=64 PREFETCH_CHUNK_MB=8 PREFETCH_AHEAD=2`。
+低配机器可参考：`UPLOAD_MEMORY_LIMIT=64MB UPLOAD_MAX_CONCURRENT=2 DIR_CACHE_BYTES=32MB CHUNK_CACHE_MB=64 PREFETCH_CHUNK_MB=8 PREFETCH_AHEAD=2`。
 
 ## 免责声明
 

@@ -764,7 +764,14 @@ mod tests {
             alert: crate::alert::Alert::new(None),
         };
         let drive = crate::drive::QuarkDrive::new(config).unwrap();
-        let fs = crate::vfs::QuarkDriveFileSystem::new(drive, root.to_string(), 100, 60).unwrap();
+        let fs = crate::vfs::QuarkDriveFileSystem::new(
+            drive,
+            root.to_string(),
+            100,
+            64 * 1024 * 1024,
+            60,
+        )
+        .unwrap();
         let handler = DavHandler::builder()
             .filesystem(Box::new(fs.clone()))
             .build_handler();

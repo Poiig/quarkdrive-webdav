@@ -126,8 +126,14 @@ pub struct QuarkDriveFileSystem {
 
 impl QuarkDriveFileSystem {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(drive: QuarkDrive, root: String, cache_size: u64, cache_ttl: u64) -> Result<Self> {
-        let dir_cache = Cache::new(cache_size, cache_ttl, drive.clone());
+    pub fn new(
+        drive: QuarkDrive,
+        root: String,
+        cache_size: u64,
+        cache_bytes: u64,
+        cache_ttl: u64,
+    ) -> Result<Self> {
+        let dir_cache = Cache::new(cache_size, cache_bytes, cache_ttl, drive.clone());
         debug!("dir cache initialized");
         let root = if root.starts_with('/') {
             PathBuf::from(root)
@@ -1466,14 +1472,15 @@ impl QuarkDavFile {
 
 
     async fn consume_buf(&mut self) -> Result<(), FsError> {
-        let mut md5_ctx = self.md5_ctx.clone();
-        let mut sha1_ctx = self.sha1_ctx.clone();
-        let bytes = self.upload_state.buffer.split().freeze().to_vec();
+        // 流式：不 clone digest、不 to_vec；边写边更新 md5/sha1。
+        let bytes = self.upload_state.buffer.split().freeze();
+        if bytes.is_empty() {
+            return Ok(());
+        }
         let add = bytes.len() as u64;
 
         // 先落盘/入内存成功后再累加 size，避免失败后 size 虚高导致读切片越界。
         if self.upload_state.use_memory {
-            // 并行合计超限则溢出到临时文件。
             if self.fs.upload_memory.try_reserve(add) {
                 self.upload_state.memory_reserved += add;
                 self.upload_state.memory_data.extend_from_slice(&bytes);
@@ -1507,11 +1514,9 @@ impl QuarkDavFile {
             })?;
         }
 
-        self.upload_state.size = self.upload_state.size + add;
-        md5_ctx.consume(&bytes);
-        sha1_ctx.update(&bytes);
-        self.md5_ctx = md5_ctx;
-        self.sha1_ctx = sha1_ctx;
+        self.upload_state.size += add;
+        self.md5_ctx.consume(&bytes);
+        self.sha1_ctx.update(&bytes);
         Ok(())
     }
 
@@ -1708,11 +1713,27 @@ impl DavFile for QuarkDavFile {
     }
 
     /// write file : open -> metadata -> flush -> write_buf/write_byte -> flush
-    fn write_buf(&mut self, buf: Box<dyn bytes::Buf + Send>) -> FsFuture<()>{
+    fn write_buf(&mut self, mut buf: Box<dyn bytes::Buf + Send>) -> FsFuture<()>{
         debug!(file_id = %self.file.fid, file_name = %self.file.file_name, "file: write_buf");
         async move {
-            if self.prepare_for_upload().await? {
-                self.upload_state.buffer.put(buf);
+            if !self.prepare_for_upload().await? {
+                return Ok(());
+            }
+            // 大块写入按 upload_buffer_size 切片消费，边写边哈希，避免巨型 buffer 停留。
+            let cap = self.fs.upload_buffer_size.max(64 * 1024);
+            while buf.has_remaining() {
+                let space = cap
+                    .saturating_sub(self.upload_state.buffer.len())
+                    .max(1);
+                let chunk = buf.chunk();
+                let take = chunk.len().min(space);
+                self.upload_state.buffer.extend_from_slice(&chunk[..take]);
+                buf.advance(take);
+                if self.upload_state.buffer.len() >= cap {
+                    self.consume_buf().await?;
+                }
+            }
+            if !self.upload_state.buffer.is_empty() {
                 self.consume_buf().await?;
             }
             Ok(())

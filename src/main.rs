@@ -88,11 +88,14 @@ struct Opt {
     /// 操作日志保留天数，默认 7；未设置即为 7
     #[arg(long, env = "OP_LOG_RETENTION_DAYS", default_value_t = 7)]
     op_log_retention_days: u64,
-    /// Directory entries cache size
-    #[arg(long, default_value = "1000")]
+    /// 目录缓存最多保留多少个目录（与字节上限共同约束）
+    #[arg(long, env = "DIR_CACHE_SIZE", default_value = "1000")]
     cache_size: u64,
+    /// 目录缓存字节上限，如 64MB；大目录列表按估算字节计入
+    #[arg(long, env = "DIR_CACHE_BYTES", default_value = "64MB")]
+    cache_bytes: String,
     /// Directory entries cache expiration time in seconds
-    #[arg(long, default_value = "600")]
+    #[arg(long, env = "DIR_CACHE_TTL", default_value = "600")]
     cache_ttl: u64,
     /// 分块预取缓存上限（MB）。0 关闭
     #[arg(long, env = "CHUNK_CACHE_MB", default_value = "128")]
@@ -276,7 +279,9 @@ async fn main() -> anyhow::Result<()> {
     );
     oplog.start_prune_task();
 
-    let mut fs = QuarkDriveFileSystem::new(drive, opt.root, opt.cache_size, opt.cache_ttl)?;
+    let cache_bytes = parse_byte_size(&opt.cache_bytes)?;
+    let mut fs =
+        QuarkDriveFileSystem::new(drive, opt.root, opt.cache_size, cache_bytes, opt.cache_ttl)?;
     fs.set_no_trash(opt.no_trash)
         .set_read_only(opt.read_only)
         .set_upload_buffer_size(opt.upload_buffer_size)
