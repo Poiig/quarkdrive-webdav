@@ -25,9 +25,12 @@ pub struct QuarkFile {
     pub updated_at: u64,
     pub dir: bool,
     pub file: bool,
-    pub download_url:Option<String>,
+    pub download_url: Option<String>,
     pub content_hash: Option<String>,
     pub parent_path: Option<String>,
+    /// Open 列表返回的缩略图（HEIC 等浏览器不能直显时优先用它预览）。
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
 }
 
 
@@ -48,6 +51,7 @@ impl QuarkFile {
             fid: "0".to_string(),
             download_url: None,
             content_hash: None,
+            thumbnail_url: None,
         }
     }
 }

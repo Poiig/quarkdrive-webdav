@@ -234,7 +234,11 @@ impl QuarkDriveWebDav {
                 }
                 return Some(html_response(
                     200,
-                    render_image_preview_page(req_path, &file.file_name),
+                    render_image_preview_page(
+                        req_path,
+                        &file.file_name,
+                        file.thumbnail_url.as_deref(),
+                    ),
                 ));
             }
         }
@@ -603,10 +607,18 @@ body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:
     )
 }
 
-/// 浏览器图片预览；HEIC/HEIF 用 heic2any 转 JPEG（Chrome/Firefox 原生不支持）。
-fn render_image_preview_page(req_path: &str, file_name: &str) -> String {
+/// 浏览器图片预览；HEIC 优先用夸克缩略图，失败再试 heic2any。
+fn render_image_preview_page(
+    req_path: &str,
+    file_name: &str,
+    thumbnail_url: Option<&str>,
+) -> String {
     let title = html_escape(file_name);
-    let raw_url = format!("{}?raw=1", html_escape(req_path));
+    let raw_url = html_escape(&format!(
+        "{}{}raw=1",
+        req_path,
+        if req_path.contains('?') { "&" } else { "?" }
+    ));
     let parent = {
         let p = req_path.trim_end_matches('/');
         match p.rfind('/') {
@@ -615,26 +627,104 @@ fn render_image_preview_page(req_path: &str, file_name: &str) -> String {
         }
     };
     let parent = html_escape(&parent);
+    let thumb_js = match thumbnail_url {
+        Some(u) if !u.is_empty() => format!("const THUMB_URL = {};", serde_json::to_string(u).unwrap_or_else(|_| "null".into())),
+        _ => "const THUMB_URL = null;".to_string(),
+    };
     let heic = is_heic_like(file_name);
-    let heic_script = if heic {
+    let body_script = if heic {
         r#"
-<script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
 <script>
+function errText(e) {
+  if (e == null) return 'unknown';
+  if (typeof e === 'string') return e;
+  if (e instanceof Error) return e.message || String(e);
+  if (typeof e === 'object') {
+    var m = e.message || e.msg || e.error || e.reason;
+    if (typeof m === 'string' && m) {
+      return (e.code != null ? (String(e.code) + ': ') : '') + m;
+    }
+    if (e.code != null) return String(e.code);
+    try {
+      var s = JSON.stringify(e);
+      if (s && s !== '{}' && s !== 'null') return s;
+    } catch (_) {}
+  }
+  try { return String(e); } catch (_) { return 'unknown error'; }
+}
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error('脚本加载失败: ' + src));
+    document.head.appendChild(s);
+  });
+}
+function showImg(url, note) {
+  const img = document.getElementById('preview');
+  const status = document.getElementById('status');
+  img.onload = () => { status.textContent = note || ''; };
+  img.onerror = () => { status.textContent = '图片加载失败'; };
+  img.src = url;
+  img.hidden = false;
+}
 (async () => {
   const status = document.getElementById('status');
-  const img = document.getElementById('preview');
+  // 1) 优先夸克缩略图（与 OpenList 一致，Chrome 可直接看）
+  if (THUMB_URL) {
+    showImg(THUMB_URL, '当前为云端缩略图预览；可下载原文件查看全图');
+  } else {
+    status.textContent = '正在加载转换库…';
+  }
   try {
-    status.textContent = '正在转换 HEIC…';
-    const res = await fetch(RAW_URL, { credentials: 'same-origin' });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const blob = await res.blob();
-    const out = await heic2any({ blob, toType: 'image/jpeg', quality: 0.92 });
-    const jpeg = Array.isArray(out) ? out[0] : out;
-    img.src = URL.createObjectURL(jpeg);
-    img.hidden = false;
-    status.textContent = '';
+    if (typeof heic2any !== 'function') {
+      const cdns = [
+        'https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js',
+        'https://unpkg.com/heic2any@0.0.4/dist/heic2any.min.js',
+        'https://fastly.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js'
+      ];
+      let loaded = false;
+      for (const src of cdns) {
+        try { await loadScript(src); if (typeof heic2any === 'function') { loaded = true; break; } }
+        catch (_) {}
+      }
+      if (!loaded) throw new Error('无法加载 heic2any（CDN 不可达）');
+    }
+    const res = await fetch(RAW_URL, {
+      credentials: 'include',
+      headers: { 'Accept': '*/*' },
+      cache: 'no-store'
+    });
+    if (!res.ok) throw new Error('下载失败 HTTP ' + res.status);
+    const ctype = (res.headers.get('content-type') || '').toLowerCase();
+    if (ctype.includes('text/html')) throw new Error('拿到的是网页而不是图片');
+    const buf = await res.arrayBuffer();
+    if (!buf || buf.byteLength < 32) throw new Error('文件过小 (' + (buf && buf.byteLength) + ' bytes)');
+    let lastErr = null;
+    for (const t of ['image/heic', 'image/heif', 'application/octet-stream']) {
+      try {
+        const out = await heic2any({
+          blob: new Blob([buf], { type: t }),
+          toType: 'image/jpeg',
+          quality: 0.92,
+          multiple: false
+        });
+        const jpeg = Array.isArray(out) ? out[0] : out;
+        if (!jpeg) throw new Error('转换结果为空');
+        showImg(URL.createObjectURL(jpeg), '');
+        return;
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error('HEIC 转换失败');
   } catch (e) {
-    status.textContent = 'HEIC 预览失败：' + e + '。可尝试下载原文件，或使用 Safari。';
+    if (THUMB_URL) {
+      status.textContent = '原图转换失败（' + errText(e) + '），已显示缩略图；可下载原文件或用 Safari 查看全图';
+      return;
+    }
+    status.innerHTML = 'HEIC 预览失败：' + errText(e)
+      + '。<br/>可 <a href="' + RAW_URL + '" download style="color:#8ab4ff">下载原文件</a>，或使用 Safari。';
   }
 })();
 </script>"#
@@ -655,9 +745,9 @@ document.getElementById('status').textContent = '';
 body{{margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif}}
 .bar{{display:flex;gap:12px;align-items:center;padding:10px 16px;background:#1a1a1a;flex-wrap:wrap}}
 .bar a{{color:#8ab4ff;text-decoration:none}}
-.wrap{{display:flex;justify-content:center;align-items:center;min-height:calc(100vh - 48px);padding:16px}}
+.wrap{{display:flex;justify-content:center;align-items:center;min-height:calc(100vh - 48px);padding:16px;flex-direction:column}}
 img{{max-width:100%;max-height:calc(100vh - 80px);object-fit:contain}}
-#status{{padding:16px;color:#ccc}}
+#status{{padding:16px;color:#ccc;text-align:center;line-height:1.6}}
 </style></head><body>
 <div class="bar">
   <a href="{parent}">← 返回</a>
@@ -668,8 +758,8 @@ img{{max-width:100%;max-height:calc(100vh - 80px);object-fit:contain}}
   <p id="status">加载中…</p>
   <img id="preview" alt="{title}" hidden/>
 </div>
-<script>const RAW_URL = "{raw_url}";</script>
-{heic_script}
+<script>const RAW_URL = "{raw_url}"; {thumb_js}</script>
+{body_script}
 </body></html>"#
     )
 }
@@ -863,6 +953,7 @@ mod tests {
                 download_url: None,
                 content_hash: None,
                 parent_path: None,
+                thumbnail_url: None,
             },
             crate::drive::QuarkFile {
                 fid: "2".to_string(),
@@ -878,6 +969,7 @@ mod tests {
                 download_url: None,
                 content_hash: None,
                 parent_path: None,
+                thumbnail_url: None,
             },
         ];
         let html = render_directory_html("/docs", &files);
@@ -908,6 +1000,7 @@ mod tests {
                 download_url: None,
                 content_hash: None,
                 parent_path: None,
+                thumbnail_url: None,
             },
             crate::drive::QuarkFile {
                 fid: "2".to_string(),
@@ -923,6 +1016,7 @@ mod tests {
                 download_url: None,
                 content_hash: None,
                 parent_path: None,
+                thumbnail_url: None,
             },
         ];
         let html = render_directory_html("/", &files);
@@ -930,6 +1024,22 @@ mod tests {
         let pos_b = html.find("b.txt").unwrap();
         // a.txt should come before b.txt (sorted alphabetically)
         assert!(pos_a < pos_b);
+    }
+
+    #[test]
+    fn test_heic_preview_page_errtext_and_thumb() {
+        let html = render_image_preview_page(
+            "/photos/a.HEIC",
+            "a.HEIC",
+            Some("https://img.example/thumb.jpg"),
+        );
+        assert!(html.contains("function errText"));
+        assert!(html.contains("THUMB_URL"));
+        assert!(html.contains("https://img.example/thumb.jpg"));
+        assert!(html.contains("heic2any"));
+        assert!(html.contains("raw=1"));
+        let no_thumb = render_image_preview_page("/x.heic", "x.heic", None);
+        assert!(no_thumb.contains("THUMB_URL = null"));
     }
 
     // --- compute_fs_path tests ---

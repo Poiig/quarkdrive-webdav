@@ -189,6 +189,8 @@ struct OpenFile {
     #[serde(default)]
     content_hash: Option<String>,
     #[serde(default)]
+    thumbnail_url: Option<String>,
+    #[serde(default)]
     created_at: u64,
     #[serde(default)]
     updated_at: u64,
@@ -224,6 +226,7 @@ impl From<OpenFile> for QuarkFile {
             download_url: None,
             content_hash: f.content_hash,
             parent_path: None,
+            thumbnail_url: f.thumbnail_url.filter(|s| !s.is_empty()),
         }
     }
 }
@@ -632,52 +635,72 @@ impl OpenClient {
         if pre.data.task_id.is_empty() {
             bail!("upload_pre 未返回 task_id");
         }
-        let part_size = if pre.data.part_size > 0 {
-            pre.data.part_size as u64
-        } else {
-            4 * 1024 * 1024
-        };
+        // 夸克 get_upload_urls / finish 的 part list 上限约 256（超出会 part list exceed）。
+        let part_size = effective_part_size(size, pre.data.part_size.max(0) as u64);
         let part_info = build_part_info(size, part_size);
-        let url_body = json!({
-            "task_id": pre.data.task_id,
-            "part_info_list": part_info,
-        });
-        let up_urls: UpUrlResp = self
-            .request(
-                client,
-                "/open/v1/file/get_upload_urls",
-                "POST",
-                Some(url_body),
-                None,
-            )
-            .await?;
+        debug!(
+            file_name = %file_name,
+            size = size,
+            part_size = part_size,
+            parts = part_info.len(),
+            "open upload part plan"
+        );
 
-        let mut etags = Vec::with_capacity(up_urls.data.upload_urls.len());
-        for (i, item) in up_urls.data.upload_urls.iter().enumerate() {
-            let offset = i as u64 * part_size;
-            let this_size = std::cmp::min(part_size, size.saturating_sub(offset));
-            // 空分片会触发 OSS EntityTooSmall；非空文件跳过（对齐 OpenList）。
-            if this_size == 0 {
-                continue;
+        // 按批申请上传 URL（每批 ≤256），再上传；etag 按 part_number 落位。
+        let mut etags: Vec<Option<String>> = vec![None; part_info.len()];
+        for chunk in part_info.chunks(MAX_UPLOAD_PARTS as usize) {
+            let url_body = json!({
+                "task_id": pre.data.task_id,
+                "part_info_list": chunk,
+            });
+            let up_urls: UpUrlResp = self
+                .request(
+                    client,
+                    "/open/v1/file/get_upload_urls",
+                    "POST",
+                    Some(url_body),
+                    None,
+                )
+                .await?;
+            let common_headers = up_urls.data.common_headers;
+            if up_urls.data.upload_urls.len() != chunk.len() {
+                bail!(
+                    "get_upload_urls 返回 {} 个 URL，期望 {}",
+                    up_urls.data.upload_urls.len(),
+                    chunk.len()
+                );
             }
-            let buf = source
-                .read_at(offset, this_size as usize)
-                .await
-                .with_context(|| format!("读取上传分片 {} 失败", i + 1))?;
-            // OpenList：分片失败退避重试最多 3 次。
-            let etag = self
-                .upload_part_with_retry(client, item, &up_urls.data.common_headers, buf)
-                .await
-                .with_context(|| format!("上传分片 {} 失败", i + 1))?;
-            etags.push(etag);
+            for item in up_urls.data.upload_urls.iter() {
+                let idx = (item.part_number.max(1) as u64 - 1) as usize;
+                if idx >= part_info.len() {
+                    bail!("get_upload_urls 返回非法 part_number={}", item.part_number);
+                }
+                let this_size = part_info[idx]["part_size"].as_u64().unwrap_or(0);
+                if this_size == 0 {
+                    continue;
+                }
+                let offset = idx as u64 * part_size;
+                let buf = source
+                    .read_at(offset, this_size as usize)
+                    .await
+                    .with_context(|| format!("读取上传分片 {} 失败", item.part_number))?;
+                let etag = self
+                    .upload_part_with_retry(client, item, &common_headers, buf)
+                    .await
+                    .with_context(|| format!("上传分片 {} 失败", item.part_number))?;
+                etags[idx] = Some(etag);
+            }
         }
 
         let mut finish_parts = Vec::with_capacity(part_info.len());
         for (i, part) in part_info.iter().enumerate() {
+            let etag = etags[i]
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("缺少分片 {} 的 etag", i + 1))?;
             finish_parts.push(json!({
                 "part_number": part["part_number"],
                 "part_size": part["part_size"],
-                "etag": etags.get(i).cloned().unwrap_or_default(),
+                "etag": etag,
             }));
         }
         let finish_body = json!({
@@ -1244,6 +1267,22 @@ pub async fn exchange_token_by_nonce(
     ))
 }
 
+/// 夸克 Open `get_upload_urls` / `upload_finish` 单次 part list 上限约 256。
+const MAX_UPLOAD_PARTS: u64 = 256;
+
+/// 在 API 建议的 part_size 基础上，保证总分片数不超过 MAX_UPLOAD_PARTS。
+fn effective_part_size(file_size: u64, api_part_size: u64) -> u64 {
+    const DEFAULT: u64 = 4 * 1024 * 1024;
+    const ALIGN: u64 = 1024 * 1024; // 按 1MB 对齐，便于 OSS
+    let base = if api_part_size > 0 { api_part_size } else { DEFAULT };
+    if file_size == 0 {
+        return base.max(ALIGN);
+    }
+    let min_needed = (file_size + MAX_UPLOAD_PARTS - 1) / MAX_UPLOAD_PARTS;
+    let aligned = ((min_needed + ALIGN - 1) / ALIGN) * ALIGN;
+    base.max(aligned).max(ALIGN)
+}
+
 fn build_part_info(total: u64, part_size: u64) -> Vec<serde_json::Value> {
     // 对齐 OpenList `_getPartInfo`：0 字节不生成分片，避免 OSS EntityTooSmall。
     let mut parts = Vec::new();
@@ -1364,11 +1403,28 @@ mod tests {
             size: 0,
             file_type: "0".into(),
             content_hash: None,
+            thumbnail_url: None,
             created_at: 1,
             updated_at: 2,
         };
         let q: QuarkFile = f.into();
         assert!(q.dir);
         assert!(!q.file);
+    }
+
+    #[test]
+    fn test_effective_part_size_caps_at_256_parts() {
+        // 用户日志里的 ~2.1GB MOV：4MB 分片会 ~537 片 → part list exceed。
+        let size = 2u64 * 1024 * 1024 * 1024 + 100 * 1024 * 1024;
+        let ps = effective_part_size(size, 4 * 1024 * 1024);
+        let parts = build_part_info(size, ps);
+        assert!(parts.len() as u64 <= MAX_UPLOAD_PARTS);
+        assert!(ps >= 9 * 1024 * 1024); // ceil(2.1G/256) 对齐到 1MB ≈ 9MB
+        // 小文件保持 API 建议值，不强行放大。
+        assert_eq!(effective_part_size(8 * 1024 * 1024, 4 * 1024 * 1024), 4 * 1024 * 1024);
+        // 超大文件也不得超过 256 片。
+        let huge = 40u64 * 1024 * 1024 * 1024;
+        let huge_ps = effective_part_size(huge, 4 * 1024 * 1024);
+        assert!(build_part_info(huge, huge_ps).len() as u64 <= MAX_UPLOAD_PARTS);
     }
 }

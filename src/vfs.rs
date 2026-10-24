@@ -452,6 +452,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     updated_at: now as u64,
                     download_url: None,
                     parent_path: Some(parent_path.to_string_lossy().into_owned()),
+                    thumbnail_url: None,
                 };
 
                 let parent_key = Self::parent_cache_key(parent_path);
