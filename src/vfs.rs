@@ -829,6 +829,8 @@ struct UploadState {
     callback: Option<Callback>,
     is_uploading: bool,
     flush_count: u32,
+    /// 临时文件/上传占位已交给后台任务；客户端断开时 Drop 不得删文件或摘占位。
+    handed_off: bool,
 }
 
 impl Default for UploadState {
@@ -855,6 +857,7 @@ impl Default for UploadState {
             callback: None,
             is_uploading: false,
             flush_count: 0,
+            handed_off: false,
         }
     }
 }
@@ -1191,6 +1194,8 @@ impl QuarkDavFile {
         let log_path = self.upload_log_path();
         let log_size = size;
         let log_mode = self.fs.drive_mode();
+        // 后台任务拥有临时文件生命周期；避免客户端断连时 Drop 删掉还在读的文件。
+        self.upload_state.handed_off = true;
 
         let handle = tokio::spawn(async move {
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
@@ -1410,6 +1415,8 @@ impl QuarkDavFile {
         let sha1 = sha1.to_string();
         let log_path = self.upload_log_path();
         let log_mode = self.fs.drive_mode();
+        // 后台任务拥有临时文件生命周期；避免客户端断连时 Drop 删掉还在读的文件。
+        self.upload_state.handed_off = true;
 
         let handle = tokio::spawn(async move {
             let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
@@ -1743,6 +1750,10 @@ impl QuarkDavFile {
     }
 
     async fn delete_temp_file(&self) -> Result<(), FsError> {
+        // 已交接给后台任务时由任务自己删，避免与流式读取竞态。
+        if self.upload_state.handed_off {
+            return Ok(());
+        }
         let temp_path = &self.upload_state.temp_file_path;
         if tokio::fs::metadata(temp_path).await.is_ok() {
             if let Err(err) = tokio::fs::remove_file(temp_path).await {
@@ -1758,6 +1769,10 @@ impl QuarkDavFile {
         self.delete_temp_file().await?;
         self.release_upload_memory();
         let parent_path = self.file.parent_path.as_ref().unwrap().clone();
+        // 后台任务已负责 wait_until / 失败摘占位；此处避免重复或抢删。
+        if self.upload_state.handed_off {
+            return Ok(());
+        }
         if ok {
             let size = if self.upload_state.size > 0 {
                 self.upload_state.size
@@ -2028,9 +2043,15 @@ impl DavFile for QuarkDavFile {
 
 impl Drop for QuarkDavFile {
     /// 客户端中断上传时归还内存配额，并尽量清掉临时文件 / uploading 幽灵项。
+    /// 若已 handoff 给后台任务，则不得碰临时文件与占位（否则流式 PUT 会 ENOENT）。
     fn drop(&mut self) {
-        self.release_upload_memory();
-        if self.upload_state.is_uploading && !self.upload_state.is_finished {
+        if !self.upload_state.handed_off {
+            self.release_upload_memory();
+        }
+        if self.upload_state.is_uploading
+            && !self.upload_state.is_finished
+            && !self.upload_state.handed_off
+        {
             let temp = self.upload_state.temp_file_path.clone();
             let parent = self.file.parent_path.clone();
             let name = self.file.file_name.clone();

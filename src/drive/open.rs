@@ -584,9 +584,11 @@ impl OpenClient {
 
     /// Open 上传全流程：pre（含 proof）→ 分片 URL → PUT → finish。
     /// `source` 可为内存字节或临时文件，避免小文件强制落盘。
+    /// `put_client` 须为无 retry 中间件的裸 Client（流式 body 不可被中间件 clone）。
     pub async fn upload_file(
         &self,
         client: &ClientWithMiddleware,
+        put_client: &reqwest::Client,
         file_name: &str,
         size: u64,
         pdir_fid: &str,
@@ -685,7 +687,7 @@ impl OpenClient {
                 // 流式 PUT：单片可到数百 MB，整段进内存会在低配机器 OOM。
                 let etag = self
                     .upload_part_with_retry(
-                        client,
+                        put_client,
                         item,
                         &common_headers,
                         source,
@@ -734,7 +736,7 @@ impl OpenClient {
 
     async fn upload_part_with_retry(
         &self,
-        client: &ClientWithMiddleware,
+        put_client: &reqwest::Client,
         item: &UploadUrlItem,
         headers: &CommonOssHeaders,
         source: &UploadSource,
@@ -743,8 +745,9 @@ impl OpenClient {
     ) -> Result<String> {
         let mut last_err = None;
         for attempt in 0..3u32 {
+            // 每次重试重新打开文件流（流只能消费一次）。
             match self
-                .upload_part(client, item, headers, source, offset, len)
+                .upload_part(put_client, item, headers, source, offset, len)
                 .await
             {
                 Ok(etag) => return Ok(etag),
@@ -765,7 +768,7 @@ impl OpenClient {
 
     async fn upload_part(
         &self,
-        client: &ClientWithMiddleware,
+        put_client: &reqwest::Client,
         item: &UploadUrlItem,
         headers: &CommonOssHeaders,
         source: &UploadSource,
@@ -791,7 +794,7 @@ impl OpenClient {
             .upload_body(offset, len)
             .await
             .with_context(|| format!("打开分片 {} 数据流失败", item.part_number))?;
-        let res = client
+        let res = put_client
             .put(&item.upload_url)
             .headers(hdrs)
             .body(body)

@@ -82,6 +82,8 @@ pub struct QuarkDrive {
     /// Open 下载专用：不带 pan.quark.cn Origin/Referer，且禁用自动跟随重定向
     ///（reqwest 跨域会剥 Cookie，与 OpenList 行为不一致）。
     open_download_client: ClientWithMiddleware,
+    /// OSS 分片 PUT：无 retry 中间件（流式 body 不可 clone，中间件重试会直接失败）。
+    oss_put_client: reqwest::Client,
     md5_cache: Arc<DashMap<String, String>>,
     /// Open：fid → 已解开重定向的 CDN 直链，避免预取每块重走 302。
     open_cdn_cache: Arc<DashMap<String, String>>,
@@ -177,6 +179,16 @@ impl QuarkDrive {
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 
+        // 分片 PUT 必须用裸 Client：RetryTransientMiddleware 会 clone 请求，流式 body 会报
+        // "Request object is not cloneable"。应用层已有 upload_part_with_retry。
+        let oss_put_client = reqwest::Client::builder()
+            .user_agent("quarkdrive-webdav/oss-put")
+            .pool_idle_timeout(Duration::from_secs(50))
+            .pool_max_idle_per_host(pool_size)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .build()?;
+
         let alert = config.alert.clone();
         let open = config
             .open
@@ -187,6 +199,7 @@ impl QuarkDrive {
             client,
             download_client,
             open_download_client,
+            oss_put_client,
             md5_cache: Arc::new(DashMap::new()),
             open_cdn_cache: Arc::new(DashMap::new()),
             open,
@@ -295,6 +308,7 @@ impl QuarkDrive {
             .context("upload_open_file 仅在 Open 模式下可用")?;
         open.upload_file(
             &self.client,
+            &self.oss_put_client,
             file_name,
             size,
             pdir_fid,
