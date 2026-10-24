@@ -15,7 +15,7 @@ use dav_server::{
     },
 };
 use futures_util::future::{ready, FutureExt};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use crate::{
     cache::Cache,
     drive::{QuarkDrive, QuarkFile},
@@ -36,6 +36,8 @@ use tokio::io::AsyncReadExt;
 pub struct QuarkDriveFileSystem {
     pub(crate) drive: QuarkDrive,
     pub(crate) dir_cache: Cache,
+    /// 已拉回的分块，按 (fid, 块号) 共享。挂文件系统层，避免随 DavFile 句柄丢弃。
+    pub(crate) chunk_cache: crate::prefetch::ChunkCache,
     uploading: Arc<DashMap<String, Vec<QuarkFile>>>,
     pub(crate) root: PathBuf,
     no_trash: bool,
@@ -59,6 +61,7 @@ impl QuarkDriveFileSystem {
         Ok(Self {
             drive,
             dir_cache,
+            chunk_cache: crate::prefetch::new_chunk_cache(crate::prefetch::DEFAULT_CACHE_BYTES),
             uploading: Arc::new(DashMap::new()),
             root,
             no_trash: false,
@@ -68,6 +71,12 @@ impl QuarkDriveFileSystem {
             prefer_http_download: false,
             upload_wait_timeout: 280,
         })
+    }
+
+    /// 分块预取缓存上限（字节）。0 = 关闭缓存。用 setter 避免改动 `new` 公开签名。
+    pub fn set_chunk_cache_bytes(&mut self, bytes: u64) -> &mut Self {
+        self.chunk_cache = crate::prefetch::new_chunk_cache(bytes);
+        self
     }
 
     pub fn set_read_only(&mut self, read_only: bool) -> &mut Self {
@@ -644,6 +653,8 @@ struct QuarkDavFile {
     current_pos: u64,
     upload_state: UploadState,
     http_download: bool,
+    /// 滑动窗口预取：多连接并发拉分块，绕开单流限速。
+    prefetch: Option<crate::prefetch::Prefetcher>,
     md5_ctx: Md5Context,
     sha1_ctx: Sha1,
 }
@@ -675,6 +686,7 @@ impl QuarkDavFile {
             parent_file_id,
             parent_dir,
             current_pos: 0,
+            prefetch: None,
             upload_state: UploadState {
                 size,
                 sha1,
@@ -742,6 +754,11 @@ impl QuarkDavFile {
                 error!(file_name = %self.file.file_name, error = %err,
                        "delete file before upload failed");
             }
+        }
+
+        // Open API 上传链路与 Cookie 分片鉴权不同，整段交给 drive 完成。
+        if self.fs.drive.is_open_mode() {
+            return self.do_flush_open(&md5, &sha1, size).await;
         }
 
         // up_pre
@@ -946,9 +963,98 @@ impl QuarkDavFile {
     }
 
 
+    /// Open 模式上传：临时文件已齐，直接走 upload_pre + 分片 + finish。
+    async fn do_flush_open(&mut self, md5: &str, sha1: &str, size: u64) -> Result<(), FsError> {
+        let temp_path = self.upload_state.temp_file_path.clone();
+        // 空文件可能尚未落盘，补一个空临时文件供 proof/分片读取。
+        if temp_path.is_empty() || (size == 0 && !std::path::Path::new(&temp_path).exists()) {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let path = if temp_path.is_empty() {
+                format!("./temp/{}_{}", timestamp, self.file.file_name)
+            } else {
+                temp_path.clone()
+            };
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            tokio::fs::write(&path, b"").await.map_err(|e| {
+                error!(file_name = %self.file.file_name, error = %e, "create empty temp file failed");
+                FsError::GeneralFailure
+            })?;
+            self.upload_state.temp_file_path = path;
+        }
+
+        let drive = self.fs.drive.clone();
+        let file_name = self.file.file_name.clone();
+        let parent_file_id = self.parent_file_id.clone();
+        let parent_path = self.file.parent_path.as_ref().unwrap().clone();
+        let parent_dir = self.parent_dir.clone();
+        let fs = self.fs.clone();
+        let temp_path = self.upload_state.temp_file_path.clone();
+        let md5 = md5.to_string();
+        let sha1 = sha1.to_string();
+
+        let handle = tokio::spawn(async move {
+            drive
+                .upload_open_file(
+                    &file_name,
+                    size,
+                    &parent_file_id,
+                    &md5,
+                    &sha1,
+                    std::path::Path::new(&temp_path),
+                )
+                .await
+                .map_err(|err| {
+                    error!(file_name = %file_name, error = %err, "open upload failed");
+                    FsError::GeneralFailure
+                })?;
+            if tokio::fs::metadata(&temp_path).await.is_ok() {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+            }
+            fs.remove_uploading_file(&parent_path, &file_name);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            fs.dir_cache.invalidate(parent_dir.as_path()).await;
+            Ok::<(), FsError>(())
+        });
+
+        let upload_wait_timeout = self.fs.upload_wait_timeout;
+        if upload_wait_timeout > 0 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(upload_wait_timeout),
+                handle,
+            )
+            .await
+            {
+                Ok(result) => {
+                    result.map_err(|err| {
+                        error!(file_name = %self.file.file_name, error = %err, "open upload task join failed");
+                        FsError::GeneralFailure
+                    })??;
+                }
+                Err(_) => {
+                    info!(file_name = %self.file.file_name, timeout_secs = upload_wait_timeout,
+                          "open upload still in progress, returning early to avoid client timeout");
+                }
+            }
+        } else {
+            handle.await.map_err(|err| {
+                error!(file_name = %self.file.file_name, error = %err, "open upload task join failed");
+                FsError::GeneralFailure
+            })??;
+        }
+
+        self.upload_state = UploadState::default();
+        Ok(())
+    }
+
     async fn upload_mini_byte_file(&mut self) -> Result<(), FsError> {
         // Empty file MD5
         let empty_md5 = "d41d8cd98f00b204e9800998ecf8427e";
+        let empty_sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
 
         // If old file exists, compare hash before deleting
         if !self.file.fid.is_empty() {
@@ -973,6 +1079,10 @@ impl QuarkDavFile {
                 error!(file_name = %self.file.file_name, error = %err,
                        "delete file before upload failed");
             }
+        }
+
+        if self.fs.drive.is_open_mode() {
+            return self.do_flush_open(empty_md5, empty_sha1, 0).await;
         }
 
         // pre -> hash -> commit -> finish
@@ -1335,12 +1445,50 @@ impl DavFile for QuarkDavFile {
                 }
             };
 
-            if !download_url.is_empty() {
-                let content = self.fs.drive.download(download_url, Some((self.current_pos, count))).await.unwrap();
-                self.current_pos += content.len() as u64;
-                return Ok(content);
-            }else {
+            if download_url.is_empty() {
                 return Err(FsError::NotFound);
+            }
+
+            // 预取窗口并发拉分块；单流串行会被夸克压在约 10 Mbps。
+            let url = download_url.clone();
+            let size = self.file.size;
+            let pos = self.current_pos;
+
+            let usable = self
+                .prefetch
+                .as_ref()
+                .map(|p| p.serves(&url, pos))
+                .unwrap_or(false);
+            if !usable {
+                self.prefetch = Some(crate::prefetch::Prefetcher::new(
+                    self.fs.drive.clone(),
+                    url,
+                    self.file.fid.clone(),
+                    self.fs.chunk_cache.clone(),
+                    size,
+                    pos,
+                ));
+            }
+
+            let got = self.prefetch.as_mut().unwrap().read(pos, count).await;
+            match got {
+                Some(content) if !content.is_empty() => {
+                    self.current_pos += content.len() as u64;
+                    Ok(content)
+                }
+                _ => {
+                    warn!(pos = pos, "prefetch miss, falling back to direct range read");
+                    self.prefetch = None;
+                    let fallback_url = self.file.download_url.clone().unwrap_or_default();
+                    let content = self
+                        .fs
+                        .drive
+                        .download(fallback_url, Some((pos, count)))
+                        .await
+                        .map_err(|_| FsError::NotFound)?;
+                    self.current_pos += content.len() as u64;
+                    Ok(content)
+                }
             }
         }
             .boxed()

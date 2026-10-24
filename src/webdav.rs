@@ -615,6 +615,7 @@ mod tests {
         let config = crate::drive::DriveConfig {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie,
+            open: None,
         };
         let drive = crate::drive::QuarkDrive::new(config).unwrap();
         let fs = crate::vfs::QuarkDriveFileSystem::new(drive, root.to_string(), 100, 60).unwrap();

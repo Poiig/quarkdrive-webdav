@@ -30,8 +30,10 @@ use headers::Cookie;
 use moka::future::FutureExt;
 
 pub mod model;
+pub mod open;
 
 pub use model::{QuarkFile};
+pub use open::{OpenClient, OpenCredentials, TokenFile};
 
 const ORIGIN: &str = "https://pan.quark.cn";
 const REFERER: &str = "https://pan.quark.cn/";
@@ -42,6 +44,8 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 pub struct DriveConfig {
     pub api_base_url: String,
     pub cookie: Arc<DashMap<String, String>>,
+    /// 存在则走夸克 Open API，不再依赖网页 Cookie。
+    pub open: Option<OpenCredentials>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +54,7 @@ pub struct QuarkDrive {
     client: ClientWithMiddleware,
     download_client: ClientWithMiddleware,
     md5_cache: Arc<DashMap<String, String>>,
+    open: Option<OpenClient>,
 }
 
 impl DavMetaData for QuarkFile {
@@ -96,6 +101,9 @@ impl QuarkDrive {
         let cpu_count = num_cpus::get();
         let pool_size: usize = min(cpu_count.saturating_mul(2), 16).max(3);
 
+        // 下载池按预取窗口定并发（AHEAD），与 CPU 核数无关；堆空闲连接可能触发按连接限速。
+        let download_pool_size: usize = crate::prefetch::AHEAD + 2;
+
         let client = reqwest::Client::builder()
             .user_agent(UA)
             .default_headers(headers.clone())
@@ -116,7 +124,7 @@ impl QuarkDrive {
             .default_headers(headers)
             // Enable connection pooling to avoid TCP handshake overhead on each request
             .pool_idle_timeout(Duration::from_secs(50))
-            .pool_max_idle_per_host(pool_size) // Increase pool size for concurrent downloads
+            .pool_max_idle_per_host(download_pool_size)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300)) // Increase timeout for large files
             .build()?;
@@ -124,18 +132,61 @@ impl QuarkDrive {
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 
+        let open = config.open.clone().map(OpenClient::new);
         let drive = Self {
             config,
             client,
             download_client,
             md5_cache: Arc::new(DashMap::new()),
+            open,
         };
-
 
         Ok(drive)
     }
 
+    /// 是否启用夸克 Open API（与 Cookie 模式互斥使用）。
+    pub fn is_open_mode(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Open 模式启动时拉取 user_id，供上传 proof 使用。
+    pub async fn init_open(&self) -> Result<()> {
+        if let Some(ref open) = self.open {
+            open.init(&self.client).await?;
+        }
+        Ok(())
+    }
+
+    /// Open 上传入口：VFS 在 Open 模式下走完整 pre→分片→finish，不复用 Cookie 分片鉴权。
+    pub async fn upload_open_file(
+        &self,
+        file_name: &str,
+        size: u64,
+        pdir_fid: &str,
+        md5: &str,
+        sha1: &str,
+        temp_path: &std::path::Path,
+    ) -> Result<()> {
+        let open = self
+            .open
+            .as_ref()
+            .context("upload_open_file 仅在 Open 模式下可用")?;
+        open.upload_file(
+            &self.client,
+            file_name,
+            size,
+            pdir_fid,
+            md5,
+            sha1,
+            temp_path,
+        )
+        .await
+    }
+
     async fn resolve_cookies(&self) -> String {
+        if let Some(ref open) = self.open {
+            return open.creds.auth_cookie().await;
+        }
         self.config.cookie.iter()
             .map(|entry| format!("{}={}", entry.key(), entry.value()))
             .collect::<Vec<_>>()
@@ -321,6 +372,22 @@ impl QuarkDrive {
     pub async fn get_files_by_pdir_fid(&self, pdir_fid: &str, page:u32, size:u32) -> Result<(Option<QuarkFiles>, u32)> {
         debug!(pdir_fid = %pdir_fid, page = %page, size = %size,  "get file");
 
+        if let Some(ref open) = self.open {
+            // Open 列表是 cursor 分页；缓存层按页拉取，这里第 1 页一次拉全量，后续页返回空。
+            if page > 1 {
+                return Ok((
+                    Some(QuarkFiles {
+                        list: Vec::new(),
+                        total: 0,
+                    }),
+                    0,
+                ));
+            }
+            let list = open.list_all_files(&self.client, pdir_fid).await?;
+            let total = list.len() as u32;
+            return Ok((Some(QuarkFiles { list, total }), total));
+        }
+
         let res: Result<GetFilesResponse> = self
             .get_request(
                 format!("{}/1/clouddrive/file/sort?pr=ucpro&fr=pc&&pdir_fid={}&_page={}&_size={}&_fetch_total=1&_fetch_sub_dirs=0&_sort=file_type:asc,updated_at:desc,"
@@ -353,6 +420,14 @@ impl QuarkDrive {
 
     pub async fn get_download_urls(&self, fids: Vec<String>) -> Result<HashMap<String, String>> {
         debug!(fids = ?fids, "get download url");
+        if let Some(ref open) = self.open {
+            let mut map = HashMap::new();
+            for fid in fids {
+                let url = open.get_download_url(&self.client, &fid).await?;
+                map.insert(fid, url);
+            }
+            return Ok(map);
+        }
         let req = GetFilesDownloadUrlsRequest { fids };
         let res: GetFilesDownloadUrlsResponse = self
             .post_request(
@@ -388,6 +463,10 @@ impl QuarkDrive {
 
     pub async fn get_file_md5(&self, fid: &str) -> Result<Option<String>> {
         debug!(fid = %fid, "get file md5");
+        // Open 下载接口不返回 md5，跳过以免误判秒传/跳过上传。
+        if self.is_open_mode() {
+            return Ok(None);
+        }
         let req = GetFilesDownloadUrlsRequest { fids: vec![fid.to_string()] };
         let res: GetFilesDownloadUrlsResponse = self
             .post_request(
@@ -405,23 +484,19 @@ impl QuarkDrive {
 
     pub async fn download<U: IntoUrl>(&self, url: U, range: Option<(u64, usize)>) -> Result<Bytes> {
         use reqwest::header::RANGE;
+        // Open 直链依赖 x_pan_* Cookie；Cookie 模式带上也能兼容。
         let cookie = self.resolve_cookies().await;
         let url = url.into_url()?;
-        let res = if let Some((start_pos, size)) = range {
+        let mut req = self.download_client.get(url.clone()).header("Cookie", &cookie);
+        if let Some((start_pos, size)) = range {
             let end_pos = start_pos + size as u64 - 1;
             debug!(url = %url, start = start_pos, end = end_pos, "download file");
             let range = format!("bytes={}-{}", start_pos, end_pos);
-            self.download_client
-                .get(url)
-                .header(RANGE, range)
-                .header("Cookie", cookie)
-                .send()
-                .await?
-                .error_for_status()?
+            req = req.header(RANGE, range);
         } else {
             debug!(url = %url, "download file");
-            self.download_client.get(url).send().await?.error_for_status()?
-        };
+        }
+        let res = req.send().await?.error_for_status()?;
         self.update_cookie_from_response(&res).await;
         Ok(res.bytes().await?)
     }
@@ -433,6 +508,9 @@ impl QuarkDrive {
     }
     pub async fn rename_file(&self, file_id: &str, name: &str) -> Result<()> {
         debug!(file_id = %file_id, name = %name, "rename file");
+        if let Some(ref open) = self.open {
+            return open.rename_file(&self.client, file_id, name).await;
+        }
         let req = RenameFileRequest {
             fid: file_id.to_string(),
             file_name: name.to_string(),
@@ -458,6 +536,11 @@ impl QuarkDrive {
         to_parent_file_id: &str,
     ) -> Result<()> {
         debug!(file_id = %file_id, to_parent_file_id = %to_parent_file_id, "move file");
+        if let Some(ref open) = self.open {
+            return open
+                .move_file(&self.client, file_id, to_parent_file_id)
+                .await;
+        }
         let req = MoveFileRequest {
             filelist: vec![file_id.to_string()],
             to_pdir_fid: to_parent_file_id.to_string(),
@@ -478,6 +561,9 @@ impl QuarkDrive {
     }
     async fn delete_file(&self, file_id: &str) -> Result<()> {
         debug!(file_id = %file_id, "delete file");
+        if let Some(ref open) = self.open {
+            return open.delete_file(&self.client, file_id).await;
+        }
         let req = DeleteFilesRequest {
             action_type: 2u8,
             exclude_fids: vec![],
@@ -505,6 +591,9 @@ impl QuarkDrive {
 
     pub async fn create_folder(&self, parent_file_id: &str, name: &str) -> Result<()> {
         debug!(parent_file_id = %parent_file_id, name = %name, "create folder");
+        if let Some(ref open) = self.open {
+            return open.create_folder(&self.client, parent_file_id, name).await;
+        }
         let req = CreateFolderRequest {
             pdir_fid: parent_file_id.to_string(),
             file_name: name.to_string(),
@@ -527,6 +616,10 @@ impl QuarkDrive {
 
 
     pub async fn get_quota(&self) -> Result<(u64, u64)> {
+        // OpenList 的 quark_open 未实现容量接口，避免误调 Cookie 会员接口。
+        if self.is_open_mode() {
+            return Ok((0, 0));
+        }
         let res: GetSpaceInfoResponse = self
             .get_request(
                 format!("{}/1/clouddrive/member?pr=ucpro&fr=pc&uc_param_str=&fetch_subscribe=true&_ch=home&fetch_identity=true", self.config.api_base_url),
@@ -849,7 +942,8 @@ impl QuarkDrive {
 }
 
 
-fn get_format_type(file_name: &str) -> &str {
+/// 按扩展名猜测 MIME；Open/Cookie 上传 pre 都需要，故 crate 内共享。
+pub(crate) fn get_format_type(file_name: &str) -> &str {
     if let Some(ext) = file_name.rsplit('.').next() {
         let ext = ext.to_lowercase();
         match ext.as_str() {
@@ -936,6 +1030,7 @@ mod tests {
         let config = DriveConfig {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie,
+            open: None,
         };
         let drive = QuarkDrive::new(config).unwrap();
 
@@ -975,6 +1070,7 @@ mod tests {
         let config = DriveConfig {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie: cookie,
+            open: None,
         };
         let drive = QuarkDrive::new(config).unwrap();
         let (files, _total) = drive.get_files_by_pdir_fid("0", 1, 50).await.unwrap();
@@ -1008,6 +1104,7 @@ mod tests {
         let config = DriveConfig {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie,
+            open: None,
         };
         QuarkDrive::new(config).unwrap()
     }
@@ -1023,6 +1120,7 @@ mod tests {
         let config = DriveConfig {
             api_base_url: "https://drive.quark.cn".to_string(),
             cookie,
+            open: None,
         };
         QuarkDrive::new(config).unwrap()
     }
