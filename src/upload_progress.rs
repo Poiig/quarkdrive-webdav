@@ -164,21 +164,50 @@ impl UploadTracker {
         }
     }
 
+    /// 是否仍在向网盘上传（供重试 PUT 判断，勿与 receiving 混淆）。
+    pub fn is_uploading(&self, path: &str) -> bool {
+        self.inner
+            .get(path)
+            .map(|e| e.status == "uploading")
+            .unwrap_or(false)
+    }
+
     /// 开始接收（WebDAV PUT 写入时）。
+    ///
+    /// CloudSync 在服务端提前返回后常会整文件重 PUT；若后台仍在上传，
+    /// 绝不能 insert 新条目，否则已传到盘的进度会被清成「接收中」。
     pub fn start_receiving(&self, path: &str, size: u64) {
+        if let Some(mut e) = self.inner.get_mut(path) {
+            if e.status == "uploading" {
+                if size > 0 {
+                    e.size = e.size.max(size);
+                }
+                e.updated_ms = now_ms();
+                return;
+            }
+        }
         self.inner
             .insert(path.to_string(), ProgressEntry::new(path.to_string(), size, "receiving"));
     }
 
     /// 更新已从客户端接收的字节数。
+    ///
+    /// 上传阶段若客户端重试写入，只记接收量，禁止把 status 降回 receiving。
     pub fn set_received(&self, path: &str, received: u64, size: u64) {
         let now = now_ms();
         self.inner
             .entry(path.to_string())
             .and_modify(|e| {
-                e.received = received;
                 if size > 0 {
-                    e.size = size;
+                    e.size = e.size.max(size);
+                }
+                // 重试 PUT 的 received 从 0 累加，不能覆盖上传期已记的满收值。
+                e.received = e.received.max(received);
+                if e.status == "uploading"
+                    || matches!(e.status.as_str(), "ok" | "error" | "skip")
+                {
+                    e.updated_ms = now;
+                    return;
                 }
                 if e.status == "receiving" || e.status.is_empty() {
                     e.status = "receiving".into();
@@ -374,6 +403,25 @@ mod tests {
         let e = t.list().into_iter().next().unwrap();
         assert_eq!(e.speed_bps, 2_000);
         assert!(e.speed_bps < 50_000, "must not treat full received size as one sample");
+    }
+
+    #[test]
+    fn retry_put_does_not_wipe_uploading_progress() {
+        let t = UploadTracker::new();
+        t.start_receiving("/big.bin", 10_000);
+        t.set_received("/big.bin", 10_000, 10_000);
+        t.mark_uploading("/big.bin", 10_000);
+        t.add_uploaded("/big.bin", 3_900, 1_000);
+        assert_eq!(t.list()[0].percent(), 39);
+
+        // 客户端超时重 PUT：不得清零，也不得降回 receiving。
+        t.start_receiving("/big.bin", 10_000);
+        t.set_received("/big.bin", 100, 10_000);
+        let e = t.list().into_iter().next().unwrap();
+        assert_eq!(e.status, "uploading");
+        assert_eq!(e.percent(), 39);
+        assert_eq!(e.uploaded, 3_900);
+        assert!(t.is_uploading("/big.bin"));
     }
 
     #[test]
