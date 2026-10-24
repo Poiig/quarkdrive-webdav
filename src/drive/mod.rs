@@ -1,7 +1,7 @@
 use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::{Arc};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use model::*;
 
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
@@ -41,6 +41,29 @@ const ORIGIN: &str = "https://pan.quark.cn";
 const REFERER: &str = "https://pan.quark.cn/";
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch";
 
+/// Open/CDN 直链是否已过期（查 Expires/exp/e，预留 60s）。
+fn cdn_url_expired(url: &str) -> bool {
+    let Ok(parsed) = ::url::Url::parse(url) else {
+        return false;
+    };
+    let expires = parsed.query_pairs().find_map(|(k, v)| {
+        let key = k.as_ref();
+        if key.eq_ignore_ascii_case("expires") || key == "exp" || key == "e" {
+            v.parse::<u64>().ok()
+        } else {
+            None
+        }
+    });
+    let Some(expires) = expires else {
+        return false;
+    };
+    let current_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    current_ts + 60 >= expires
+}
+
 
 #[derive(Debug, Clone)]
 pub struct DriveConfig {
@@ -60,6 +83,8 @@ pub struct QuarkDrive {
     ///（reqwest 跨域会剥 Cookie，与 OpenList 行为不一致）。
     open_download_client: ClientWithMiddleware,
     md5_cache: Arc<DashMap<String, String>>,
+    /// Open：fid → 已解开重定向的 CDN 直链，避免预取每块重走 302。
+    open_cdn_cache: Arc<DashMap<String, String>>,
     open: Option<OpenClient>,
     alert: Alert,
 }
@@ -163,6 +188,7 @@ impl QuarkDrive {
             download_client,
             open_download_client,
             md5_cache: Arc::new(DashMap::new()),
+            open_cdn_cache: Arc::new(DashMap::new()),
             open,
             alert,
         };
@@ -579,10 +605,29 @@ impl QuarkDrive {
 
     pub async fn get_download_url(&self, fid: &str) -> Result<String> {
         debug!(fid = %fid, "get download url");
-        self.get_download_urls(vec![fid.to_string()]).await?.iter().next()
-            .map(|(_, url)| url.clone())
-            .ok_or_else(|| anyhow::anyhow!("No download URL found for fid: {}", fid))
-
+        // Open：CDN 直链未过期则复用，少打 API、也少走一轮 302。
+        if self.is_open_mode() {
+            if let Some(cdn) = self.open_cdn_cache.get(fid) {
+                if !cdn_url_expired(cdn.as_str()) {
+                    return Ok(cdn.clone());
+                }
+                drop(cdn);
+                self.open_cdn_cache.remove(fid);
+            }
+        }
+        let url = self
+            .get_download_urls(vec![fid.to_string()])
+            .await?
+            .into_iter()
+            .next()
+            .map(|(_, u)| u)
+            .ok_or_else(|| anyhow::anyhow!("No download URL found for fid: {}", fid))?;
+        if self.is_open_mode() {
+            let cdn = self.resolve_open_cdn_url(&url).await?;
+            self.open_cdn_cache.insert(fid.to_string(), cdn.clone());
+            return Ok(cdn);
+        }
+        Ok(url)
     }
 
     pub async fn get_file_md5(&self, fid: &str) -> Result<Option<String>> {
@@ -627,7 +672,61 @@ impl QuarkDrive {
         Ok(res.bytes().await?)
     }
 
+    /// 解开 Open API 返回的跳转链，得到可 Range 的 CDN 地址（只做一次，供预取复用）。
+    async fn resolve_open_cdn_url(&self, api_url: &str) -> Result<String> {
+        use reqwest::header::{LOCATION, RANGE};
+        let open = self
+            .open
+            .as_ref()
+            .context("resolve_open_cdn_url 仅 Open 模式可用")?;
+        let mut url = reqwest::Url::parse(api_url)
+            .with_context(|| format!("非法 Open 下载 URL: {api_url}"))?;
+        let mut refreshed = false;
+        for hop in 0..10u32 {
+            let cookie = open.creds.auth_cookie().await;
+            // 探测用 1 字节 Range，避免把整文件拉进代理。
+            let res = self
+                .open_download_client
+                .get(url.clone())
+                .header("Cookie", &cookie)
+                .header(RANGE, "bytes=0-0")
+                .send()
+                .await?;
+            let status = res.status();
+            if status.is_redirection() {
+                let loc = res
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .context("Open 下载重定向缺少 Location")?;
+                url = url
+                    .join(loc)
+                    .with_context(|| format!("解析重定向失败: {loc}"))?;
+                debug!(hop = hop, next = %url, "open cdn resolve redirect");
+                continue;
+            }
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) && !refreshed
+            {
+                let body = res.text().await.unwrap_or_default();
+                warn!(
+                    status = %status,
+                    body = %body,
+                    "Open CDN 解析鉴权失败，刷新 token 后重试"
+                );
+                open.refresh_token(&self.client).await?;
+                refreshed = true;
+                continue;
+            }
+            // 206/200 都算解析成功；丢弃 body。
+            let _ = res.error_for_status()?;
+            debug!(cdn = %url, hops = hop, "open cdn resolved");
+            return Ok(url.to_string());
+        }
+        anyhow::bail!("Open CDN 解析重定向过多: {api_url}")
+    }
+
     /// Open 下载：对齐 OpenList `Link`（只带 `x_pan_*` Cookie），手动跟随重定向并保留 Cookie。
+    /// 预取路径应已持有 CDN 直链；若仍遇 302 则跟跳，Range 只打在最终响应上。
     async fn download_open<U: IntoUrl>(
         &self,
         url: U,
@@ -638,7 +737,8 @@ impl QuarkDrive {
             .open
             .as_ref()
             .context("download_open 仅 Open 模式可用")?;
-        let mut url = url.into_url()?;
+        let start_url = url.into_url()?;
+        let mut url = start_url.clone();
         let mut refreshed = false;
         for hop in 0..10u32 {
             let cookie = open.creds.auth_cookie().await;
@@ -683,8 +783,12 @@ impl QuarkDrive {
                     body = %body,
                     "Open 下载鉴权失败，刷新 token 后重试"
                 );
+                // CDN / API 链失效：清 fid 缓存，下次重新解析。
+                self.open_cdn_cache.clear();
                 open.refresh_token(&self.client).await?;
                 refreshed = true;
+                // token 刷新后若起点是旧 CDN，回到起点再试一轮。
+                url = start_url.clone();
                 continue;
             }
             let res = res.error_for_status().map_err(|err| {

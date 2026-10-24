@@ -1794,7 +1794,7 @@ impl DavFile for QuarkDavFile {
             let usable = self
                 .prefetch
                 .as_ref()
-                .map(|p| p.serves(&url, pos))
+                .map(|p| p.serves(&url, &self.file.fid, pos))
                 .unwrap_or(false);
             if !usable {
                 self.prefetch = Some(crate::prefetch::Prefetcher::new(
@@ -1805,6 +1805,8 @@ impl DavFile for QuarkDavFile {
                     size,
                     pos,
                 ));
+            } else {
+                self.prefetch.as_mut().unwrap().set_url(url);
             }
 
             let got = self.prefetch.as_mut().unwrap().read(pos, count).await;
@@ -1816,10 +1818,8 @@ impl DavFile for QuarkDavFile {
                 _ => {
                     warn!(pos = pos, "prefetch miss, falling back to direct range read");
                     self.prefetch = None;
-                    // Open 直链可能已失效：清缓存后重新取链再读。
-                    if self.fs.drive.is_open_mode() {
-                        self.file.download_url = None;
-                    }
+                    // 与 Cookie 一致：miss 不先清 URL（Open 先前误清会强制再打 API+302）。
+                    // 仅真实下载失败时再清。
                     let fallback_url = if let Some(url) = self.file.download_url.clone() {
                         url
                     } else {

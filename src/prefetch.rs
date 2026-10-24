@@ -152,8 +152,9 @@ impl Prefetcher {
         p
     }
 
-    pub fn serves(&self, url: &str, pos: u64) -> bool {
-        if self.url != url {
+    /// 同一 fid 且读位置仍在窗口内即可复用；URL 字符串变化（CDN 刷新）不整窗作废。
+    pub fn serves(&self, _url: &str, fid: &str, pos: u64) -> bool {
+        if self.fid != fid {
             return false;
         }
         let want = pos / self.chunk;
@@ -165,6 +166,13 @@ impl Prefetcher {
         match front {
             Some(f) => want >= f && want < self.next_index + self.ahead as u64,
             None => false,
+        }
+    }
+
+    /// 复用窗口时刷新直链，后续补块走新 URL。
+    pub fn set_url(&mut self, url: String) {
+        if self.url != url {
+            self.url = url;
         }
     }
 
