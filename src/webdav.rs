@@ -735,10 +735,18 @@ fn console_float_css() -> &'static str {
 .qd-actions a:hover,.qd-actions button:hover{border-color:var(--accent);color:var(--accent);text-decoration:none}
 .qd-actions .ghost{background:transparent}
 .qd-float{
-  position:fixed;top:64px;right:16px;z-index:40;width:min(380px,calc(100vw - 24px));
-  background:rgba(255,255,255,.96);border:1px solid var(--line);
-  box-shadow:0 18px 40px rgba(20,34,43,.14);backdrop-filter:blur(12px);
+  position:fixed;top:64px;right:12px;z-index:40;width:300px;
+  background:rgba(255,255,255,.97);border:1px solid var(--line);
+  box-shadow:0 12px 28px rgba(20,34,43,.12);
 }
+/* 展开时给主内容让出右侧，避免挡住目录列表 */
+@media (min-width:960px){
+  body.qd-panel-open .wrap{padding-right:332px}
+  body.qd-panel-open .top-inner{padding-right:332px}
+}
+/* 无任务时收成窄条，少占视线 */
+.qd-float.idle{width:auto;min-width:140px}
+.qd-float.idle .qd-float-bd{display:none!important}
 .qd-float-hd{
   display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;user-select:none;
   border-bottom:1px solid transparent;
@@ -827,8 +835,11 @@ fn console_float_css() -> &'static str {
 .qd-modal .path{word-break:break-all;color:var(--ink)}
 .qd-modal .ok{color:var(--ok)} .qd-modal .bad{color:var(--bad)}
 .qd-modal .empty-row td{text-align:center;color:var(--muted);padding:36px 16px}
+@media (max-width:959px){
+  .qd-float{top:auto;bottom:12px;right:12px;left:auto;width:min(300px,calc(100vw - 24px))}
+  body.qd-panel-open .wrap{padding-bottom:120px}
+}
 @media (max-width:720px){
-  .qd-float{top:auto;bottom:12px;right:12px;left:12px;width:auto}
   .qd-modal{padding:16px}
   .qd-modal-hd,.qd-modal-tools{padding-left:16px;padding-right:16px}
   .qd-modal-bd{padding:4px 8px 16px}
@@ -840,7 +851,7 @@ fn console_float_css() -> &'static str {
 /// 右上角进度面板（默认展开）+ 历史弹窗 markup 与轮询脚本。
 fn console_float_html() -> &'static str {
     r#"
-<aside class="qd-float open" id="qdFloat" aria-live="polite">
+<aside class="qd-float idle" id="qdFloat" aria-live="polite">
   <div class="qd-float-hd" id="qdFloatToggle" title="展开/收起上传进度">
     <strong>上传进度</strong>
     <span class="qd-badge" id="qdBadge" data-n="0">0</span>
@@ -880,7 +891,18 @@ fn console_float_html() -> &'static str {
   const floatEl=document.getElementById("qdFloat");
   const body=document.getElementById("qdFloatBody");
   const badge=document.getElementById("qdBadge");
-  document.getElementById("qdFloatToggle").addEventListener("click",()=>floatEl.classList.toggle("open"));
+  let userCollapsed=false;
+  function syncPanelLayout(){
+    const open=floatEl.classList.contains("open");
+    document.body.classList.toggle("qd-panel-open", open);
+  }
+  document.getElementById("qdFloatToggle").addEventListener("click",()=>{
+    const willOpen=!floatEl.classList.contains("open");
+    floatEl.classList.toggle("open", willOpen);
+    userCollapsed=!willOpen;
+    syncPanelLayout();
+  });
+  syncPanelLayout();
 
   // 客户端固定出现顺序，刷新只改内容，避免整表重绘导致跳动。
   const order=[];
@@ -905,6 +927,16 @@ fn console_float_html() -> &'static str {
     const active=items.filter(i=>i.status==="receiving"||i.status==="uploading").length;
     badge.textContent=String(active);
     badge.dataset.n=String(active);
+    // 有进行中任务才自动展开并给主栏让位；否则收成窄条，避免挡住目录。
+    const busy=active>0;
+    if(busy && !userCollapsed){
+      floatEl.classList.add("open");
+    }else if(!busy){
+      floatEl.classList.remove("open");
+      if(items.length===0) userCollapsed=false;
+    }
+    floatEl.classList.toggle("idle", !floatEl.classList.contains("open"));
+    syncPanelLayout();
     if(!items.length){
       order.length=0;
       body.innerHTML='<div class="qd-empty">暂无上传任务</div>';
@@ -1879,7 +1911,7 @@ mod tests {
         // file size should be formatted
         assert!(html.contains("1.0 KB"));
         // 进度面板默认展开；历史走弹窗而非独立页链接主导航
-        assert!(html.contains("qd-float open"));
+        assert!(html.contains("qd-float"));
         assert!(html.contains("/__uploads.json"));
         assert!(!html.contains("href=\"/__uploads\""));
     }
