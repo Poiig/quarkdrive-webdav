@@ -149,8 +149,9 @@ struct Opt {
     #[arg(long, env = "REFRESH_CACHE_SECS_INTERVAL", default_value = "300")]
     refresh_cache_secs_interval: u64,
 
-    /// Max seconds to wait for upload completion before returning early to client.
-    #[arg(long, env = "UPLOAD_WAIT_TIMEOUT", default_value = "280")]
+    /// 等待上传完成的最长秒数。默认 0=一直等到夸克上传完成再返回客户端；
+    /// 设为正数则超时后先返回、后台继续传（旧「快返回」行为）。
+    #[arg(long, env = "UPLOAD_WAIT_TIMEOUT", default_value_t = 0)]
     upload_wait_timeout: u64,
 }
 

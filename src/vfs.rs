@@ -153,7 +153,7 @@ impl QuarkDriveFileSystem {
             upload_buffer_size: 16 * 1024 * 1024,
             skip_upload_same_size: false,
             prefer_http_download: false,
-            upload_wait_timeout: 280,
+            upload_wait_timeout: 0,
             oplog: Arc::new(OpLog::new("./logs", 7)),
         })
     }
