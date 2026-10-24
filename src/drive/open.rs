@@ -656,31 +656,22 @@ impl OpenClient {
             "open upload part plan"
         );
 
-        // 按批申请上传 URL（每批 ≤256），再上传；etag 按 part_number 落位。
+        // 签名 URL / X-Oss-Date 有效期通常约 15 分钟（~900s）。
+        // 旧逻辑一次申请最多 256 片再串行 PUT：家宽传 11G 约 15 分钟后剩余分片 403，
+        // 进度会精确停在约 1/3（与「34% · 失败 · 均 4MB/s」吻合）。改为小批即时申请。
         let mut etags: Vec<Option<String>> = vec![None; part_info.len()];
-        for chunk in part_info.chunks(MAX_UPLOAD_PARTS as usize) {
-            let url_body = json!({
-                "task_id": pre.data.task_id,
-                "part_info_list": chunk,
-            });
-            let up_urls: UpUrlResp = self
-                .request(
-                    client,
-                    "/open/v1/file/get_upload_urls",
-                    "POST",
-                    Some(url_body),
-                    None,
-                )
+        for chunk in part_info.chunks(UPLOAD_URL_BATCH) {
+            let (mut common_headers, items) = self
+                .fetch_upload_urls(client, &pre.data.task_id, chunk)
                 .await?;
-            let common_headers = up_urls.data.common_headers;
-            if up_urls.data.upload_urls.len() != chunk.len() {
+            if items.len() != chunk.len() {
                 bail!(
                     "get_upload_urls 返回 {} 个 URL，期望 {}",
-                    up_urls.data.upload_urls.len(),
+                    items.len(),
                     chunk.len()
                 );
             }
-            for item in up_urls.data.upload_urls.iter() {
+            for item in items {
                 let idx = (item.part_number.max(1) as u64 - 1) as usize;
                 if idx >= part_info.len() {
                     bail!("get_upload_urls 返回非法 part_number={}", item.part_number);
@@ -694,15 +685,18 @@ impl OpenClient {
                 let put_started = std::time::Instant::now();
                 let etag = self
                     .upload_part_with_retry(
+                        client,
                         put_client,
+                        &pre.data.task_id,
+                        &part_info[idx],
                         item,
-                        &common_headers,
+                        &mut common_headers,
                         source,
                         offset,
                         this_size,
                     )
                     .await
-                    .with_context(|| format!("上传分片 {} 失败", item.part_number))?;
+                    .with_context(|| format!("上传分片 {} 失败", idx + 1))?;
                 let put_ms = put_started.elapsed().as_millis() as u64;
                 etags[idx] = Some(etag);
                 if let Some((tracker, path)) = progress {
@@ -753,21 +747,50 @@ impl OpenClient {
         Ok(())
     }
 
+    /// 向 Open API 申请一批分片的签名上传 URL（须在过期前用完）。
+    async fn fetch_upload_urls(
+        &self,
+        client: &ClientWithMiddleware,
+        task_id: &str,
+        part_info_list: &[serde_json::Value],
+    ) -> Result<(CommonOssHeaders, Vec<UploadUrlItem>)> {
+        let url_body = json!({
+            "task_id": task_id,
+            "part_info_list": part_info_list,
+        });
+        let up_urls: UpUrlResp = self
+            .request(
+                client,
+                "/open/v1/file/get_upload_urls",
+                "POST",
+                Some(url_body),
+                None,
+            )
+            .await?;
+        Ok((up_urls.data.common_headers, up_urls.data.upload_urls))
+    }
+
+    /// 分片 PUT：网关错误退避重试；签名/403 过期则重新 get_upload_urls 再传，避免整文件失败。
     async fn upload_part_with_retry(
         &self,
+        client: &ClientWithMiddleware,
         put_client: &reqwest::Client,
-        item: &UploadUrlItem,
-        headers: &CommonOssHeaders,
+        task_id: &str,
+        part_meta: &serde_json::Value,
+        mut item: UploadUrlItem,
+        headers: &mut CommonOssHeaders,
         source: &UploadSource,
         offset: u64,
         len: u64,
     ) -> Result<String> {
         // OSS 偶发 504/502 很常见（网关超时），多试几次；每次重开文件流。
-        const MAX_ATTEMPTS: u32 = 5;
+        const MAX_ATTEMPTS: u32 = 8;
+        const MAX_URL_REFRESH: u32 = 3;
         let mut last_err = None;
+        let mut url_refreshes = 0u32;
         for attempt in 0..MAX_ATTEMPTS {
             match self
-                .upload_part(put_client, item, headers, source, offset, len)
+                .upload_part(put_client, &item, headers, source, offset, len)
                 .await
             {
                 Ok(etag) => {
@@ -781,10 +804,12 @@ impl OpenClient {
                     return Ok(etag);
                 }
                 Err(err) => {
-                    let retryable = is_retryable_oss_put_error(&err);
+                    let expired = is_oss_url_expired_error(&err);
+                    let retryable = expired || is_retryable_oss_put_error(&err);
                     warn!(
                         part = item.part_number,
                         attempt = attempt + 1,
+                        expired = expired,
                         retryable = retryable,
                         error = %err,
                         "open upload part failed, retrying"
@@ -792,6 +817,34 @@ impl OpenClient {
                     last_err = Some(err);
                     if !retryable || attempt + 1 >= MAX_ATTEMPTS {
                         break;
+                    }
+                    // 签名过期必须换新 URL；沿用旧 URL 重试只会连续 403。
+                    if expired && url_refreshes < MAX_URL_REFRESH {
+                        url_refreshes += 1;
+                        match self
+                            .fetch_upload_urls(client, task_id, std::slice::from_ref(part_meta))
+                            .await
+                        {
+                            Ok((new_headers, items)) => {
+                                if let Some(fresh) = items.into_iter().next() {
+                                    *headers = new_headers;
+                                    item = fresh;
+                                    info!(
+                                        part = item.part_number,
+                                        refresh = url_refreshes,
+                                        "refreshed expired OSS upload URL"
+                                    );
+                                    continue;
+                                }
+                            }
+                            Err(refresh_err) => {
+                                warn!(
+                                    part = item.part_number,
+                                    error = %refresh_err,
+                                    "refresh upload URL failed"
+                                );
+                            }
+                        }
                     }
                     // 504 等多等一会再传，退避上限 30s。
                     let delay = (1u64 << attempt).min(30);
@@ -1374,8 +1427,24 @@ fn is_retryable_oss_put_error(err: &anyhow::Error) -> bool {
         || s.contains("broken pipe")
 }
 
+/// 签名 URL / X-Oss-Date 过期类错误：必须重新 get_upload_urls，不能原地重试。
+fn is_oss_url_expired_error(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}").to_ascii_lowercase();
+    s.contains("403")
+        || s.contains("401")
+        || s.contains("request has expired")
+        || s.contains("security token expired")
+        || s.contains("signaturedoesnotmatch")
+        || s.contains("signature does not match")
+        || s.contains("accessdenied")
+        || s.contains("access denied")
+        || (s.contains("expired") && (s.contains("oss") || s.contains("url") || s.contains("token")))
+}
+
 /// 夸克 Open `get_upload_urls` / `upload_finish` 单次 part list 上限约 256。
 const MAX_UPLOAD_PARTS: u64 = 256;
+/// 每次申请的上传 URL 数。签名约 15 分钟失效，一次申太多会导致大文件中途 403。
+const UPLOAD_URL_BATCH: usize = 2;
 
 /// 在 API 建议的 part_size 基础上，保证总分片数不超过 MAX_UPLOAD_PARTS。
 fn effective_part_size(file_size: u64, api_part_size: u64) -> u64 {
@@ -1499,6 +1568,23 @@ mod tests {
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0]["part_size"], 4);
         assert_eq!(parts[2]["part_size"], 2);
+    }
+
+    #[test]
+    fn test_oss_url_expired_detection() {
+        assert!(is_oss_url_expired_error(&anyhow!("HTTP 403 Forbidden")));
+        assert!(is_oss_url_expired_error(&anyhow!("Request has expired")));
+        assert!(is_oss_url_expired_error(&anyhow!("SignatureDoesNotMatch")));
+        assert!(!is_oss_url_expired_error(&anyhow!("HTTP 504 Gateway Timeout")));
+        assert!(is_retryable_oss_put_error(&anyhow!("HTTP 504 Gateway Timeout")));
+    }
+
+    #[test]
+    fn upload_url_batch_keeps_urls_fresh() {
+        // 批太大时家宽单批耗时会逼近签名 15 分钟有效期。
+        assert!(UPLOAD_URL_BATCH >= 1);
+        assert!(UPLOAD_URL_BATCH <= 8);
+        assert!(UPLOAD_URL_BATCH < MAX_UPLOAD_PARTS as usize);
     }
 
     #[test]

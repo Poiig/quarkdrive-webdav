@@ -955,12 +955,17 @@ fn console_float_html() -> &'static str {
     const lane=LANE[it.lane]||"";
     const laneCls=it.lane==="fast"||it.lane==="slow"?it.lane:"";
     const laneHtml=lane?`<span class="lane ${laneCls}">${lane}</span>`:"";
+    // 失败时把简短原因挂到 title，便于对照日志（完整 detail 仍在 JSON）。
+    const detail=String(it.detail||"").replace(/\s+/g," ").trim();
+    const detailShort=detail.length>80?detail.slice(0,80)+"…":detail;
+    const stText=it.status==="error"&&detailShort?`${st}（${detailShort}）`:st;
+    const title=detail?` title="${esc(detail)}"`:"";
     // 接收阶段进度条保持 0，不显示假的一半进度。
     const barPct=it.status==="receiving"?0:(unknown?40:pct);
     const pctText=it.status==="receiving"?"0%":(unknown?"…":pct+"%");
-    return `<div class="r1"><span class="name">${esc(name)}</span><span class="size">${esc(fmt(it.size))}</span></div>
+    return `<div class="r1"${title}><span class="name">${esc(name)}</span><span class="size">${esc(fmt(it.size))}</span></div>
       <div class="${barCls}"><i style="width:${barPct}%"></i></div>
-      <div class="r2"><span class="pct">${pctText} · ${esc(st)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>`;
+      <div class="r2"><span class="pct">${pctText} · ${esc(stText)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>`;
   }
   function isActive(it){ return it.status==="receiving"||it.status==="uploading"; }
   function renderUploads(items, maxItems){
