@@ -13,15 +13,13 @@
 
 ## Docker Compose（推荐）
 
-仓库自带 [`docker-compose.yml`](docker-compose.yml)，按模式选一个 profile：
+仓库自带 [`docker-compose.yml`](docker-compose.yml)，默认 Open 模式：
 
 ```bash
-# Open 模式
-docker compose --profile open up -d
-
-# Cookie 模式（先改 compose 里的 QUARK_COOKIE）
-docker compose --profile cookie up -d
+docker compose up -d
 ```
+
+Cookie 模式改 compose 里的环境变量即可（文件内有注释示例）。
 
 ## Docker Run
 
