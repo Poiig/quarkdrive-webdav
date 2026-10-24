@@ -1625,12 +1625,26 @@ impl DavFile for QuarkDavFile {
             if self.file.fid.is_empty() {
                 return Err(FsError::NotFound);
             }
-            let download_url = self.fs.drive.get_download_url(&self.file.fid).await.unwrap();
-
-            return Ok(Some(download_url));
-
+            // Open 直链必须带 x_pan_* Cookie，客户端跟 302 拿不到 → 禁止直跳，走代理 Range。
+            if self.fs.drive.is_open_mode() {
+                return Ok(None);
+            }
+            let download_url = self
+                .fs
+                .drive
+                .get_download_url(&self.file.fid)
+                .await
+                .map_err(|err| {
+                    error!(
+                        file_id = %self.file.fid,
+                        error = %err,
+                        "get download url for redirect failed"
+                    );
+                    FsError::GeneralFailure
+                })?;
+            Ok(Some(download_url))
         }
-            .boxed()
+        .boxed()
     }
 
 
@@ -1742,13 +1756,31 @@ impl DavFile for QuarkDavFile {
                 _ => {
                     warn!(pos = pos, "prefetch miss, falling back to direct range read");
                     self.prefetch = None;
-                    let fallback_url = self.file.download_url.clone().unwrap_or_default();
+                    // Open 直链可能已失效：清缓存后重新取链再读。
+                    if self.fs.drive.is_open_mode() {
+                        self.file.download_url = None;
+                    }
+                    let fallback_url = if let Some(url) = self.file.download_url.clone() {
+                        url
+                    } else {
+                        self.get_download_url().await?
+                    };
+                    self.file.download_url = Some(fallback_url.clone());
                     let content = self
                         .fs
                         .drive
                         .download(fallback_url, Some((pos, count)))
                         .await
-                        .map_err(|_| FsError::NotFound)?;
+                        .map_err(|err| {
+                            error!(
+                                file_id = %self.file.fid,
+                                pos = pos,
+                                error = %err,
+                                "fallback download failed"
+                            );
+                            self.file.download_url = None;
+                            FsError::NotFound
+                        })?;
                     self.current_pos += content.len() as u64;
                     Ok(content)
                 }
@@ -1844,7 +1876,9 @@ async fn read_upload_slice(
 fn is_url_expired(url: &str) -> bool {
     if let Ok(oss_url) = ::url::Url::parse(url) {
         let expires = oss_url.query_pairs().find_map(|(k, v)| {
-            if k == "Expires" {
+            // Cookie 模式常用 Expires；Open/OSS 也可能是 expires / exp / e（秒级时间戳）
+            let key = k.as_ref();
+            if key.eq_ignore_ascii_case("expires") || key == "exp" || key == "e" {
                 if let Ok(expires) = v.parse::<u64>() {
                     return Some(expires);
                 }

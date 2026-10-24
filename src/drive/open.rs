@@ -191,12 +191,17 @@ where
 impl From<OpenFile> for QuarkFile {
     fn from(f: OpenFile) -> Self {
         let is_dir = f.file_type == "0";
+        let format_type = if is_dir {
+            String::new()
+        } else {
+            get_format_type(&f.filename).to_string()
+        };
         QuarkFile {
             fid: f.fid,
             file_name: f.filename,
             pdir_fid: f.parent_fid,
             size: f.size,
-            format_type: String::new(),
+            format_type,
             status: 1,
             created_at: f.created_at,
             updated_at: f.updated_at,

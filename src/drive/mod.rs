@@ -56,6 +56,9 @@ pub struct QuarkDrive {
     config: DriveConfig,
     client: ClientWithMiddleware,
     download_client: ClientWithMiddleware,
+    /// Open 下载专用：不带 pan.quark.cn Origin/Referer，且禁用自动跟随重定向
+    ///（reqwest 跨域会剥 Cookie，与 OpenList 行为不一致）。
+    open_download_client: ClientWithMiddleware,
     md5_cache: Arc<DashMap<String, String>>,
     open: Option<OpenClient>,
     alert: Alert,
@@ -133,6 +136,19 @@ impl QuarkDrive {
             .timeout(Duration::from_secs(300)) // Increase timeout for large files
             .build()?;
         let download_client = ClientBuilder::new(download_client)
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy.clone()))
+            .build();
+
+        // OpenList quark_open Link 仅附带 Cookie；直链常跨域跳转，须手动跟重定向并保留 Cookie。
+        let open_download_client = reqwest::Client::builder()
+            .user_agent("quarkdrive-webdav/open")
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_idle_timeout(Duration::from_secs(50))
+            .pool_max_idle_per_host(download_pool_size)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .build()?;
+        let open_download_client = ClientBuilder::new(open_download_client)
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 
@@ -145,6 +161,7 @@ impl QuarkDrive {
             config,
             client,
             download_client,
+            open_download_client,
             md5_cache: Arc::new(DashMap::new()),
             open,
             alert,
@@ -590,8 +607,10 @@ impl QuarkDrive {
     }
 
     pub async fn download<U: IntoUrl>(&self, url: U, range: Option<(u64, usize)>) -> Result<Bytes> {
+        if self.is_open_mode() {
+            return self.download_open(url, range).await;
+        }
         use reqwest::header::RANGE;
-        // Open 直链依赖 x_pan_* Cookie；Cookie 模式带上也能兼容。
         let cookie = self.resolve_cookies().await;
         let url = url.into_url()?;
         let mut req = self.download_client.get(url.clone()).header("Cookie", &cookie);
@@ -606,6 +625,75 @@ impl QuarkDrive {
         let res = req.send().await?.error_for_status()?;
         self.update_cookie_from_response(&res).await;
         Ok(res.bytes().await?)
+    }
+
+    /// Open 下载：对齐 OpenList `Link`（只带 `x_pan_*` Cookie），手动跟随重定向并保留 Cookie。
+    async fn download_open<U: IntoUrl>(
+        &self,
+        url: U,
+        range: Option<(u64, usize)>,
+    ) -> Result<Bytes> {
+        use reqwest::header::{LOCATION, RANGE};
+        let open = self
+            .open
+            .as_ref()
+            .context("download_open 仅 Open 模式可用")?;
+        let mut url = url.into_url()?;
+        let mut refreshed = false;
+        for hop in 0..10u32 {
+            let cookie = open.creds.auth_cookie().await;
+            let mut req = self
+                .open_download_client
+                .get(url.clone())
+                .header("Cookie", &cookie);
+            if let Some((start_pos, size)) = range {
+                let end_pos = start_pos + size as u64 - 1;
+                debug!(
+                    url = %url,
+                    start = start_pos,
+                    end = end_pos,
+                    hop = hop,
+                    "open download"
+                );
+                req = req.header(RANGE, format!("bytes={}-{}", start_pos, end_pos));
+            } else {
+                debug!(url = %url, hop = hop, "open download");
+            }
+            let res = req.send().await?;
+            let status = res.status();
+            if status.is_redirection() {
+                let loc = res
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .context("Open 下载重定向缺少 Location")?;
+                url = url
+                    .join(loc)
+                    .with_context(|| format!("解析重定向失败: {loc}"))?;
+                continue;
+            }
+            if matches!(
+                status,
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ) && !refreshed
+            {
+                let body = res.text().await.unwrap_or_default();
+                warn!(
+                    status = %status,
+                    body = %body,
+                    "Open 下载鉴权失败，刷新 token 后重试"
+                );
+                open.refresh_token(&self.client).await?;
+                refreshed = true;
+                continue;
+            }
+            let res = res.error_for_status().map_err(|err| {
+                error!(error = %err, url = %url, "open download failed");
+                err
+            })?;
+            return Ok(res.bytes().await?);
+        }
+        anyhow::bail!("Open 下载重定向过多: {url}")
     }
 
     pub async fn remove_file(&self, file_id: &str, trash: bool) -> Result<()> {
