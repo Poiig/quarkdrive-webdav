@@ -735,17 +735,15 @@ fn console_float_css() -> &'static str {
 .qd-actions a:hover,.qd-actions button:hover{border-color:var(--accent);color:var(--accent);text-decoration:none}
 .qd-actions .ghost{background:transparent}
 .qd-float{
-  position:fixed;top:64px;right:12px;z-index:40;width:300px;
-  background:rgba(255,255,255,.97);border:1px solid var(--line);
-  box-shadow:0 12px 28px rgba(20,34,43,.12);
-}
-/* 展开时给主内容让出右侧，避免挡住目录列表 */
-@media (min-width:960px){
-  body.qd-panel-open .wrap{padding-right:332px}
-  body.qd-panel-open .top-inner{padding-right:332px}
+  /* 叠在右上角，不挤占目录居中布局 */
+  position:fixed;top:72px;right:16px;z-index:40;width:min(300px,calc(100vw - 32px));
+  background:rgba(255,255,255,.98);border:1px solid var(--line);
+  box-shadow:0 10px 32px rgba(20,34,43,.16);
+  max-height:calc(100vh - 96px);
+  display:flex;flex-direction:column;
 }
 /* 无任务时收成窄条，少占视线 */
-.qd-float.idle{width:auto;min-width:140px}
+.qd-float.idle{width:auto;min-width:148px;max-height:none}
 .qd-float.idle .qd-float-bd{display:none!important}
 .qd-float-hd{
   display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;user-select:none;
@@ -760,7 +758,7 @@ fn console_float_css() -> &'static str {
 .qd-badge[data-n="0"]{background:#94a3b8}
 .qd-float-hd .chev{margin-left:auto;color:var(--muted);font-size:12px;transition:transform .2s}
 .qd-float.open .qd-float-hd .chev{transform:rotate(180deg)}
-.qd-float-bd{display:none;max-height:min(52vh,420px);overflow:auto;padding:4px 0}
+.qd-float-bd{display:none;overflow:auto;padding:4px 0;flex:1;min-height:0}
 .qd-float.open .qd-float-bd{display:block}
 .qd-empty{padding:22px 16px;text-align:center;color:var(--muted);font-size:13px}
 .qd-item{padding:12px 14px 10px;border-bottom:1px solid var(--line)}
@@ -835,11 +833,9 @@ fn console_float_css() -> &'static str {
 .qd-modal .path{word-break:break-all;color:var(--ink)}
 .qd-modal .ok{color:var(--ok)} .qd-modal .bad{color:var(--bad)}
 .qd-modal .empty-row td{text-align:center;color:var(--muted);padding:36px 16px}
-@media (max-width:959px){
-  .qd-float{top:auto;bottom:12px;right:12px;left:auto;width:min(300px,calc(100vw - 24px))}
-  body.qd-panel-open .wrap{padding-bottom:120px}
-}
 @media (max-width:720px){
+  .qd-float{top:auto;bottom:12px;right:12px;width:min(300px,calc(100vw - 24px))}
+
   .qd-modal{padding:16px}
   .qd-modal-hd,.qd-modal-tools{padding-left:16px;padding-right:16px}
   .qd-modal-bd{padding:4px 8px 16px}
@@ -892,20 +888,13 @@ fn console_float_html() -> &'static str {
   const body=document.getElementById("qdFloatBody");
   const badge=document.getElementById("qdBadge");
   let userCollapsed=false;
-  function syncPanelLayout(){
-    const open=floatEl.classList.contains("open");
-    document.body.classList.toggle("qd-panel-open", open);
-  }
   document.getElementById("qdFloatToggle").addEventListener("click",()=>{
     const willOpen=!floatEl.classList.contains("open");
     floatEl.classList.toggle("open", willOpen);
     userCollapsed=!willOpen;
-    syncPanelLayout();
   });
-  syncPanelLayout();
 
-  // 客户端固定出现顺序，刷新只改内容，避免整表重绘导致跳动。
-  const order=[];
+  // 进行中按开始时间新→旧置顶；已完成沉底。同组内 started_ms 不变故不跳动。
   function itemHtml(it){
     const pct=Math.max(0,Math.min(100,Number(it.percent)||0));
     const st=STATUS[it.status]||it.status;
@@ -923,12 +912,12 @@ fn console_float_html() -> &'static str {
       <div class="${barCls}"><i style="width:${unknown?40:pct}%"></i></div>
       <div class="r2"><span class="pct">${unknown?"…":pct+"%"} · ${esc(st)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>`;
   }
+  function isActive(it){ return it.status==="receiving"||it.status==="uploading"; }
   function renderUploads(items){
-    const active=items.filter(i=>i.status==="receiving"||i.status==="uploading").length;
-    badge.textContent=String(active);
-    badge.dataset.n=String(active);
-    // 有进行中任务才自动展开并给主栏让位；否则收成窄条，避免挡住目录。
-    const busy=active>0;
+    const activeN=items.filter(isActive).length;
+    badge.textContent=String(activeN);
+    badge.dataset.n=String(activeN);
+    const busy=activeN>0;
     if(busy && !userCollapsed){
       floatEl.classList.add("open");
     }else if(!busy){
@@ -936,39 +925,34 @@ fn console_float_html() -> &'static str {
       if(items.length===0) userCollapsed=false;
     }
     floatEl.classList.toggle("idle", !floatEl.classList.contains("open"));
-    syncPanelLayout();
     if(!items.length){
-      order.length=0;
       body.innerHTML='<div class="qd-empty">暂无上传任务</div>';
       return;
     }
-    const byPath=new Map(items.map(it=>[it.path,it]));
-    // 去掉服务端已消失的项，保留既有顺序。
-    for(let i=order.length-1;i>=0;i--){
-      if(!byPath.has(order[i])) order.splice(i,1);
-    }
-    for(const it of items){
-      if(!order.includes(it.path)) order.push(it.path);
-    }
+    const active=items.filter(isActive).sort((a,b)=>(b.started_ms||0)-(a.started_ms||0)||String(a.path).localeCompare(b.path));
+    const done=items.filter(it=>!isActive(it)).sort((a,b)=>(b.updated_ms||0)-(a.updated_ms||0)||String(a.path).localeCompare(b.path));
+    const ordered=[...active,...done];
     const empty=body.querySelector(".qd-empty");
     if(empty) empty.remove();
-    const seen=new Set();
-    for(const path of order){
-      const it=byPath.get(path);
-      if(!it) continue;
-      seen.add(path);
-      let el=[...body.querySelectorAll(".qd-item")].find(e=>e.dataset.path===path);
-      if(!el){
+    const prevFirst=body.querySelector(".qd-item")?.dataset.path;
+    const frag=document.createDocumentFragment();
+    const reuse=new Map([...body.querySelectorAll(".qd-item")].map(el=>[el.dataset.path,el]));
+    for(const it of ordered){
+      let el=reuse.get(it.path);
+      if(el) reuse.delete(it.path);
+      else{
         el=document.createElement("div");
         el.className="qd-item";
-        el.dataset.path=path;
-        body.appendChild(el);
+        el.dataset.path=it.path;
       }
-      el.title=path;
+      el.title=it.path;
       el.innerHTML=itemHtml(it);
+      frag.appendChild(el);
     }
-    for(const el of [...body.querySelectorAll(".qd-item")]){
-      if(!seen.has(el.dataset.path)) el.remove();
+    body.replaceChildren(frag);
+    // 有更新的进行中任务置顶时，滚到顶部方便看到进度。
+    if(ordered[0] && ordered[0].path!==prevFirst && isActive(ordered[0])){
+      body.scrollTop=0;
     }
   }
 
@@ -1365,6 +1349,12 @@ fn render_directory_html(req_path: &str, files: &[crate::drive::QuarkFile]) -> S
     }
 
     let total = dirs.len() + regular_files.len();
+    // 标签页标题：根目录不用裸 "/"，子目录去掉前导斜杠。
+    let page_title = if display_path == "/" {
+        "根目录".to_string()
+    } else {
+        display_path.trim_start_matches('/').to_string()
+    };
 
     format!(
         r#"<!DOCTYPE html>
@@ -1430,7 +1420,7 @@ tr.parent:hover,tr.dir:hover{{background:#eef8f9}}
 </main>
 {float_html}
 </body></html>"#,
-        title = html_escape(&display_path),
+        title = html_escape(&page_title),
         base = browse_base_css(),
         float = console_float_css(),
         actions = console_actions_html(false),
@@ -1858,6 +1848,8 @@ mod tests {
         let files: Vec<crate::drive::QuarkFile> = vec![];
         let html = render_directory_html("/", &files);
         assert!(html.contains("QuarkDrive"));
+        assert!(html.contains("<title>根目录 · QuarkDrive</title>"));
+        assert!(!html.contains("<title>/ ·"));
         assert!(html.contains("0 项"));
         assert!(html.contains("qdFloat"));
         assert!(html.contains("data-qd-history"));

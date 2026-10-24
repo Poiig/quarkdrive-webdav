@@ -272,7 +272,7 @@ impl UploadTracker {
             });
     }
 
-    /// 列出条目：按开始时间升序固定位置，避免进度刷新时上下跳动。
+    /// 列出条目：进行中（新→旧）在上，已完成在下；同组按 started_ms 稳定，避免刷新乱跳。
     pub fn list(&self) -> Vec<ProgressEntry> {
         let now = now_ms();
         // 已结束超过 1 小时的从内存表摘掉，避免无限涨。
@@ -282,11 +282,21 @@ impl UploadTracker {
             active || now.saturating_sub(e.updated_ms) < DONE_TTL_MS
         });
         let mut items: Vec<_> = self.inner.iter().map(|e| e.value().clone()).collect();
-        // 同一文件始终同一槽位：只按 started_ms，不用 updated_ms 重排。
         items.sort_by(|a, b| {
-            a.started_ms
-                .cmp(&b.started_ms)
-                .then_with(|| a.path.cmp(&b.path))
+            let a_active = matches!(a.status.as_str(), "receiving" | "uploading");
+            let b_active = matches!(b.status.as_str(), "receiving" | "uploading");
+            b_active.cmp(&a_active).then_with(|| {
+                if a_active && b_active {
+                    // 进行中：新任务在上
+                    b.started_ms
+                        .cmp(&a.started_ms)
+                        .then_with(|| a.path.cmp(&b.path))
+                } else {
+                    b.updated_ms
+                        .cmp(&a.updated_ms)
+                        .then_with(|| a.path.cmp(&b.path))
+                }
+            })
         });
         items
     }
