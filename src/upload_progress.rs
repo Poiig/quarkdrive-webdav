@@ -270,21 +270,63 @@ impl UploadTracker {
                 e.detail = detail.into();
                 e
             });
+        // 完成后顺带裁剪，避免列表无限涨。
+        self.prune();
+    }
+
+    /// 是否进行中任务。
+    fn is_active(status: &str) -> bool {
+        matches!(status, "receiving" | "uploading")
+    }
+
+    /// 清除已完成/失败/跳过项，返回清除条数。
+    pub fn clear_completed(&self) -> usize {
+        let before = self.inner.len();
+        self.inner.retain(|_, e| Self::is_active(&e.status));
+        before.saturating_sub(self.inner.len())
+    }
+
+    /// 列表上限：进行中全保留，已完成最多凑到合计 [`MAX_LIST_ITEMS`]。
+    pub const MAX_LIST_ITEMS: usize = 30;
+    /// 已完成项最长保留（超时也归档删除）。
+    const DONE_TTL_MS: u64 = 30 * 60 * 1000;
+
+    /// 裁剪过期与超额的已完成项（进行中永不裁）。
+    fn prune(&self) {
+        let now = now_ms();
+        self.inner.retain(|_, e| {
+            Self::is_active(&e.status) || now.saturating_sub(e.updated_ms) < Self::DONE_TTL_MS
+        });
+        let active_n = self
+            .inner
+            .iter()
+            .filter(|e| Self::is_active(&e.status))
+            .count();
+        let done_budget = Self::MAX_LIST_ITEMS.saturating_sub(active_n);
+        if done_budget >= self.inner.len().saturating_sub(active_n) {
+            return;
+        }
+        let mut done: Vec<(String, u64)> = self
+            .inner
+            .iter()
+            .filter(|e| !Self::is_active(&e.status))
+            .map(|e| (e.path.clone(), e.updated_ms))
+            .collect();
+        // 旧的先删，只留最新的 done_budget 条。
+        done.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let drop_n = done.len().saturating_sub(done_budget);
+        for (path, _) in done.into_iter().take(drop_n) {
+            self.inner.remove(&path);
+        }
     }
 
     /// 列出条目：进行中（新→旧）在上，已完成在下；同组按 started_ms 稳定，避免刷新乱跳。
     pub fn list(&self) -> Vec<ProgressEntry> {
-        let now = now_ms();
-        // 已结束超过 1 小时的从内存表摘掉，避免无限涨。
-        const DONE_TTL_MS: u64 = 60 * 60 * 1000;
-        self.inner.retain(|_, e| {
-            let active = matches!(e.status.as_str(), "receiving" | "uploading");
-            active || now.saturating_sub(e.updated_ms) < DONE_TTL_MS
-        });
+        self.prune();
         let mut items: Vec<_> = self.inner.iter().map(|e| e.value().clone()).collect();
         items.sort_by(|a, b| {
-            let a_active = matches!(a.status.as_str(), "receiving" | "uploading");
-            let b_active = matches!(b.status.as_str(), "receiving" | "uploading");
+            let a_active = Self::is_active(&a.status);
+            let b_active = Self::is_active(&b.status);
             b_active.cmp(&a_active).then_with(|| {
                 if a_active && b_active {
                     // 进行中：新任务在上
@@ -335,5 +377,27 @@ mod tests {
         let e = t.list().into_iter().next().unwrap();
         assert_eq!(e.speed_bps, 2_000);
         assert!(e.speed_bps < 50_000, "must not treat full received size as one sample");
+    }
+
+    #[test]
+    fn clear_completed_keeps_active_and_caps_list() {
+        let t = UploadTracker::new();
+        for i in 0..40 {
+            let p = format!("/done-{i}.bin");
+            t.start_receiving(&p, 100);
+            t.finish(&p, "ok", "");
+        }
+        t.start_receiving("/active.bin", 100);
+        t.mark_uploading("/active.bin", 100);
+        let list = t.list();
+        assert!(list.len() <= UploadTracker::MAX_LIST_ITEMS);
+        assert!(list.iter().any(|e| e.path == "/active.bin"));
+        assert!(list.iter().any(|e| e.status == "uploading"));
+
+        let cleared = t.clear_completed();
+        assert!(cleared > 0);
+        let list = t.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].path, "/active.bin");
     }
 }

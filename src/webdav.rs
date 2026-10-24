@@ -198,6 +198,7 @@ impl QuarkDriveWebDav {
     fn is_console_path(path: &str) -> bool {
         path == "/__uploads"
             || path == "/__uploads.json"
+            || path == "/__uploads/clear"
             || path == "/__history"
             || path == "/__history.json"
             || path.starts_with("/__history/")
@@ -587,6 +588,18 @@ impl QuarkDriveWebDav {
         let query = req.uri().query().unwrap_or("");
         let params = parse_query(query);
 
+        // 清除已完成的上传进度项（进行中保留）。
+        if path == "/__uploads/clear"
+            || (path == "/__uploads.json"
+                && params
+                    .get("clear")
+                    .map(|v| v == "1" || v == "completed")
+                    .unwrap_or(false))
+        {
+            let n = self.fs.upload_tracker().clear_completed();
+            return json_response(serde_json::json!({ "cleared": n }));
+        }
+
         if path == "/__uploads.json" {
             let items = self.fs.upload_tracker().list();
             let list: Vec<serde_json::Value> = items
@@ -605,10 +618,14 @@ impl QuarkDriveWebDav {
                         "avg_speed_bps": e.avg_speed_bps(),
                         "lane": e.lane,
                         "updated_ms": e.updated_ms,
+                        "started_ms": e.started_ms,
                     })
                 })
                 .collect();
-            return json_response(serde_json::json!({ "items": list }));
+            return json_response(serde_json::json!({
+                "items": list,
+                "max_items": crate::upload_progress::UploadTracker::MAX_LIST_ITEMS,
+            }));
         }
 
         // 旧独立进度页 → 目录（右上角面板）。
@@ -758,6 +775,18 @@ fn console_float_css() -> &'static str {
 .qd-badge[data-n="0"]{background:#94a3b8}
 .qd-float-hd .chev{margin-left:auto;color:var(--muted);font-size:12px;transition:transform .2s}
 .qd-float.open .qd-float-hd .chev{transform:rotate(180deg)}
+.qd-float-tools{
+  display:none;padding:8px 12px;gap:8px;border-bottom:1px solid var(--line);background:#f8fafb;
+  align-items:center;justify-content:space-between;
+}
+.qd-float.open .qd-float-tools{display:flex}
+.qd-float-tools .hint{font-size:11px;color:var(--muted)}
+.qd-float-tools button{
+  appearance:none;border:1px solid var(--line);background:#fff;color:var(--muted);
+  font:inherit;font-size:12px;padding:5px 10px;cursor:pointer;
+}
+.qd-float-tools button:hover{color:var(--bad);border-color:#fecaca}
+.qd-float-tools button:disabled{opacity:.45;cursor:default;color:var(--muted);border-color:var(--line)}
 .qd-float-bd{display:none;overflow:auto;padding:4px 0;flex:1;min-height:0}
 .qd-float.open .qd-float-bd{display:block}
 .qd-empty{padding:22px 16px;text-align:center;color:var(--muted);font-size:13px}
@@ -853,6 +882,10 @@ fn console_float_html() -> &'static str {
     <span class="qd-badge" id="qdBadge" data-n="0">0</span>
     <span class="chev">▾</span>
   </div>
+  <div class="qd-float-tools">
+    <span class="hint" id="qdFloatHint">最多保留 30 条</span>
+    <button type="button" id="qdClearDone" title="清除已完成/失败项，进行中保留">清除已完成</button>
+  </div>
   <div class="qd-float-bd" id="qdFloatBody"><div class="qd-empty">暂无上传任务</div></div>
 </aside>
 <div class="qd-modal" id="qdHistModal" role="dialog" aria-modal="true" aria-labelledby="qdHistTitle">
@@ -887,11 +920,25 @@ fn console_float_html() -> &'static str {
   const floatEl=document.getElementById("qdFloat");
   const body=document.getElementById("qdFloatBody");
   const badge=document.getElementById("qdBadge");
+  const clearBtn=document.getElementById("qdClearDone");
+  const floatHint=document.getElementById("qdFloatHint");
   let userCollapsed=false;
   document.getElementById("qdFloatToggle").addEventListener("click",()=>{
     const willOpen=!floatEl.classList.contains("open");
     floatEl.classList.toggle("open", willOpen);
     userCollapsed=!willOpen;
+  });
+  clearBtn.addEventListener("click",async (e)=>{
+    e.stopPropagation();
+    if(clearBtn.disabled) return;
+    clearBtn.disabled=true;
+    try{
+      const r=await fetch("/__uploads/clear",{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}});
+      const data=await r.json();
+      await poll();
+      if(data.cleared!=null) floatHint.textContent="已清除 "+data.cleared+" 条";
+    }catch(_){ floatHint.textContent="清除失败"; }
+    finally{ clearBtn.disabled=false; }
   });
 
   // 进行中按开始时间新→旧置顶；已完成沉底。同组内 started_ms 不变故不跳动。
@@ -913,10 +960,14 @@ fn console_float_html() -> &'static str {
       <div class="r2"><span class="pct">${unknown?"…":pct+"%"} · ${esc(st)}</span><span class="speed">${esc(speed)}</span>${laneHtml}</div>`;
   }
   function isActive(it){ return it.status==="receiving"||it.status==="uploading"; }
-  function renderUploads(items){
+  function renderUploads(items, maxItems){
     const activeN=items.filter(isActive).length;
+    const doneN=items.length-activeN;
     badge.textContent=String(activeN);
     badge.dataset.n=String(activeN);
+    clearBtn.disabled=doneN===0;
+    const cap=maxItems||30;
+    floatHint.textContent=doneN>0?("已完成 "+doneN+" · 上限 "+cap):("上限 "+cap+" 条");
     const busy=activeN>0;
     if(busy && !userCollapsed){
       floatEl.classList.add("open");
@@ -962,7 +1013,7 @@ fn console_float_html() -> &'static str {
       const r=await fetch("/__uploads.json",{credentials:"same-origin",cache:"no-store"});
       if(!r.ok) return;
       const data=await r.json();
-      renderUploads(data.items||[]);
+      renderUploads(data.items||[], data.max_items);
     }catch(_){}
   }
   poll();
