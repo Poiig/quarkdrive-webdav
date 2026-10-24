@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 
 /// 同一类告警最短间隔，避免刷屏。
 const DEDUP_SECS: u64 = 300;
+const PROJECT_TITLE: &str = "quarkdrive-webdav";
 
 #[derive(Debug, Clone)]
 pub struct Alert {
@@ -43,38 +44,55 @@ impl Alert {
         self.inner.is_some()
     }
 
-    /// 推送文本告警；同类文案在 DEDUP_SECS 内只发一次。
-    pub async fn notify(&self, title: &str, detail: &str) {
+    /// 推送告警：标题固定为项目名，事件与报错换行展示。
+    pub async fn notify(&self, event: &str, detail: &str) {
         let Some(inner) = &self.inner else {
             return;
         };
-        let content = format!("【quarkdrive-webdav】{title}\n{detail}");
-        let dedup_key = format!("{title}|{detail}");
+        let detail = format_detail(detail);
+        let content = format!(
+            "**{PROJECT_TITLE}**\n\
+             > {event}\n\
+             \n\
+             {detail}"
+        );
+        let dedup_key = format!("{event}|{detail}");
         {
             let mut last = inner.last_sent.lock().await;
             if let Some((ref prev, at)) = *last {
                 if prev == &dedup_key && at.elapsed() < Duration::from_secs(DEDUP_SECS) {
-                    debug!(title = %title, "skip duplicate wecom alert");
+                    debug!(event = %event, "skip duplicate wecom alert");
                     return;
                 }
             }
             *last = Some((dedup_key, Instant::now()));
         }
-        if let Err(err) = inner.send(&content).await {
+        if let Err(err) = inner.send_markdown(&content).await {
             warn!(error = %err, "wecom webhook send failed");
         }
     }
 }
 
+/// 把常见粘连错误拆成多行，便于企微阅读。
+fn format_detail(detail: &str) -> String {
+    detail
+        .replace("\r\n", "\n")
+        .replace('；', "\n")
+        .replace("; ", "\n")
+        .replace(" → ", "\n→ ")
+        .trim()
+        .to_string()
+}
+
 impl AlertInner {
-    async fn send(&self, content: &str) -> Result<()> {
+    async fn send_markdown(&self, content: &str) -> Result<()> {
         let url = format!(
             "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={}",
             self.webhook_key
         );
         let body = json!({
-            "msgtype": "text",
-            "text": { "content": content }
+            "msgtype": "markdown",
+            "markdown": { "content": content }
         });
         let res = self.client.post(&url).json(&body).send().await?;
         let status = res.status();
@@ -82,12 +100,23 @@ impl AlertInner {
         if !status.is_success() {
             anyhow::bail!("wecom HTTP {status}: {text}");
         }
-        // 企微业务错误：errcode != 0
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             if v.get("errcode").and_then(|c| c.as_i64()).unwrap_or(0) != 0 {
                 anyhow::bail!("wecom api error: {text}");
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_detail_splits_joined_errors() {
+        let s = format_detail("刷新失败：A → err1；飞牛本地刷新 → err2");
+        assert!(s.contains('\n'));
+        assert!(s.lines().count() >= 2);
     }
 }
