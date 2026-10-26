@@ -248,6 +248,11 @@ impl UploadTracker {
             .unwrap_or(false)
     }
 
+    /// 当前状态：receiving / uploading / ok / error / skip / cancelled。
+    pub fn status_of(&self, path: &str) -> Option<String> {
+        self.inner.get(path).map(|e| e.status.clone())
+    }
+
     /// 开始接收（WebDAV PUT 写入时）。
     ///
     /// CloudSync 在服务端提前返回后常会整文件重 PUT；若后台仍在上传，

@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Formatter};
 use std::io::{SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -126,8 +126,8 @@ pub struct QuarkDriveFileSystem {
     oplog: Arc<OpLog>,
     /// Web 控制台上传进度（与 CloudSync uploading stub 独立）。
     upload_tracker: UploadTracker,
-    /// 正在向网盘上传的路径集合：防止 upload_wait_timeout 提前返回后客户端重 PUT 再开一条 OSS。
-    upload_inflight: Arc<DashMap<String, ()>>,
+    /// 正在向网盘上传的路径。重复 PUT 挂到同一个槽上，等原任务结束再回复，避免 CloudSync 提前看到成功。
+    upload_inflight: Arc<DashMap<String, Arc<InflightSlot>>>,
     /// 客户端 PUT 带来的文件 mtime（unix 毫秒）。PROPFIND 用它覆盖夸克的上传时间，
     /// 否则 CloudSync 每次对账都认为远端时间不对，把同一个文件再传一遍。
     client_mtimes: Arc<DashMap<String, u64>>,
@@ -191,19 +191,30 @@ impl QuarkDriveFileSystem {
         }
     }
 
-    /// 尝试登记「此路径正在上传」；已有则返回 None（调用方应跳过重复 flush）。
+    /// 尝试登记「此路径正在上传」。已有则返回 None，调用方应等待原任务，而不是再开一条 OSS。
     fn try_begin_upload(&self, path: &str) -> Option<UploadInflightGuard> {
         use dashmap::mapref::entry::Entry;
         match self.upload_inflight.entry(path.to_string()) {
             Entry::Occupied(_) => None,
             Entry::Vacant(v) => {
-                v.insert(());
+                let slot = InflightSlot::new();
+                v.insert(slot.clone());
                 Some(UploadInflightGuard {
                     map: self.upload_inflight.clone(),
                     path: path.to_string(),
+                    slot,
+                    settled: false,
                 })
             }
         }
+    }
+
+    fn upload_in_flight(&self, path: &str) -> bool {
+        self.upload_inflight.contains_key(path)
+    }
+
+    fn inflight_slot(&self, path: &str) -> Option<Arc<InflightSlot>> {
+        self.upload_inflight.get(path).map(|s| Arc::clone(s.value()))
     }
 
     /// 供 Web 页读取上传进度。
@@ -1024,6 +1035,8 @@ struct UploadState {
     flush_count: u32,
     /// 临时文件/上传占位已交给后台任务；客户端断开时 Drop 不得删文件或摘占位。
     handed_off: bool,
+    /// 同路径已有上传在进行。这次 PUT 只丢掉正文，等原任务结束后再回复客户端。
+    discard_duplicate: bool,
 }
 
 impl Default for UploadState {
@@ -1051,6 +1064,7 @@ impl Default for UploadState {
             is_uploading: false,
             flush_count: 0,
             handed_off: false,
+            discard_duplicate: false,
         }
     }
 }
@@ -1123,6 +1137,18 @@ impl QuarkDavFile {
             return Ok(false);
         }
         if !self.upload_state.is_uploading {
+            let path = self.upload_log_path();
+            // 原任务已经在传夸克。重试 PUT 的正文不再落盘，避免再写一份 11GB，也不许改进度。
+            if self.fs.upload_in_flight(&path) || self.fs.upload_tracker.is_uploading(&path) {
+                info!(
+                    path = %path,
+                    file_name = %self.file.file_name,
+                    "discard duplicate PUT body; original upload still running"
+                );
+                self.upload_state.discard_duplicate = true;
+                self.upload_state.is_uploading = true;
+                return Ok(true);
+            }
             self.upload_state.is_uploading = true;
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1283,7 +1309,39 @@ impl QuarkDavFile {
             .await;
     }
 
+    /// CloudSync 超时后会再 PUT 一遍。这次请求必须等到原上传真正结束再回复，
+    /// 否则客户端先记成功，后台失败时不会再重试。
+    async fn join_inflight_upload(&mut self) -> Result<(), FsError> {
+        let path = self.upload_log_path();
+        info!(
+            path = %path,
+            file_name = %self.file.file_name,
+            "duplicate PUT waits for in-flight upload"
+        );
+        self.upload_state.handed_off = false;
+        self.delete_temp_file().await?;
+        self.release_upload_memory();
+        let ok = if let Some(slot) = self.fs.inflight_slot(&path) {
+            slot.wait().await
+        } else {
+            match self.fs.upload_tracker.status_of(&path).as_deref() {
+                Some("ok") | Some("skip") => true,
+                _ => false,
+            }
+        };
+        self.upload_state.is_finished = true;
+        self.upload_state.discard_duplicate = true;
+        if ok {
+            Ok(())
+        } else {
+            Err(FsError::GeneralFailure)
+        }
+    }
+
     async fn do_flush(&mut self) -> Result<(), FsError> {
+        if self.upload_state.discard_duplicate {
+            return self.join_inflight_upload().await;
+        }
         let size = self.upload_state.size;
         let log_path_early = self.upload_log_path();
         // 接收阶段点了取消：不再开 OSS，直接收尾。
@@ -1362,7 +1420,7 @@ impl QuarkDavFile {
                 file_name = %self.file.file_name,
                 "skip duplicate cookie upload: already in flight"
             );
-            return self.abandon_duplicate_retry_upload().await;
+            return self.join_inflight_upload().await;
         };
 
         // up_pre
@@ -1455,7 +1513,7 @@ impl QuarkDavFile {
         let handle = tokio::spawn(async move {
             // 路径锁留到任务结束（含等列表），挡住同路径的第二次 OSS。
             // 上传槽和快车道只包住真正传字节的那段，等列表不能把并发名额占住。
-            let _inflight_guard = inflight_guard;
+            let mut inflight_guard = inflight_guard;
             let temp_path = upload_state.temp_file_path.clone();
             let result = {
                 let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
@@ -1581,13 +1639,13 @@ impl QuarkDavFile {
             }
 
             let cancelled = cancel_flag.load(std::sync::atomic::Ordering::Acquire);
-            if cancelled {
+            let client_result = if cancelled {
                 // request_cancel 已写入 cancelled；此处只做清理。
                 fs.remove_uploading_file(&parent_path, &file_name);
                 fs.oplog
                     .log_upload(&log_path, log_size, log_mode, "cancelled")
                     .await;
-                Ok::<(), FsError>(())
+                Ok(())
             } else {
                 match result {
                     Ok(_) => {
@@ -1628,7 +1686,10 @@ impl QuarkDavFile {
                         Err(err)
                     }
                 }
-            }
+            };
+            // 先标结果再丢锁，重试 PUT 才能等到和这次一样的成败。
+            inflight_guard.settle(client_result.is_ok());
+            client_result
         });
         self.fs
             .upload_tracker
@@ -1694,7 +1755,7 @@ impl QuarkDavFile {
                 file_name = %self.file.file_name,
                 "skip duplicate open upload: already in flight"
             );
-            return self.abandon_duplicate_retry_upload().await;
+            return self.join_inflight_upload().await;
         };
 
         // 空上传且既无内存也无文件时，用空内存源即可。
@@ -1754,7 +1815,7 @@ impl QuarkDavFile {
         let handle = tokio::spawn(async move {
             // 同路径锁一直握到等列表结束，避免 CloudSync 超时重 PUT 再开一条 OSS。
             // 并发槽和快车道在字节传完就放开：等列表最多 90 秒，不能把后面的任务堵住。
-            let _inflight_guard = inflight_guard;
+            let mut inflight_guard = inflight_guard;
             let result = {
                 let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
                 let smart = crate::upload_schedule::join(size).await;
@@ -1784,12 +1845,12 @@ impl QuarkDavFile {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
             let cancelled = cancel_flag.load(std::sync::atomic::Ordering::Acquire);
-            if cancelled {
+            let client_result = if cancelled {
                 fs.remove_uploading_file(&parent_path, &file_name);
                 fs.oplog
                     .log_upload(&log_path, size, log_mode, "cancelled")
                     .await;
-                Ok::<(), FsError>(())
+                Ok(())
             } else {
                 match result {
                     Ok(()) => {
@@ -1825,7 +1886,9 @@ impl QuarkDavFile {
                         Err(FsError::GeneralFailure)
                     }
                 }
-            }
+            };
+            inflight_guard.settle(client_result.is_ok());
+            client_result
         });
         self.fs
             .upload_tracker
@@ -2265,6 +2328,10 @@ impl DavFile for QuarkDavFile {
             if !self.prepare_for_upload().await? {
                 return Ok(());
             }
+            // 原上传还在进行：把重试正文丢掉，等 flush 时再跟原任务的结果。
+            if self.upload_state.discard_duplicate {
+                return Ok(());
+            }
             // 大块写入按 upload_buffer_size 切片消费，边写边哈希，避免巨型 buffer 停留。
             let cap = self.fs.upload_buffer_size.max(64 * 1024);
             while buf.has_remaining() {
@@ -2438,6 +2505,11 @@ impl Drop for QuarkDavFile {
     /// 客户端中断上传时归还内存配额，并尽量清掉临时文件 / uploading 幽灵项。
     /// 若已 handoff 给后台任务，则不得碰临时文件与占位（否则流式 PUT 会 ENOENT）。
     fn drop(&mut self) {
+        // 重试 PUT 和原任务共用占位。这里断开不能把正在传的占位摘掉。
+        if self.upload_state.discard_duplicate {
+            self.release_upload_memory();
+            return;
+        }
         if !self.upload_state.handed_off {
             self.release_upload_memory();
         }
@@ -2582,14 +2654,60 @@ fn file_names_equal(a: &str, b: &str) -> bool {
     fold(a) == fold(b)
 }
 
+/// 同路径上传的完成信号。重试 PUT 等这个结果，不再自己回成功。
+struct InflightSlot {
+    tx: tokio::sync::watch::Sender<Option<bool>>,
+    settled: AtomicBool,
+}
+
+impl InflightSlot {
+    fn new() -> Arc<Self> {
+        let (tx, _rx) = tokio::sync::watch::channel(None);
+        Arc::new(Self {
+            tx,
+            settled: AtomicBool::new(false),
+        })
+    }
+
+    fn settle(&self, ok: bool) {
+        self.settled.store(true, Ordering::Release);
+        // send 在没有接收者时会丢掉值。重试 PUT 可能稍后再来等，必须留下结果。
+        self.tx.send_replace(Some(ok));
+    }
+
+    async fn wait(&self) -> bool {
+        let mut rx = self.tx.subscribe();
+        loop {
+            if let Some(ok) = *rx.borrow() {
+                return ok;
+            }
+            if rx.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+}
+
 /// 路径级上传互斥：任务结束（成功/失败/提前 return）时自动摘掉，允许合法重试。
 struct UploadInflightGuard {
-    map: Arc<DashMap<String, ()>>,
+    map: Arc<DashMap<String, Arc<InflightSlot>>>,
     path: String,
+    slot: Arc<InflightSlot>,
+    settled: bool,
+}
+
+impl UploadInflightGuard {
+    fn settle(&mut self, ok: bool) {
+        self.settled = true;
+        self.slot.settle(ok);
+    }
 }
 
 impl Drop for UploadInflightGuard {
     fn drop(&mut self) {
+        if !self.settled {
+            self.slot.settle(false);
+        }
         self.map.remove(&self.path);
     }
 }
@@ -2810,6 +2928,32 @@ mod tests {
         let s = flatten_error("上传分片 12 失败:\nHTTP 504");
         assert_eq!(s, "上传分片 12 失败: HTTP 504");
         assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn duplicate_waiter_sees_settled_result_and_failed_drop() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let slot = InflightSlot::new();
+            slot.settle(true);
+            assert!(slot.wait().await);
+
+            let map: Arc<DashMap<String, Arc<InflightSlot>>> = Arc::new(DashMap::new());
+            let slot = InflightSlot::new();
+            map.insert("/a.MOV".into(), slot.clone());
+            let guard = UploadInflightGuard {
+                map: map.clone(),
+                path: "/a.MOV".into(),
+                slot: slot.clone(),
+                settled: false,
+            };
+            drop(guard);
+            assert!(!slot.wait().await);
+            assert!(!map.contains_key("/a.MOV"));
+        });
     }
 
     #[test]
