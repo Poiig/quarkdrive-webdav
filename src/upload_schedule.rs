@@ -402,6 +402,20 @@ pub async fn join(size: u64) -> SmartUploadPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// 全局调度器/路径表跨测共享；串行化并清状态，避免并行污染。
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn reset_global_schedule() {
+        init(DEFAULT_LARGE_THRESHOLD, DEFAULT_SLOW_BPS);
+        let sched = scheduler();
+        let mut st = sched.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.order.clear();
+        st.fast_holder = None;
+        st.next_ticket = 1;
+        path_lanes().clear();
+    }
 
     #[test]
     fn lane_labels() {
@@ -412,6 +426,8 @@ mod tests {
 
     #[test]
     fn slow_lane_exposes_throttle_bps() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_global_schedule();
         init(1024, 256 * 1024);
         let sched = scheduler();
         let mut st = sched.state.lock().unwrap();
@@ -432,8 +448,9 @@ mod tests {
         };
         assert_eq!(p.lane(), UploadLane::Slow);
         assert_eq!(p.throttle_bps(), Some(256 * 1024));
-        // cleanup so other tests not poisoned
         drop(p);
+        // Drop 只清本票；假 fast_holder(999) 仍在，显式复位。
+        reset_global_schedule();
     }
 
     #[test]
@@ -447,7 +464,9 @@ mod tests {
 
     #[test]
     fn manual_promote_demotes_previous_fast() {
-        // 独立调度器快照：直接往 PATH_LANES / order 塞两票验证抢车道。
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_global_schedule();
+        // 直接往 PATH_LANES / order 塞两票验证抢车道。
         init(1, 64 * 1024);
         let sched = scheduler();
         let fast_flag = Arc::new(AtomicBool::new(true));
@@ -481,12 +500,13 @@ mod tests {
         assert_eq!(result.demoted, vec!["/fast.bin".to_string()]);
         assert!(slow_flag.load(Ordering::Acquire));
         assert!(!fast_flag.load(Ordering::Acquire));
-        let st = sched.state.lock().unwrap();
-        assert_eq!(st.fast_holder, Some(200));
-        assert_eq!(st.order.front().copied(), Some(200));
+        {
+            let st = sched.state.lock().unwrap();
+            assert_eq!(st.fast_holder, Some(200));
+            assert_eq!(st.order.front().copied(), Some(200));
+        }
 
-        map.remove("/fast.bin");
-        map.remove("/slow.bin");
+        reset_global_schedule();
     }
 
     fn pollster_join_small() -> SmartUploadPermit {
