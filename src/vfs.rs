@@ -22,7 +22,6 @@ use crate::{
     drive::{QuarkDrive, QuarkFile, UploadSource},
     oplog::OpLog,
     upload_progress::UploadTracker,
-    util::is_cloudsync_metadata_dir,
 };
 use bytes::BufMut;
 
@@ -1003,12 +1002,10 @@ impl DavFileSystem for QuarkDriveFileSystem {
             if let Some(name) = path.file_name() {
                 let name = name.to_string_lossy().into_owned();
                 let path_str = path.display().to_string();
+                // CloudSync 常对已存在目录再 MKCOL；405 Exists 会被当成失败并报「未找到远程文件」。
                 if self.get_file(path.clone()).await?.is_some() {
-                    if is_cloudsync_metadata_dir(&name) {
-                        debug!(path = %path_str, "cloudsync metadata dir mkcol idempotent ok");
-                        return Ok(());
-                    }
-                    return Err(FsError::Exists);
+                    debug!(path = %path_str, "mkcol idempotent ok (already exists)");
+                    return Ok(());
                 }
                 self.dir_cache.invalidate(parent_path).await;
                 let mode = self.drive_mode();
@@ -1017,15 +1014,69 @@ impl DavFileSystem for QuarkDriveFileSystem {
                         self.oplog.log_mkdir(&path_str, mode, "ok").await;
                     }
                     Err(err) => {
-                        error!(path = %path.display(), error = %err, "create folder failed");
-                        self.oplog
-                            .log_mkdir(&path_str, mode, &format!("error:{err:#}"))
-                            .await;
-                        return Err(FsError::GeneralFailure);
+                        // 并发建同名目录时 API 可能报错，但远端已有 → 仍按成功收尾。
+                        self.dir_cache.invalidate(parent_path).await;
+                        if self
+                            .get_file(path.clone())
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some()
+                        {
+                            warn!(
+                                path = %path_str,
+                                error = %err,
+                                "create folder API error but dir visible; treat as ok"
+                            );
+                            self.oplog
+                                .log_mkdir(&path_str, mode, "ok:exists_after_error")
+                                .await;
+                        } else {
+                            error!(path = %path.display(), error = %err, "create folder failed");
+                            self.oplog
+                                .log_mkdir(&path_str, mode, &format!("error:{err:#}"))
+                                .await;
+                            return Err(FsError::GeneralFailure);
+                        }
                     }
                 }
-                // sleep 1s for quark server to update cache
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // API 成功后立刻给 PROPFIND 占位，再等到列表真有这条，避免群晖「未找到远程文件」。
+                let parent_key = Self::parent_cache_key(parent_path);
+                let now = Self::now_ms();
+                let stub = QuarkFile {
+                    fid: String::new(),
+                    file_name: name.clone(),
+                    pdir_fid: parent_file.fid.clone(),
+                    size: 0,
+                    format_type: String::new(),
+                    status: 1,
+                    dir: true,
+                    file: false,
+                    content_hash: None,
+                    created_at: now,
+                    updated_at: now,
+                    download_url: None,
+                    parent_path: Some(parent_path.to_string_lossy().into_owned()),
+                    thumbnail_url: None,
+                };
+                {
+                    let mut uploading = self.uploading.entry(parent_key.clone()).or_default();
+                    if !uploading
+                        .iter()
+                        .any(|f| file_names_equal(&f.file_name, &name))
+                    {
+                        uploading.push(stub);
+                    }
+                }
+                let visible = self
+                    .wait_until_remote_visible(parent_path, &name, 0, &parent_key)
+                    .await;
+                if !visible {
+                    warn!(
+                        path = %path_str,
+                        "mkdir not yet in remote listing; stub kept for PROPFIND"
+                    );
+                }
                 self.dir_cache.invalidate(&path).await;
                 self.dir_cache.invalidate_parent(&path).await;
                 Ok(())
