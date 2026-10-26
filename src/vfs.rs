@@ -131,7 +131,25 @@ pub struct QuarkDriveFileSystem {
     /// 客户端 PUT 带来的文件 mtime（unix 毫秒）。PROPFIND 用它覆盖夸克的上传时间，
     /// 否则 CloudSync 每次对账都认为远端时间不对，把同一个文件再传一遍。
     client_mtimes: Arc<DashMap<String, u64>>,
+    /// CloudSync「移动」常是先删再上传。大文件删除先挂起，同名同大小再 PUT 时改走网盘内移动。
+    pending_relocate: Arc<DashMap<String, PendingRelocate>>,
 }
+
+/// 被 CloudSync 先删、可能马上在别处再传的大文件。
+#[derive(Debug, Clone)]
+struct PendingRelocate {
+    fid: String,
+    name: String,
+    size: u64,
+    content_hash: Option<String>,
+    from_path: String,
+    deleted_ms: u64,
+}
+
+/// 超过此大小的删除才延迟：小文件重传便宜，不必占着 fid。
+const RELOCATE_MIN_SIZE: u64 = 32 * 1024 * 1024;
+/// 延迟删除窗口：群晖移动大文件时，删与再传之间可能隔几十分钟。
+const RELOCATE_TTL_MS: u64 = 2 * 60 * 60 * 1000;
 
 impl QuarkDriveFileSystem {
     #[allow(clippy::too_many_arguments)]
@@ -167,7 +185,124 @@ impl QuarkDriveFileSystem {
             upload_tracker: UploadTracker::new(),
             upload_inflight: Arc::new(DashMap::new()),
             client_mtimes: Arc::new(DashMap::new()),
+            pending_relocate: Arc::new(DashMap::new()),
         })
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// 列表/取值时把「已对客户端声明删除、实际还在夸克」的条目藏起来。
+    fn is_pending_relocate_fid(&self, fid: &str) -> bool {
+        self.expire_pending_relocate();
+        self.pending_relocate.contains_key(fid)
+    }
+
+    /// 过期的挂起删除真正送到回收站/删除。
+    fn expire_pending_relocate(&self) {
+        let now = Self::now_ms();
+        let expired: Vec<(String, PendingRelocate)> = self
+            .pending_relocate
+            .iter()
+            .filter(|e| now.saturating_sub(e.deleted_ms) >= RELOCATE_TTL_MS)
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        for (fid, pending) in expired {
+            if self.pending_relocate.remove(&fid).is_none() {
+                continue;
+            }
+            let drive = self.drive.clone();
+            let no_trash = self.no_trash;
+            let from = pending.from_path.clone();
+            tokio::spawn(async move {
+                match drive.remove_file(&fid, !no_trash).await {
+                    Ok(()) => info!(fid = %fid, path = %from, "expired pending relocate deleted"),
+                    Err(err) => warn!(fid = %fid, path = %from, error = %err, "expired pending relocate delete failed"),
+                }
+            });
+        }
+    }
+
+    /// CloudSync 大文件「移动」：先对客户端说删成功，fid 先留着等同名同大小再 PUT。
+    fn note_pending_relocate(&self, file: &QuarkFile, path: &str) {
+        self.expire_pending_relocate();
+        // 同名旧挂起先清掉，避免一对多对不上。
+        let stale: Vec<String> = self
+            .pending_relocate
+            .iter()
+            .filter(|e| file_names_equal(&e.name, &file.file_name))
+            .map(|e| e.key().clone())
+            .collect();
+        for fid in stale {
+            if let Some((_, old)) = self.pending_relocate.remove(&fid) {
+                let drive = self.drive.clone();
+                let no_trash = self.no_trash;
+                tokio::spawn(async move {
+                    let _ = drive.remove_file(&old.fid, !no_trash).await;
+                });
+            }
+        }
+        info!(
+            fid = %file.fid,
+            path,
+            size = file.size,
+            "defer large-file delete for possible CloudSync relocate"
+        );
+        self.pending_relocate.insert(
+            file.fid.clone(),
+            PendingRelocate {
+                fid: file.fid.clone(),
+                name: file.file_name.clone(),
+                size: file.size,
+                content_hash: file.content_hash.clone(),
+                from_path: path.to_string(),
+                deleted_ms: Self::now_ms(),
+            },
+        );
+    }
+
+    /// 上传前认领「刚被删的同名同大小」文件，改走网盘内移动。
+    fn take_pending_relocate(
+        &self,
+        name: &str,
+        size: u64,
+        local_sha1: &str,
+        local_md5: &str,
+    ) -> Option<PendingRelocate> {
+        self.expire_pending_relocate();
+        if size < RELOCATE_MIN_SIZE {
+            return None;
+        }
+        let mut candidates: Vec<(String, PendingRelocate)> = self
+            .pending_relocate
+            .iter()
+            .filter(|e| file_names_equal(&e.name, name) && e.size == size)
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        // 有 hash 且对得上优先；否则取最近删除的。
+        candidates.sort_by(|a, b| b.1.deleted_ms.cmp(&a.1.deleted_ms));
+        let picked = candidates
+            .iter()
+            .find(|(_, p)| {
+                p.content_hash
+                    .as_deref()
+                    .map(|h| hash_matches(Some(h), local_sha1, local_md5))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .or_else(|| candidates.first().cloned());
+        let Some((fid, pending)) = picked else {
+            return None;
+        };
+        self.pending_relocate.remove(&fid)?;
+        Some(pending)
     }
 
     /// 记下 PUT 上的客户端 mtime，供列表和上传预创建使用。
@@ -500,6 +635,10 @@ impl QuarkDriveFileSystem {
             let file = self.dir_cache.get_or_insert(&parent_str).await.and_then(|files| {
                 for file in &files {
                     if file_names_equal(&file.file_name, &file_name) {
+                        // 对客户端已删、实际还在夸克等搬家的条目，PROPFIND 当不存在。
+                        if self.is_pending_relocate_fid(&file.fid) {
+                            return None;
+                        }
                         return Some(file.clone());
                     }
                 }
@@ -517,6 +656,9 @@ impl QuarkDriveFileSystem {
 
     async fn get_file(&self, path: PathBuf) -> Result<Option<QuarkFile>, FsError> {
         if let Some(file) = self.find_in_cache(&path).await? {
+            if self.is_pending_relocate_fid(&file.fid) {
+                return Ok(None);
+            }
             trace!(path = %path.display(), file_id = %file.fid, "file found in cache");
             return Ok(Some(file));
         }
@@ -706,6 +848,9 @@ impl DavFileSystem for QuarkDriveFileSystem {
             let mut v: Vec<Result<Box<dyn DavDirEntry>, FsError>> =
                 Vec::with_capacity(files.len());
             for mut file in files {
+                if self.is_pending_relocate_fid(&file.fid) {
+                    continue;
+                }
                 self.apply_client_mtime(&mut file);
                 v.push(Ok(Box::new(file)));
             }
@@ -816,13 +961,20 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     return Ok(());
                 }
                 self.dir_cache.invalidate(parent_path).await;
-                self.drive
-                    .create_folder(&parent_file.fid, &name)
-                    .await
-                    .map_err(|err| {
+                let mode = self.drive_mode();
+                let path_str = path.display().to_string();
+                match self.drive.create_folder(&parent_file.fid, &name).await {
+                    Ok(()) => {
+                        self.oplog.log_mkdir(&path_str, mode, "ok").await;
+                    }
+                    Err(err) => {
                         error!(path = %path.display(), error = %err, "create folder failed");
-                        FsError::GeneralFailure
-                    })?;
+                        self.oplog
+                            .log_mkdir(&path_str, mode, &format!("error:{err:#}"))
+                            .await;
+                        return Err(FsError::GeneralFailure);
+                    }
+                }
                 // sleep 1s for quark server to update cache
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 self.dir_cache.invalidate(&path).await;
@@ -893,6 +1045,15 @@ impl DavFileSystem for QuarkDriveFileSystem {
             }
             let mode = self.drive_mode();
             let path_str = path.display().to_string();
+            // CloudSync 跨目录「移动」= 先删再整文件上传。大文件先挂起删除，后面同名同大小 PUT 时改 move。
+            if file.size >= RELOCATE_MIN_SIZE {
+                self.note_pending_relocate(&file, &path_str);
+                self.oplog
+                    .log_delete(&path_str, false, mode, "ok:pending_move")
+                    .await;
+                self.dir_cache.invalidate_parent(&path).await;
+                return Ok(());
+            }
             match self.drive.remove_file(&file.fid, !self.no_trash).await {
                 Ok(()) => {
                     self.oplog
@@ -931,7 +1092,11 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 return Err(FsError::Forbidden);
             }
 
+            let mode = self.drive_mode();
+            let from_str = from.display().to_string();
+            let to_str = to.display().to_string();
             let is_dir;
+            let size_for_log;
             if from.parent() == to.parent() {
                 // rename
                 if let Some(name) = to.file_name() {
@@ -940,14 +1105,22 @@ impl DavFileSystem for QuarkDriveFileSystem {
                         .await?
                         .ok_or(FsError::NotFound)?;
                     is_dir = file.dir;
+                    size_for_log = if file.file { Some(file.size) } else { None };
                     let name = name.to_string_lossy().into_owned();
-                    self.drive
-                        .rename_file(&file.fid, &name)
-                        .await
-                        .map_err(|err| {
+                    match self.drive.rename_file(&file.fid, &name).await {
+                        Ok(()) => {
+                            self.oplog
+                                .log_rename(&from_str, &to_str, mode, "ok")
+                                .await;
+                        }
+                        Err(err) => {
                             error!(from = %from.display(), to = %to.display(), error = %err, "rename file failed");
-                            FsError::GeneralFailure
-                        })?;
+                            self.oplog
+                                .log_rename(&from_str, &to_str, mode, &format!("error:{err:#}"))
+                                .await;
+                            return Err(FsError::GeneralFailure);
+                        }
+                    }
                     // sleep 1s for quark server to update cache
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     self.dir_cache.invalidate_parent(&from).await;
@@ -961,38 +1134,46 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     .await?
                     .ok_or(FsError::NotFound)?;
                 is_dir = file.dir;
+                size_for_log = if file.file { Some(file.size) } else { None };
                 let to_parent_file = self
                     .get_file(to.parent().unwrap().to_path_buf())
                     .await?
                     .ok_or(FsError::NotFound)?;
                 let new_name = to_dav.file_name();
-                self.drive
-                    .move_file(&file.fid, &to_parent_file.fid)
-                    // then rename ...
-                    .await
-                    .map_err(|err| {
-                        error!(from = %from.display(), to = %to.display(), error = %err, "move file failed");
-                        FsError::GeneralFailure
-                    })?;
+                if let Err(err) = self.drive.move_file(&file.fid, &to_parent_file.fid).await {
+                    error!(from = %from.display(), to = %to.display(), error = %err, "move file failed");
+                    self.oplog
+                        .log_move(&from_str, &to_str, size_for_log, mode, &format!("error:{err:#}"))
+                        .await;
+                    return Err(FsError::GeneralFailure);
+                }
                 if let Some(to_name) = new_name {
-                    if let Some(from_name) = from_dav.file_name(){
+                    if let Some(from_name) = from_dav.file_name() {
                         if from_name != to_name {
-                            self.drive.rename_file(&file.fid, to_name)
-                                .await
-                                .map_err(|err| {
-                                    error!(from = %from.display(), to = %to.display(), error = %err, "rename file after move failed");
-                                    FsError::GeneralFailure
-                                })?;
+                            if let Err(err) = self.drive.rename_file(&file.fid, to_name).await {
+                                error!(from = %from.display(), to = %to.display(), error = %err, "rename file after move failed");
+                                self.oplog
+                                    .log_move(
+                                        &from_str,
+                                        &to_str,
+                                        size_for_log,
+                                        mode,
+                                        &format!("error:rename:{err:#}"),
+                                    )
+                                    .await;
+                                return Err(FsError::GeneralFailure);
+                            }
                         }
                     }
                 }
+                self.oplog
+                    .log_move(&from_str, &to_str, size_for_log, mode, "ok")
+                    .await;
                 // sleep 1s for quark server to update cache
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 self.dir_cache.invalidate_parent(&from).await;
                 self.dir_cache.invalidate_parent(&to).await;
-
             }
-
 
             // sleep 1s for quark server to update cache
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1001,6 +1182,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
             }
             self.dir_cache.invalidate_parent(&from).await;
             self.dir_cache.invalidate_parent(&to).await;
+            let _ = size_for_log;
             Ok(())
         }
             .boxed()
@@ -1358,6 +1540,65 @@ impl QuarkDavFile {
         let sha1 = format!("{:x}", self.sha1_ctx.clone().finalize());
         let md5 = format!("{:x}", self.md5_ctx.clone().compute());
         let local_mtime_ms = self.fs.client_mtime_ms(&self.upload_log_path()).unwrap_or(0);
+
+        // CloudSync 跨目录移动：刚才删的大文件同名同大小再 PUT → 网盘内 move，不重传 11GB。
+        if let Some(pending) =
+            self.fs
+                .take_pending_relocate(&self.file.file_name, size, &sha1, &md5)
+        {
+            let to_path = self.upload_log_path();
+            let mode = self.fs.drive_mode();
+            match self
+                .fs
+                .drive
+                .move_file(&pending.fid, &self.parent_file_id)
+                .await
+            {
+                Ok(()) => {
+                    info!(
+                        from = %pending.from_path,
+                        to = %to_path,
+                        fid = %pending.fid,
+                        size,
+                        "relocated deferred delete instead of re-upload"
+                    );
+                    self.file.fid = pending.fid;
+                    if let Some(old_parent) = Path::new(&pending.from_path).parent() {
+                        self.fs.dir_cache.invalidate(old_parent).await;
+                    }
+                    self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
+                    self.fs
+                        .oplog
+                        .log_move(
+                            &pending.from_path,
+                            &to_path,
+                            Some(size),
+                            mode,
+                            "ok:relocated",
+                        )
+                        .await;
+                    self.fs
+                        .upload_tracker
+                        .finish(&to_path, "ok", "ok:relocated");
+                    self.upload_state.is_finished = true;
+                    self.after_flush(true).await?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        from = %pending.from_path,
+                        to = %to_path,
+                        error = %err,
+                        "relocate failed; fall back to upload and delete old fid"
+                    );
+                    let _ = self
+                        .fs
+                        .drive
+                        .remove_file(&pending.fid, !self.fs.no_trash)
+                        .await;
+                }
+            }
+        }
 
         // 占位没有 fid。先认领网盘上已有的同名文件，避免再传出第二份。
         self.bind_existing_remote().await;

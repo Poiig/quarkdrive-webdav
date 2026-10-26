@@ -712,13 +712,18 @@ impl QuarkDriveWebDav {
                     ),
                 };
             }
-            let kind = params.get("kind").map(|s| s.as_str()).unwrap_or("upload");
+            let kind = params.get("kind").map(|s| s.as_str()).unwrap_or("all");
             let result = params.get("result").map(|s| s.as_str()).unwrap_or("all");
             let q = params.get("q").map(|s| s.as_str());
             let limit = params
                 .get("limit")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(100usize);
+                .unwrap_or(50usize)
+                .clamp(1, 200);
+            let offset = params
+                .get("offset")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0usize);
             // date=YYYY-MM-DD：只看某一天；since_mins=N：最近 N 分钟（与 date 互斥，date 优先）。
             let date = params
                 .get("date")
@@ -736,11 +741,12 @@ impl QuarkDriveWebDav {
                         crate::util::now_shanghai() - chrono::Duration::minutes(mins)
                     })
             };
-            let entries = self
+            let page = self
                 .fs
                 .oplog()
                 .list_entries(
                     limit,
+                    offset,
                     Some(kind),
                     Some(result),
                     q.filter(|s| !s.is_empty()),
@@ -748,7 +754,8 @@ impl QuarkDriveWebDav {
                     since,
                 )
                 .await;
-            let list: Vec<serde_json::Value> = entries
+            let list: Vec<serde_json::Value> = page
+                .entries
                 .iter()
                 .map(|e| {
                     serde_json::json!({
@@ -760,7 +767,12 @@ impl QuarkDriveWebDav {
                     })
                 })
                 .collect();
-            return json_response(serde_json::json!({ "entries": list }));
+            return json_response(serde_json::json!({
+                "entries": list,
+                "total": page.total,
+                "limit": limit,
+                "offset": offset,
+            }));
         }
 
         if path == "/__history" {
@@ -954,23 +966,33 @@ fn console_float_css() -> &'static str {
 .qd-range .qd-range-date input[type=date]{
   padding:5px 8px;border:1px solid var(--line);font:inherit;font-size:12px;background:#fff;color:var(--ink);
 }
-.qd-modal-bd{overflow:auto;padding:8px 20px 24px;flex:1}
+.qd-modal-bd{overflow:auto;padding:8px 20px 12px;flex:1;min-height:0}
 .qd-modal table{width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed}
 .qd-modal th,.qd-modal td{
-  padding:10px 12px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:middle;
+  padding:10px 10px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:middle;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-.qd-modal th:nth-child(1),.qd-modal td:nth-child(1){width:9.6em;padding-left:8px;white-space:nowrap;font-variant-numeric:tabular-nums}
-.qd-modal th:nth-child(2),.qd-modal td:nth-child(2){width:3.2em;white-space:nowrap}
-.qd-modal th:nth-child(3),.qd-modal td:nth-child(3){width:22%}
-.qd-modal th:nth-child(4),.qd-modal td:nth-child(4){width:5.2em;white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums}
+.qd-modal th:nth-child(1),.qd-modal td:nth-child(1){width:11.8em;padding-left:8px;font-variant-numeric:tabular-nums}
+.qd-modal th:nth-child(2),.qd-modal td:nth-child(2){width:4.2em}
+.qd-modal th:nth-child(3),.qd-modal td:nth-child(3){width:16%}
+.qd-modal th:nth-child(4),.qd-modal td:nth-child(4){width:5.4em;text-align:right;font-variant-numeric:tabular-nums}
 .qd-modal th:nth-child(5),.qd-modal td:nth-child(5){width:auto;padding-right:8px}
 .qd-modal th{color:var(--muted);font-weight:600;background:#fff;position:sticky;top:0;z-index:1}
-/* 路径/结果单行省略，避免窄列里逐字换行撑出超高行 */
-.qd-modal .path,.qd-modal .res{
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);max-width:100%;
-}
+.qd-modal .path,.qd-modal .res{color:var(--ink)}
 .qd-modal .ok{color:var(--ok)} .qd-modal .bad{color:var(--bad)}
-.qd-modal .empty-row td{text-align:center;color:var(--muted);padding:36px 16px;white-space:normal}
+.qd-modal .empty-row td{text-align:center;color:var(--muted);padding:36px 16px;white-space:normal;overflow:visible}
+.qd-pager{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  padding:10px 20px 16px;border-top:1px solid var(--line);background:#fff;
+}
+.qd-pager .meta{font-size:12px;color:var(--muted)}
+.qd-pager .nav{display:flex;align-items:center;gap:8px}
+.qd-pager button{
+  appearance:none;border:1px solid var(--line);background:#fff;color:var(--ink);
+  font:inherit;font-size:12px;padding:6px 12px;cursor:pointer;
+}
+.qd-pager button:disabled{opacity:.4;cursor:default}
+.qd-pager button:not(:disabled):hover{border-color:var(--accent);color:var(--accent)}
 .qd-item.is-done .pct{color:var(--muted);font-weight:600}
 .qd-item.is-done .qd-bar>i{background:#94a3b8}
 .qd-float-sec{
@@ -1010,7 +1032,7 @@ fn console_float_html() -> &'static str {
       <button type="button" id="qdHistClose">关闭</button>
     </div>
     <div class="qd-modal-tools">
-      <label>类型<select id="qdHistKind"><option value="upload">上传</option><option value="delete">删除</option><option value="all">全部</option></select></label>
+      <label>类型<select id="qdHistKind"><option value="all">全部</option><option value="upload">上传</option><option value="delete">删除</option><option value="mkdir">建目录</option><option value="rename">重命名</option><option value="move">移动</option></select></label>
       <label>结果<select id="qdHistResult"><option value="all">全部</option><option value="ok">成功</option><option value="error">失败</option></select></label>
       <label class="grow">搜索<input id="qdHistQ" placeholder="路径或结果关键词" autocomplete="off"/></label>
       <div class="btns">
@@ -1027,6 +1049,13 @@ fn console_float_html() -> &'static str {
       <span class="qd-range-date"><label for="qdHistDate">按日</label><input type="date" id="qdHistDate"/></span>
     </div>
     <div class="qd-modal-bd"><table><thead><tr><th>时间</th><th>类型</th><th>结果</th><th>大小</th><th>路径</th></tr></thead><tbody id="qdHistBody"></tbody></table></div>
+    <div class="qd-pager">
+      <span class="meta" id="qdHistMeta">—</span>
+      <div class="nav">
+        <button type="button" id="qdHistPrev">上一页</button>
+        <button type="button" id="qdHistNext">下一页</button>
+      </div>
+    </div>
   </div>
 </div>
 <script>
@@ -1282,7 +1311,14 @@ fn console_float_html() -> &'static str {
   const histBody=document.getElementById("qdHistBody");
   const histRange=document.getElementById("qdHistRange");
   const histDate=document.getElementById("qdHistDate");
+  const histMeta=document.getElementById("qdHistMeta");
+  const histPrev=document.getElementById("qdHistPrev");
+  const histNext=document.getElementById("qdHistNext");
+  const KIND_LABEL={upload:"上传",delete:"删除",mkdir:"建目录",rename:"重命名",move:"移动"};
+  const PAGE_SIZE=50;
   let rangeMode="all";
+  let histPage=0;
+  let histTotal=0;
   function shanghaiYmd(d){
     // en-CA → YYYY-MM-DD；用上海时区日历日，与日志文件名一致。
     return new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Shanghai",year:"numeric",month:"2-digit",day:"2-digit"}).format(d);
@@ -1297,7 +1333,7 @@ fn console_float_html() -> &'static str {
       btn.classList.toggle("on", btn.dataset.range===rangeMode);
     });
   }
-  function openHist(){ modal.classList.add("open"); loadHist(); }
+  function openHist(){ modal.classList.add("open"); histPage=0; loadHist(); }
   function closeHist(){ modal.classList.remove("open"); }
   document.querySelectorAll("[data-qd-history]").forEach(el=>el.addEventListener("click",e=>{e.preventDefault();openHist();}));
   document.getElementById("qdHistClose").addEventListener("click",closeHist);
@@ -1309,22 +1345,39 @@ fn console_float_html() -> &'static str {
     if(!btn) return;
     rangeMode=btn.dataset.range;
     histDate.value="";
+    histPage=0;
     setRangeButtons();
     loadHist();
   });
   histDate.addEventListener("change",()=>{
     if(histDate.value){
       rangeMode="date";
+      histPage=0;
       setRangeButtons();
       loadHist();
     }
   });
 
+  function updatePager(){
+    const pages=Math.max(1, Math.ceil(histTotal/PAGE_SIZE)||1);
+    const from=histTotal===0?0:(histPage*PAGE_SIZE+1);
+    const to=Math.min(histTotal,(histPage+1)*PAGE_SIZE);
+    histMeta.textContent=histTotal===0
+      ?"没有匹配记录"
+      :(`第 ${from}–${to} 条 · 共 ${histTotal} 条 · 第 ${histPage+1}/${pages} 页`);
+    histPrev.disabled=histPage<=0;
+    histNext.disabled=(histPage+1)*PAGE_SIZE>=histTotal;
+  }
+
   async function loadHist(){
     const kind=document.getElementById("qdHistKind").value;
     const result=document.getElementById("qdHistResult").value;
     const q=document.getElementById("qdHistQ").value.trim();
-    const qs=new URLSearchParams({kind,result,limit:"200"});
+    const qs=new URLSearchParams({
+      kind,result,
+      limit:String(PAGE_SIZE),
+      offset:String(histPage*PAGE_SIZE),
+    });
     if(q) qs.set("q",q);
     if(rangeMode==="15m") qs.set("since_mins","15");
     else if(rangeMode==="60m") qs.set("since_mins","60");
@@ -1332,25 +1385,39 @@ fn console_float_html() -> &'static str {
     else if(rangeMode==="yesterday") qs.set("date",shiftYmd(shanghaiYmd(new Date()),-1));
     else if(rangeMode==="date" && histDate.value) qs.set("date",histDate.value);
     histBody.innerHTML='<tr class="empty-row"><td colspan="5">加载中…</td></tr>';
+    histMeta.textContent="加载中…";
+    histPrev.disabled=true; histNext.disabled=true;
     try{
       const r=await fetch("/__history.json?"+qs.toString(),{credentials:"same-origin",headers:{Accept:"application/json"}});
       const data=await r.json();
       const rows=data.entries||[];
+      histTotal=Number(data.total)||rows.length;
+      if(histPage>0 && rows.length===0 && histTotal>0){
+        histPage=Math.max(0, Math.ceil(histTotal/PAGE_SIZE)-1);
+        return loadHist();
+      }
+      updatePager();
       if(!rows.length){ histBody.innerHTML='<tr class="empty-row"><td colspan="5">没有匹配记录</td></tr>'; return; }
       histBody.innerHTML=rows.map(e=>{
         const rc=String(e.result||"").startsWith("error")?"bad":"ok";
         const res=String(e.result||"");
         const path=String(e.path||"");
-        return `<tr><td>${esc(e.time)}</td><td>${esc(e.kind)}</td><td class="res ${rc}" title="${esc(res)}">${esc(res)}</td><td>${esc(e.size)}</td><td class="path" title="${esc(path)}">${esc(path)}</td></tr>`;
+        const kindLabel=KIND_LABEL[e.kind]||e.kind;
+        return `<tr><td title="${esc(e.time)}">${esc(e.time)}</td><td title="${esc(kindLabel)}">${esc(kindLabel)}</td><td class="res ${rc}" title="${esc(res)}">${esc(res)}</td><td title="${esc(e.size)}">${esc(e.size||"—")}</td><td class="path" title="${esc(path)}">${esc(path)}</td></tr>`;
       }).join("");
     }catch(err){
+      histTotal=0;
+      updatePager();
       histBody.innerHTML=`<tr class="empty-row"><td colspan="5" class="bad">加载失败：${esc(err)}</td></tr>`;
     }
   }
-  document.getElementById("qdHistReload").addEventListener("click",loadHist);
-  document.getElementById("qdHistQ").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); loadHist(); }});
-  document.getElementById("qdHistKind").addEventListener("change",loadHist);
-  document.getElementById("qdHistResult").addEventListener("change",loadHist);
+  function resetAndLoad(){ histPage=0; loadHist(); }
+  document.getElementById("qdHistReload").addEventListener("click",resetAndLoad);
+  document.getElementById("qdHistQ").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); resetAndLoad(); }});
+  document.getElementById("qdHistKind").addEventListener("change",resetAndLoad);
+  document.getElementById("qdHistResult").addEventListener("change",resetAndLoad);
+  histPrev.addEventListener("click",()=>{ if(histPage>0){ histPage--; loadHist(); }});
+  histNext.addEventListener("click",()=>{ if((histPage+1)*PAGE_SIZE<histTotal){ histPage++; loadHist(); }});
   document.getElementById("qdHistClear").addEventListener("click",async()=>{
     if(!confirm("确认清除操作日志？不可恢复")) return;
     const date=prompt("只清除某一天？留空=全部（YYYY-MM-DD）","")||"";
@@ -1358,7 +1425,7 @@ fn console_float_html() -> &'static str {
     if(date.trim()) qs.set("date",date.trim());
     const r=await fetch("/__history.json?"+qs.toString(),{credentials:"same-origin",headers:{Accept:"application/json"}});
     const data=await r.json();
-    if(data.error) alert(data.error); else { alert("已清除 "+(data.cleared||0)+" 个日志文件"); loadHist(); }
+    if(data.error) alert(data.error); else { alert("已清除 "+(data.cleared||0)+" 个日志文件"); resetAndLoad(); }
   });
 })();
 </script>

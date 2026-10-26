@@ -1,4 +1,4 @@
-//! 上传 / 删除操作审计日志：写文件，同时打到 stdout（Docker / 群晖控制台可见）。
+//! 上传 / 删除 / 建目录 / 重命名 / 移动 操作审计日志：写文件，同时打到 stdout。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +22,13 @@ pub struct OpLogEntry {
     pub path: String,
     pub raw: String,
     pub file: String,
+}
+
+/// 分页结果：entries 是当前页，total 是筛选后的总条数。
+#[derive(Debug, Clone)]
+pub struct OpLogPage {
+    pub entries: Vec<OpLogEntry>,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +79,36 @@ impl OpLog {
         let kind = if is_dir { "dir" } else { "file" };
         self.write_line(&format!(
             "delete result={result} mode={mode} kind={kind} path={path}"
+        ))
+        .await;
+    }
+
+    pub async fn log_mkdir(&self, path: &str, mode: &str, result: &str) {
+        self.write_line(&format!("mkdir result={result} mode={mode} path={path}"))
+            .await;
+    }
+
+    pub async fn log_rename(&self, from: &str, to: &str, mode: &str, result: &str) {
+        self.write_line(&format!(
+            "rename result={result} mode={mode} from={from} to={to} path={to}"
+        ))
+        .await;
+    }
+
+    pub async fn log_move(
+        &self,
+        from: &str,
+        to: &str,
+        size: Option<u64>,
+        mode: &str,
+        result: &str,
+    ) {
+        let size_part = match size {
+            Some(n) => format!(" size={}", format_bytes(n)),
+            None => String::new(),
+        };
+        self.write_line(&format!(
+            "move result={result} mode={mode}{size_part} from={from} to={to} path={to}"
         ))
         .await;
     }
@@ -136,20 +173,22 @@ impl OpLog {
         }
     }
 
-    /// 读取近期操作日志（新→旧），供 Web 历史页筛选。
+    /// 读取近期操作日志（新→旧），供 Web 历史页筛选与分页。
     ///
-    /// - `date`：只看某一天（`YYYY-MM-DD`，按文件名与行内时间）
+    /// - `date`：只看某一天（`YYYY-MM-DD`）
     /// - `since`：只看不早于该时刻的记录（Asia/Shanghai）
+    /// - `offset` / `limit`：分页；`total` 为筛选后的总条数
     pub async fn list_entries(
         &self,
         limit: usize,
+        offset: usize,
         kind_filter: Option<&str>,
         result_filter: Option<&str>,
         path_query: Option<&str>,
         date: Option<NaiveDate>,
         since: Option<DateTime<FixedOffset>>,
-    ) -> Vec<OpLogEntry> {
-        let limit = limit.clamp(1, 2000);
+    ) -> OpLogPage {
+        let limit = limit.clamp(1, 500);
         let mut files = list_op_log_files(&self.dir).await;
         // 新日期在前。
         files.sort_by(|a, b| b.1.cmp(&a.1));
@@ -159,7 +198,8 @@ impl OpLog {
             let since_day = since_dt.date_naive();
             files.retain(|(_, file_date, _)| *file_date >= since_day);
         }
-        let mut out = Vec::new();
+
+        let mut matched = Vec::new();
         for (path, _date, name) in files {
             let Ok(file) = fs::File::open(&path).await else {
                 continue;
@@ -176,51 +216,23 @@ impl OpLog {
                 let Some(entry) = parse_op_line(&line, &name) else {
                     continue;
                 };
-                if let Some(d) = date {
-                    if entry_date(&entry) != Some(d) {
-                        continue;
-                    }
+                if !entry_matches(
+                    &entry,
+                    kind_filter,
+                    result_filter,
+                    path_query,
+                    date,
+                    since,
+                ) {
+                    continue;
                 }
-                if let Some(since_dt) = since {
-                    match entry_datetime(&entry) {
-                        Some(t) if t >= since_dt => {}
-                        _ => continue,
-                    }
-                }
-                if let Some(k) = kind_filter {
-                    if k != "all" && entry.kind != k {
-                        continue;
-                    }
-                }
-                if let Some(r) = result_filter {
-                    if r != "all" {
-                        let okish = entry.result == "ok"
-                            || entry.result.starts_with("ok:")
-                            || entry.result == "skip"
-                            || entry.result.starts_with("skip:");
-                        match r {
-                            "ok" if !okish => continue,
-                            "error" if okish => continue,
-                            _ => {}
-                        }
-                    }
-                }
-                if let Some(q) = path_query {
-                    let q = q.trim();
-                    if !q.is_empty()
-                        && !entry.path.to_ascii_lowercase().contains(&q.to_ascii_lowercase())
-                        && !entry.result.to_ascii_lowercase().contains(&q.to_ascii_lowercase())
-                    {
-                        continue;
-                    }
-                }
-                out.push(entry);
-                if out.len() >= limit {
-                    return out;
-                }
+                matched.push(entry);
             }
         }
-        out
+
+        let total = matched.len();
+        let entries = matched.into_iter().skip(offset).take(limit).collect();
+        OpLogPage { entries, total }
     }
 
     /// 清除日志：`date=YYYY-MM-DD` 删单日，否则删目录下全部 op-*.log。
@@ -247,6 +259,61 @@ impl OpLog {
         }
         Ok(n)
     }
+}
+
+fn entry_matches(
+    entry: &OpLogEntry,
+    kind_filter: Option<&str>,
+    result_filter: Option<&str>,
+    path_query: Option<&str>,
+    date: Option<NaiveDate>,
+    since: Option<DateTime<FixedOffset>>,
+) -> bool {
+    if let Some(d) = date {
+        if entry_date(entry) != Some(d) {
+            return false;
+        }
+    }
+    if let Some(since_dt) = since {
+        match entry_datetime(entry) {
+            Some(t) if t >= since_dt => {}
+            _ => return false,
+        }
+    }
+    if let Some(k) = kind_filter {
+        if k != "all" && entry.kind != k {
+            return false;
+        }
+    }
+    if let Some(r) = result_filter {
+        if r != "all" {
+            let okish = entry.result == "ok"
+                || entry.result.starts_with("ok:")
+                || entry.result == "skip"
+                || entry.result.starts_with("skip:");
+            match r {
+                "ok" if !okish => return false,
+                "error" if okish => return false,
+                _ => {}
+            }
+        }
+    }
+    if let Some(q) = path_query {
+        let q = q.trim();
+        if !q.is_empty() {
+            let q = q.to_ascii_lowercase();
+            let hay = format!(
+                "{} {} {}",
+                entry.path.to_ascii_lowercase(),
+                entry.result.to_ascii_lowercase(),
+                entry.kind.to_ascii_lowercase()
+            );
+            if !hay.contains(&q) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// 枚举 `op-YYYY-MM-DD.log`。
@@ -278,11 +345,19 @@ fn capture_field(body: &str, key: &str) -> String {
         return String::new();
     };
     let rest = &body[start + pat.len()..];
-    let end = [" result=", " mode=", " size=", " path=", " kind="]
-        .iter()
-        .filter_map(|marker| rest.find(marker))
-        .min()
-        .unwrap_or(rest.len());
+    let end = [
+        " result=",
+        " mode=",
+        " size=",
+        " path=",
+        " kind=",
+        " from=",
+        " to=",
+    ]
+    .iter()
+    .filter_map(|marker| rest.find(marker))
+    .min()
+    .unwrap_or(rest.len());
     rest[..end].trim().to_string()
 }
 
@@ -297,36 +372,56 @@ fn entry_date(entry: &OpLogEntry) -> Option<NaiveDate> {
     entry_datetime(entry).map(|t| t.date_naive())
 }
 
-/// 解析一行控制台/文件日志。格式：`时间 upload|delete ...`
+const OP_KINDS: &[&str] = &["upload", "delete", "mkdir", "rename", "move"];
+
+/// 解析一行控制台/文件日志。格式：`时间 upload|delete|mkdir|rename|move ...`
 fn parse_op_line(line: &str, file: &str) -> Option<OpLogEntry> {
     // 新：`2026-10-24 14:22:15 upload result=ok ...`
     // 旧：`2026-10-24 14:22:15 +0800 upload result=ok ...`（兼容）
     let rest = line.trim();
-    let (time, body) = if let Some(i) = rest.find(" upload ") {
-        (&rest[..i], &rest[i + 1..])
-    } else if let Some(i) = rest.find(" delete ") {
-        (&rest[..i], &rest[i + 1..])
-    } else {
-        return None;
+    let mut found: Option<(usize, &str)> = None;
+    for kind in OP_KINDS {
+        let needle = format!(" {kind} ");
+        if let Some(i) = rest.find(&needle) {
+            if found.map(|(pos, _)| i < pos).unwrap_or(true) {
+                found = Some((i, kind));
+            }
+        }
+    }
+    let (time, body, kind) = match found {
+        Some((i, kind)) => (&rest[..i], &rest[i + 1..], kind),
+        None => return None,
     };
     let time = time
         .trim()
         .trim_end_matches("+0800")
         .trim_end_matches("UTC+8")
         .trim();
-    let kind = if body.starts_with("upload ") {
-        "upload"
-    } else if body.starts_with("delete ") {
-        "delete"
-    } else {
+    if !body.starts_with(&format!("{kind} ")) {
         return None;
-    };
+    }
     // result 里会有空格（「上传分片 12 失败: HTTP 504」）。按下一个字段名截断，
     // 不能按空白切，否则历史里只剩「error:上传分片」。
     let result = capture_field(body, "result");
     let mode = capture_field(body, "mode");
     let size = capture_field(body, "size");
-    let path = capture_field(body, "path");
+    let path = {
+        let p = capture_field(body, "path");
+        if !p.is_empty() {
+            p
+        } else {
+            // 移动/重命名优先展示 to，没有 path 字段时拼 from → to。
+            let from = capture_field(body, "from");
+            let to = capture_field(body, "to");
+            if !from.is_empty() && !to.is_empty() {
+                format!("{from} → {to}")
+            } else if !to.is_empty() {
+                to
+            } else {
+                from
+            }
+        }
+    };
     if result.is_empty() {
         return None;
     }
@@ -379,6 +474,41 @@ mod tests {
         assert_eq!(e.mode, "open");
         assert_eq!(e.size, "11.5 GB");
         assert_eq!(e.path, "/我的备份/a.MOV");
+    }
+
+    #[test]
+    fn parse_mkdir_delete_move_rename() {
+        let mkdir = parse_op_line(
+            "2026-10-26 12:00:00 mkdir result=ok mode=open path=/我的备份/新目录",
+            "op-2026-10-26.log",
+        )
+        .unwrap();
+        assert_eq!(mkdir.kind, "mkdir");
+        assert_eq!(mkdir.path, "/我的备份/新目录");
+
+        let del = parse_op_line(
+            "2026-10-26 12:00:01 delete result=ok mode=open kind=file path=/a/b.MOV",
+            "op-2026-10-26.log",
+        )
+        .unwrap();
+        assert_eq!(del.kind, "delete");
+
+        let mv = parse_op_line(
+            "2026-10-26 12:00:02 move result=ok:relocated mode=open size=11.5 GB from=/old/a.MOV to=/new/a.MOV path=/new/a.MOV",
+            "op-2026-10-26.log",
+        )
+        .unwrap();
+        assert_eq!(mv.kind, "move");
+        assert_eq!(mv.path, "/new/a.MOV");
+        assert_eq!(mv.size, "11.5 GB");
+
+        let rn = parse_op_line(
+            "2026-10-26 12:00:03 rename result=ok mode=open from=/a/x.txt to=/a/y.txt path=/a/y.txt",
+            "op-2026-10-26.log",
+        )
+        .unwrap();
+        assert_eq!(rn.kind, "rename");
+        assert_eq!(rn.path, "/a/y.txt");
     }
 
     #[test]
