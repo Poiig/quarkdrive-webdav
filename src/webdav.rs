@@ -925,7 +925,7 @@ fn console_float_css() -> &'static str {
 }
 .qd-modal.open{display:flex}
 .qd-modal-card{
-  width:min(1040px,100%);max-height:min(82vh,740px);background:#fff;border:1px solid var(--line);
+  width:min(1120px,100%);max-height:min(82vh,740px);background:#fff;border:1px solid var(--line);
   display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.25);
 }
 .qd-modal-hd{
@@ -966,24 +966,31 @@ fn console_float_css() -> &'static str {
 .qd-range .qd-range-date input[type=date]{
   padding:5px 8px;border:1px solid var(--line);font:inherit;font-size:12px;background:#fff;color:var(--ink);
 }
-.qd-modal-bd{overflow:auto;padding:8px 20px 12px;flex:1;min-height:0}
+.qd-modal-bd{overflow:auto;padding:8px 16px 12px;flex:1;min-height:0}
 .qd-modal table{width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed}
+.qd-modal col.c-time{width:9.6em}
+.qd-modal col.c-kind{width:4.6em}
+.qd-modal col.c-res{width:8.5em}
+.qd-modal col.c-size{width:6.2em}
+.qd-modal col.c-path{width:auto}
 .qd-modal th,.qd-modal td{
-  padding:10px 10px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:middle;
+  padding:9px 8px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:middle;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-.qd-modal th:nth-child(1),.qd-modal td:nth-child(1){width:11.8em;padding-left:8px;font-variant-numeric:tabular-nums}
-.qd-modal th:nth-child(2),.qd-modal td:nth-child(2){width:4.2em}
-.qd-modal th:nth-child(3),.qd-modal td:nth-child(3){width:16%}
-.qd-modal th:nth-child(4),.qd-modal td:nth-child(4){width:5.4em;text-align:right;font-variant-numeric:tabular-nums}
-.qd-modal th:nth-child(5),.qd-modal td:nth-child(5){width:auto;padding-right:8px}
+.qd-modal th:nth-child(1),.qd-modal td:nth-child(1){
+  padding-left:6px;font-variant-numeric:tabular-nums;letter-spacing:-0.01em;
+}
+.qd-modal th:nth-child(4),.qd-modal td:nth-child(4){
+  text-align:right;font-variant-numeric:tabular-nums;padding-right:10px;
+}
+.qd-modal th:nth-child(5),.qd-modal td:nth-child(5){padding-right:6px}
 .qd-modal th{color:var(--muted);font-weight:600;background:#fff;position:sticky;top:0;z-index:1}
 .qd-modal .path,.qd-modal .res{color:var(--ink)}
 .qd-modal .ok{color:var(--ok)} .qd-modal .bad{color:var(--bad)}
 .qd-modal .empty-row td{text-align:center;color:var(--muted);padding:36px 16px;white-space:normal;overflow:visible}
 .qd-pager{
   display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
-  padding:10px 20px 16px;border-top:1px solid var(--line);background:#fff;
+  padding:10px 16px 16px;border-top:1px solid var(--line);background:#fff;
 }
 .qd-pager .meta{font-size:12px;color:var(--muted)}
 .qd-pager .nav{display:flex;align-items:center;gap:8px}
@@ -1001,11 +1008,14 @@ fn console_float_css() -> &'static str {
 @media (max-width:720px){
   .qd-float{top:auto;bottom:12px;right:12px;width:min(300px,calc(100vw - 24px))}
 
-  .qd-modal{padding:16px}
-  .qd-modal-hd,.qd-modal-tools,.qd-range{padding-left:16px;padding-right:16px}
-  .qd-modal-bd{padding:4px 8px 16px}
+  .qd-modal{padding:12px}
+  .qd-modal-hd,.qd-modal-tools,.qd-range{padding-left:12px;padding-right:12px}
+  .qd-modal-bd{padding:4px 8px 12px}
   .qd-modal-tools .btns{margin-left:0;width:100%}
-  .qd-modal th:nth-child(3),.qd-modal td:nth-child(3){width:28%}
+  .qd-modal col.c-time{width:7.8em}
+  .qd-modal col.c-kind{width:4em}
+  .qd-modal col.c-res{width:6.5em}
+  .qd-modal col.c-size{width:5.6em}
 }
 "#
 }
@@ -1048,7 +1058,11 @@ fn console_float_html() -> &'static str {
       <button type="button" data-range="yesterday">昨天</button>
       <span class="qd-range-date"><label for="qdHistDate">按日</label><input type="date" id="qdHistDate"/></span>
     </div>
-    <div class="qd-modal-bd"><table><thead><tr><th>时间</th><th>类型</th><th>结果</th><th>大小</th><th>路径</th></tr></thead><tbody id="qdHistBody"></tbody></table></div>
+    <div class="qd-modal-bd"><table>
+      <colgroup><col class="c-time"/><col class="c-kind"/><col class="c-res"/><col class="c-size"/><col class="c-path"/></colgroup>
+      <thead><tr><th>时间</th><th>类型</th><th>结果</th><th>大小</th><th>路径</th></tr></thead>
+      <tbody id="qdHistBody"></tbody>
+    </table></div>
     <div class="qd-pager">
       <span class="meta" id="qdHistMeta">—</span>
       <div class="nav">
@@ -1319,6 +1333,12 @@ fn console_float_html() -> &'static str {
   let rangeMode="all";
   let histPage=0;
   let histTotal=0;
+  // 表内用 MM-DD HH:mm:ss，完整时间放 title，避免时间列把路径挤没。
+  function fmtHistTime(t){
+    const s=String(t||"").trim();
+    const m=s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2}:\d{2})/);
+    return m?`${m[2]}-${m[3]} ${m[4]}`:s;
+  }
   function shanghaiYmd(d){
     // en-CA → YYYY-MM-DD；用上海时区日历日，与日志文件名一致。
     return new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Shanghai",year:"numeric",month:"2-digit",day:"2-digit"}).format(d);
@@ -1403,7 +1423,10 @@ fn console_float_html() -> &'static str {
         const res=String(e.result||"");
         const path=String(e.path||"");
         const kindLabel=KIND_LABEL[e.kind]||e.kind;
-        return `<tr><td title="${esc(e.time)}">${esc(e.time)}</td><td title="${esc(kindLabel)}">${esc(kindLabel)}</td><td class="res ${rc}" title="${esc(res)}">${esc(res)}</td><td title="${esc(e.size)}">${esc(e.size||"—")}</td><td class="path" title="${esc(path)}">${esc(path)}</td></tr>`;
+        const timeFull=String(e.time||"");
+        const timeShort=fmtHistTime(timeFull);
+        const size=String(e.size||"—");
+        return `<tr><td title="${esc(timeFull)}">${esc(timeShort)}</td><td title="${esc(kindLabel)}">${esc(kindLabel)}</td><td class="res ${rc}" title="${esc(res)}">${esc(res)}</td><td title="${esc(size)}">${esc(size)}</td><td class="path" title="${esc(path)}">${esc(path)}</td></tr>`;
       }).join("");
     }catch(err){
       histTotal=0;
