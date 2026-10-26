@@ -760,6 +760,20 @@ impl OpenClient {
                     continue;
                 }
                 let offset = idx as u64 * part_size;
+                // 慢传：路径源在流内按块限速；内存源无法边读边限，改为 PUT 前先付带宽。
+                // 切勿「先付满再流内再限」——会变成半速。
+                let throttle = if let Some(smart) = smart {
+                    if let Some((tracker, path)) = progress {
+                        tracker.set_lane(path, smart.lane().as_str());
+                    }
+                    let t = smart.throttle_bps().map(|bps| (bps, smart.fast_flag()));
+                    if t.is_some() && matches!(source, UploadSource::Memory(_)) {
+                        smart.pace_before(this_size).await;
+                    }
+                    t
+                } else {
+                    None
+                };
                 // 流式 PUT：单片可到数百 MB，整段进内存会在低配机器 OOM。
                 let put_started = std::time::Instant::now();
                 let etag = self
@@ -773,21 +787,20 @@ impl OpenClient {
                         source,
                         offset,
                         this_size,
+                        throttle.as_ref(),
                     )
                     .await
                     .with_context(|| format!("上传分片 {} 失败", idx + 1))?;
                 let put_ms = put_started.elapsed().as_millis() as u64;
                 etags[idx] = Some(etag);
                 if let Some((tracker, path)) = progress {
-                    // 用实际上传耗时算上行速度，不含后面的慢传 sleep。
+                    // 用实际上传耗时算上行速度；慢传 sleep 已在 PUT 前/流内完成。
                     tracker.add_uploaded(path, this_size, put_ms);
                 }
-                // 慢传限速放在 PUT 之后，避免把 sleep 算进速度。
                 if let Some(smart) = smart {
                     if let Some((tracker, path)) = progress {
                         tracker.set_lane(path, smart.lane().as_str());
                     }
-                    smart.pace(this_size).await;
                 }
             }
         }
@@ -888,6 +901,7 @@ impl OpenClient {
         source: &UploadSource,
         offset: u64,
         len: u64,
+        throttle: Option<&(u64, Arc<AtomicBool>)>,
     ) -> Result<String> {
         // OSS 偶发 504/502 很常见（网关超时），多试几次；每次重开文件流。
         const MAX_ATTEMPTS: u32 = 8;
@@ -896,7 +910,7 @@ impl OpenClient {
         let mut url_refreshes = 0u32;
         for attempt in 0..MAX_ATTEMPTS {
             match self
-                .upload_part(put_client, &item, headers, source, offset, len)
+                .upload_part(put_client, &item, headers, source, offset, len, throttle)
                 .await
             {
                 Ok(etag) => {
@@ -969,6 +983,7 @@ impl OpenClient {
         source: &UploadSource,
         offset: u64,
         len: u64,
+        throttle: Option<&(u64, Arc<AtomicBool>)>,
     ) -> Result<String> {
         let mut hdrs = HeaderMap::new();
         hdrs.insert(
@@ -986,7 +1001,7 @@ impl OpenClient {
         }
         hdrs.insert(CONTENT_LENGTH, HeaderValue::from(len));
         let body = source
-            .upload_body(offset, len)
+            .upload_body(offset, len, throttle)
             .await
             .with_context(|| format!("打开分片 {} 数据流失败", item.part_number))?;
         let res = put_client
@@ -1461,7 +1476,13 @@ impl UploadSource {
     }
 
     /// 构造分片 PUT 请求体：路径源按块流式读，避免大单片整段进内存。
-    async fn upload_body(&self, offset: u64, len: u64) -> Result<reqwest::Body> {
+    /// `throttle`：慢传时按目标速率读出，避免单片 PUT 期间全速抢带宽。
+    async fn upload_body(
+        &self,
+        offset: u64,
+        len: u64,
+        throttle: Option<&(u64, Arc<AtomicBool>)>,
+    ) -> Result<reqwest::Body> {
         if len == 0 {
             return Ok(reqwest::Body::from(Bytes::new()));
         }
@@ -1477,6 +1498,7 @@ impl UploadSource {
                             data.len()
                         )
                     })?;
+                // 内存体无法边读边限速；调用方应已 pace_before。
                 Ok(reqwest::Body::from(data.slice(start..end)))
             }
             UploadSource::Path(path) => {
@@ -1490,10 +1512,81 @@ impl UploadSource {
                     .with_context(|| format!("定位分片 offset={offset} 失败"))?;
                 let reader = file.take(len);
                 let stream = ReaderStream::with_capacity(reader, STREAM_BUF);
-                Ok(reqwest::Body::wrap_stream(stream))
+                if let Some((bps, is_fast)) = throttle {
+                    let bps = (*bps).max(1);
+                    let is_fast = is_fast.clone();
+                    let limited = throttle_byte_stream(stream, bps, is_fast);
+                    Ok(reqwest::Body::wrap_stream(limited))
+                } else {
+                    Ok(reqwest::Body::wrap_stream(stream))
+                }
             }
         }
     }
+}
+
+/// 按目标速率限制字节流；`is_fast` 一旦为 true（晋升快车道）立即停止限流。
+fn throttle_byte_stream<S, E>(
+    inner: S,
+    bps: u64,
+    is_fast: Arc<AtomicBool>,
+) -> impl futures_util::Stream<Item = Result<Bytes, E>>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    use futures_util::StreamExt;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, E>>(2);
+    tokio::spawn(async move {
+        let mut inner = std::pin::pin!(inner);
+        let mut last = Instant::now();
+        let mut debt_ns = 0u64;
+        while let Some(item) = inner.next().await {
+            match item {
+                Ok(bytes) => {
+                    if !is_fast.load(Ordering::Acquire) {
+                        let n = bytes.len() as u64;
+                        let now = Instant::now();
+                        let elapsed_ns = now.duration_since(last).as_nanos() as u64;
+                        last = now;
+                        debt_ns = debt_ns.saturating_sub(elapsed_ns);
+                        let need_ns = n
+                            .saturating_mul(1_000_000_000)
+                            .checked_div(bps)
+                            .unwrap_or(0);
+                        debt_ns = debt_ns.saturating_add(need_ns);
+                        if debt_ns > 0 {
+                            let sleep_for = Duration::from_nanos(debt_ns);
+                            debt_ns = 0;
+                            // 可被晋升打断：每 50ms 看一次 is_fast。
+                            let deadline = Instant::now() + sleep_for;
+                            while Instant::now() < deadline {
+                                if is_fast.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                let left = deadline.saturating_duration_since(Instant::now());
+                                if left.is_zero() {
+                                    break;
+                                }
+                                tokio::time::sleep(left.min(Duration::from_millis(50))).await;
+                            }
+                            last = Instant::now();
+                        }
+                    }
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
+            }
+        }
+    });
+    futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
 }
 
 /// 获取飞牛授权 URL，供 `open-login` 子命令使用。

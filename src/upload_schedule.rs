@@ -170,8 +170,41 @@ impl SmartUploadPermit {
         })
     }
 
-    /// 每传完一段字节调用：慢传则按目标速率休眠；快车道一空闲立刻被唤醒晋升。
+    /// 慢传任务的目标字节速率；全速/小文件返回 None（不限流）。
+    pub fn throttle_bps(&self) -> Option<u64> {
+        if self.ticket.is_some() && !self.is_fast() {
+            Some(self.slow_bps.max(1))
+        } else {
+            None
+        }
+    }
+
+    /// 供流式 PUT 使用的「是否已晋升全速」标志（限流读时可随时停限）。
+    pub fn fast_flag(&self) -> Arc<AtomicBool> {
+        self.is_fast.clone()
+    }
+
+    /// 上传 `bytes` **之前**调用（先付带宽再传）。
+    /// 旧逻辑把 sleep 放在 PUT 之后：新慢传任务首片会全速抢带宽，拖累正在跑的快车道。
+    pub async fn pace_before(&self, bytes: u64) {
+        self.pace_inner(bytes, /*credit_elapsed=*/ false).await;
+    }
+
+    /// 兼容旧调用点：等价于 `pace_before`（应在 PUT 前调用）。
     pub async fn pace(&self, bytes: u64) {
+        self.pace_before(bytes).await;
+    }
+
+    /// 流式读出一小段后调用：按慢传速率补休眠；已晋升则立刻返回。
+    pub async fn pace_chunk(&self, bytes: u64) {
+        if bytes == 0 || self.is_fast() {
+            let _ = self.try_promote();
+            return;
+        }
+        self.pace_inner(bytes, /*credit_elapsed=*/ true).await;
+    }
+
+    async fn pace_inner(&self, bytes: u64, credit_elapsed: bool) {
         if bytes == 0 {
             return;
         }
@@ -181,9 +214,11 @@ impl SmartUploadPermit {
         let sleep_for = {
             let mut st = self.pace_lock.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
-            let elapsed_ns = now.duration_since(st.last).as_nanos() as u64;
+            if credit_elapsed {
+                let elapsed_ns = now.duration_since(st.last).as_nanos() as u64;
+                st.debt_ns = st.debt_ns.saturating_sub(elapsed_ns);
+            }
             st.last = now;
-            st.debt_ns = st.debt_ns.saturating_sub(elapsed_ns);
             // need_ns = bytes * 1e9 / slow_bps
             let need_ns = bytes
                 .saturating_mul(1_000_000_000)
@@ -373,6 +408,32 @@ mod tests {
         assert_eq!(UploadLane::Fast.as_str(), "fast");
         assert_eq!(UploadLane::Slow.as_str(), "slow");
         assert_eq!(UploadLane::Small.as_str(), "small");
+    }
+
+    #[test]
+    fn slow_lane_exposes_throttle_bps() {
+        init(1024, 256 * 1024);
+        let sched = scheduler();
+        let mut st = sched.state.lock().unwrap();
+        let t = st.next_ticket;
+        st.next_ticket += 1;
+        st.order.push_back(t);
+        st.fast_holder = Some(999); // 占住快车道，新票只能慢传
+        drop(st);
+        let p = SmartUploadPermit {
+            sched: sched.clone(),
+            ticket: Some(t),
+            is_fast: Arc::new(AtomicBool::new(false)),
+            pace_lock: Mutex::new(PaceState {
+                last: Instant::now(),
+                debt_ns: 0,
+            }),
+            slow_bps: 256 * 1024,
+        };
+        assert_eq!(p.lane(), UploadLane::Slow);
+        assert_eq!(p.throttle_bps(), Some(256 * 1024));
+        // cleanup so other tests not poisoned
+        drop(p);
     }
 
     #[test]
