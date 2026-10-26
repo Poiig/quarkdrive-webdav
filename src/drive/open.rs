@@ -760,17 +760,24 @@ impl OpenClient {
                     continue;
                 }
                 let offset = idx as u64 * part_size;
-                // 慢传：路径源在流内按块限速；内存源无法边读边限，改为 PUT 前先付带宽。
-                // 切勿「先付满再流内再限」——会变成半速。
+                // 路径源：整段流都带着 is_fast。队首被调度器标成全速后，当前分片立刻停限；
+                // 被挤回慢传后，下一块就开始限。内存源无法边读边限，只在发送前 pace。
+                // 切勿对同一段「先付满再流内再限」——会变成半速。
                 let throttle = if let Some(smart) = smart {
                     if let Some((tracker, path)) = progress {
-                        tracker.set_lane(path, smart.lane().as_str());
+                        tracker.set_lane(path, smart.sync_lane().as_str());
                     }
-                    let t = smart.throttle_bps().map(|bps| (bps, smart.fast_flag()));
-                    if t.is_some() && matches!(source, UploadSource::Memory(_)) {
-                        smart.pace_before(this_size).await;
+                    if matches!(source, UploadSource::Memory(_)) {
+                        if !smart.is_fast() {
+                            smart.pace_before(this_size).await;
+                            if let Some((tracker, path)) = progress {
+                                tracker.set_lane(path, smart.lane().as_str());
+                            }
+                        }
+                        None
+                    } else {
+                        smart.stream_throttle()
                     }
-                    t
                 } else {
                     None
                 };
@@ -901,7 +908,7 @@ impl OpenClient {
         source: &UploadSource,
         offset: u64,
         len: u64,
-        throttle: Option<&(u64, Arc<AtomicBool>)>,
+        throttle: Option<&crate::upload_schedule::ByteThrottle>,
     ) -> Result<String> {
         // OSS 偶发 504/502 很常见（网关超时），多试几次；每次重开文件流。
         const MAX_ATTEMPTS: u32 = 8;
@@ -983,7 +990,7 @@ impl OpenClient {
         source: &UploadSource,
         offset: u64,
         len: u64,
-        throttle: Option<&(u64, Arc<AtomicBool>)>,
+        throttle: Option<&crate::upload_schedule::ByteThrottle>,
     ) -> Result<String> {
         let mut hdrs = HeaderMap::new();
         hdrs.insert(
@@ -1481,7 +1488,7 @@ impl UploadSource {
         &self,
         offset: u64,
         len: u64,
-        throttle: Option<&(u64, Arc<AtomicBool>)>,
+        throttle: Option<&crate::upload_schedule::ByteThrottle>,
     ) -> Result<reqwest::Body> {
         if len == 0 {
             return Ok(reqwest::Body::from(Bytes::new()));
@@ -1512,10 +1519,8 @@ impl UploadSource {
                     .with_context(|| format!("定位分片 offset={offset} 失败"))?;
                 let reader = file.take(len);
                 let stream = ReaderStream::with_capacity(reader, STREAM_BUF);
-                if let Some((bps, is_fast)) = throttle {
-                    let bps = (*bps).max(1);
-                    let is_fast = is_fast.clone();
-                    let limited = throttle_byte_stream(stream, bps, is_fast);
+                if let Some(throttle) = throttle {
+                    let limited = throttle_byte_stream(stream, throttle.clone());
                     Ok(reqwest::Body::wrap_stream(limited))
                 } else {
                     Ok(reqwest::Body::wrap_stream(stream))
@@ -1525,11 +1530,10 @@ impl UploadSource {
     }
 }
 
-/// 按目标速率限制字节流；`is_fast` 一旦为 true（晋升快车道）立即停止限流。
+/// 按目标速率限制字节流。`is_fast` 由调度器写入：升全速立即停限，被挤回慢传后继续限。
 fn throttle_byte_stream<S, E>(
     inner: S,
-    bps: u64,
-    is_fast: Arc<AtomicBool>,
+    throttle: crate::upload_schedule::ByteThrottle,
 ) -> impl futures_util::Stream<Item = Result<Bytes, E>>
 where
     S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -1538,6 +1542,9 @@ where
     use futures_util::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, E>>(2);
     tokio::spawn(async move {
+        let bps = throttle.bps.max(1);
+        let is_fast = throttle.is_fast;
+        let notify = throttle.notify;
         let mut inner = std::pin::pin!(inner);
         let mut last = Instant::now();
         let mut debt_ns = 0u64;
@@ -1558,7 +1565,6 @@ where
                         if debt_ns > 0 {
                             let sleep_for = Duration::from_nanos(debt_ns);
                             debt_ns = 0;
-                            // 可被晋升打断：每 50ms 看一次 is_fast。
                             let deadline = Instant::now() + sleep_for;
                             while Instant::now() < deadline {
                                 if is_fast.load(Ordering::Acquire) {
@@ -1568,7 +1574,16 @@ where
                                 if left.is_zero() {
                                     break;
                                 }
-                                tokio::time::sleep(left.min(Duration::from_millis(50))).await;
+                                let slice = left.min(Duration::from_millis(50));
+                                let notified = notify.notified();
+                                tokio::pin!(notified);
+                                if is_fast.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                tokio::select! {
+                                    _ = tokio::time::sleep(slice) => {}
+                                    _ = &mut notified => {}
+                                }
                             }
                             last = Instant::now();
                         }

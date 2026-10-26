@@ -181,7 +181,15 @@ impl QuarkDriveFileSystem {
             prefer_http_download: false,
             upload_wait_timeout: 0,
             oplog: Arc::new(OpLog::new("./logs", 7)),
-            upload_tracker: UploadTracker::new(),
+            upload_tracker: {
+                let upload_tracker = UploadTracker::new();
+                // 慢传升全速发生在别的任务 Drop 里，上传循环当时可能正卡在分片流中。
+                crate::upload_schedule::set_lane_listener({
+                    let tracker = upload_tracker.clone();
+                    Arc::new(move |path: &str, lane: &str| tracker.set_lane(path, lane))
+                });
+                upload_tracker
+            },
             upload_inflight: Arc::new(DashMap::new()),
             client_mtimes: Arc::new(DashMap::new()),
             pending_relocate: Arc::new(DashMap::new()),
@@ -2034,8 +2042,9 @@ impl QuarkDavFile {
                         part_bytes: buf,
                     };
                     // Cookie 分片整块进内存后 PUT：限速只能放在发送前，避免首片全速抢带宽。
-                    tracker.set_lane(&progress_path, smart.lane().as_str());
+                    // pace 返回时可能已经接上快车道，标签跟这次发送走。
                     smart.pace_before(bytes_to_read as u64).await;
+                    tracker.set_lane(&progress_path, smart.lane().as_str());
                     let put_started = std::time::Instant::now();
                     let res = drive.up_part(up_req).await.map_err(|err| {
                         error!(file_name = %file_name, error = %err, "upload chunk failed");

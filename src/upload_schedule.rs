@@ -3,6 +3,10 @@
 //! 多路大文件同时上传时，只让队列最前的一个吃满带宽；后面的缓慢推进，
 //! 新任务只能排到队尾，不能插队。小文件不进此队列，避免拖慢目录里的零碎文件。
 //! 控制台可对慢传任务「手动提升全速」（插到队首并抢走快车道）。
+//!
+//! 不变量：队列非空时，队首就是快车道。入队、出队、手动提升都在同一把锁里
+//! 改写 `is_fast`。慢传任务（尤其是 Open 分片流）只观察这个标志，不必自己轮询
+//! 「能不能升」——否则快车道空出来时，正在限速的流永远不会把自己标成全速。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,17 +15,23 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::Notify;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// 超过此大小走智能调度（默认 32MB）。
 pub const DEFAULT_LARGE_THRESHOLD: u64 = 32 * 1024 * 1024;
 /// 非快车道任务的目标速率（默认 512KB/s）。
 pub const DEFAULT_SLOW_BPS: u64 = 512 * 1024;
 
+struct QueueEntry {
+    ticket: u64,
+    /// 与 permit / 路径绑定 / 流式限速共享，出队时直接翻转。
+    is_fast: Arc<AtomicBool>,
+}
+
 struct QueueState {
     next_ticket: u64,
-    /// 等待/持有慢传资格的 FIFO（含当前快车道持有者）。
-    order: VecDeque<u64>,
+    /// FIFO。非空时 `order[0]` 就是快车道持有者。
+    order: VecDeque<QueueEntry>,
     fast_holder: Option<u64>,
 }
 
@@ -29,7 +39,12 @@ struct SmartScheduler {
     large_threshold: u64,
     slow_bps: u64,
     state: Mutex<QueueState>,
-    notify: Notify,
+    notify: Arc<Notify>,
+}
+
+struct LaneFlip {
+    promoted: Option<u64>,
+    demoted: Vec<u64>,
 }
 
 /// 路径 → 票号/快慢标志，供控制台手动提升全速。
@@ -40,12 +55,26 @@ struct LaneBinding {
 
 static SCHEDULER: OnceLock<Arc<SmartScheduler>> = OnceLock::new();
 static PATH_LANES: OnceLock<DashMap<String, LaneBinding>> = OnceLock::new();
+static LANE_LISTENER: Mutex<Option<Arc<dyn Fn(&str, &str) + Send + Sync>>> = Mutex::new(None);
 
 /// 进程启动时配置阈值与慢传速率；可重复调用（仅首次生效）。
 pub fn init(large_threshold: u64, slow_bps: u64) {
     let large_threshold = large_threshold.max(1);
     let slow_bps = slow_bps.max(64 * 1024);
-    let _ = SCHEDULER.set(Arc::new(SmartScheduler {
+    if SCHEDULER
+        .set(Arc::new(new_scheduler(large_threshold, slow_bps)))
+        .is_ok()
+    {
+        tracing::info!(
+            large_threshold,
+            slow_bps,
+            "upload smart schedule enabled (FIFO fast lane + slow trickle)"
+        );
+    }
+}
+
+fn new_scheduler(large_threshold: u64, slow_bps: u64) -> SmartScheduler {
+    SmartScheduler {
         large_threshold,
         slow_bps,
         state: Mutex::new(QueueState {
@@ -53,32 +82,113 @@ pub fn init(large_threshold: u64, slow_bps: u64) {
             order: VecDeque::new(),
             fast_holder: None,
         }),
-        notify: Notify::new(),
-    }));
-    tracing::info!(
-        large_threshold,
-        slow_bps,
-        "upload smart schedule enabled (FIFO fast lane + slow trickle)"
-    );
+        notify: Arc::new(Notify::new()),
+    }
 }
 
 fn scheduler() -> Arc<SmartScheduler> {
-    SCHEDULER.get().cloned().unwrap_or_else(|| {
-        Arc::new(SmartScheduler {
-            large_threshold: DEFAULT_LARGE_THRESHOLD,
-            slow_bps: DEFAULT_SLOW_BPS,
-            state: Mutex::new(QueueState {
-                next_ticket: 1,
-                order: VecDeque::new(),
-                fast_holder: None,
-            }),
-            notify: Notify::new(),
-        })
-    })
+    SCHEDULER
+        .get_or_init(|| Arc::new(new_scheduler(DEFAULT_LARGE_THRESHOLD, DEFAULT_SLOW_BPS)))
+        .clone()
+}
+
+/// 车道变化时刷新控制台标签。后注册的覆盖先前的（进程内只有一个文件系统）。
+pub fn set_lane_listener(listener: Arc<dyn Fn(&str, &str) + Send + Sync>) {
+    if let Ok(mut slot) = LANE_LISTENER.lock() {
+        *slot = Some(listener);
+    }
 }
 
 fn path_lanes() -> &'static DashMap<String, LaneBinding> {
     PATH_LANES.get_or_init(DashMap::new)
+}
+
+/// 队首占快车道，其余一律慢传。调用方必须已持有队列锁。
+fn ensure_fast_holder(st: &mut QueueState) -> LaneFlip {
+    let mut flip = LaneFlip {
+        promoted: None,
+        demoted: Vec::new(),
+    };
+    let Some(front_ticket) = st.order.front().map(|e| e.ticket) else {
+        st.fast_holder = None;
+        return flip;
+    };
+    for entry in st.order.iter_mut().skip(1) {
+        if entry.is_fast.swap(false, Ordering::AcqRel) {
+            flip.demoted.push(entry.ticket);
+        }
+    }
+    if let Some(front) = st.order.front_mut() {
+        if !front.is_fast.swap(true, Ordering::AcqRel) {
+            flip.promoted = Some(front.ticket);
+        }
+        st.fast_holder = Some(front.ticket);
+    }
+    debug_assert_eq!(st.fast_holder, Some(front_ticket));
+    flip
+}
+
+fn move_to_front(st: &mut QueueState, ticket: u64) -> bool {
+    let Some(pos) = st.order.iter().position(|e| e.ticket == ticket) else {
+        return false;
+    };
+    if pos > 0 {
+        let entry = st.order.remove(pos).expect("ticket position still valid");
+        st.order.push_front(entry);
+    }
+    true
+}
+
+fn paths_for_ticket(ticket: u64) -> Vec<String> {
+    path_lanes()
+        .iter()
+        .filter(|entry| entry.ticket == ticket)
+        .map(|entry| entry.key().clone())
+        .collect()
+}
+
+fn apply_flip(sched: &SmartScheduler, flip: LaneFlip, log_promote: bool) {
+    if flip.promoted.is_none() && flip.demoted.is_empty() {
+        return;
+    }
+    let mut updates: Vec<(String, &'static str)> = Vec::new();
+    if let Some(ticket) = flip.promoted {
+        let paths = paths_for_ticket(ticket);
+        if log_promote {
+            info!(ticket, ?paths, "upload promoted to fast lane");
+        }
+        for path in paths {
+            updates.push((path, "fast"));
+        }
+    }
+    for ticket in flip.demoted {
+        let paths = paths_for_ticket(ticket);
+        if log_promote {
+            info!(ticket, ?paths, "upload demoted to slow lane");
+        }
+        for path in paths {
+            updates.push((path, "slow"));
+        }
+    }
+    // 先叫醒正在限速的流/pace，再刷 UI。
+    sched.notify.notify_waiters();
+    if updates.is_empty() {
+        return;
+    }
+    let listener = LANE_LISTENER.lock().ok().and_then(|slot| slot.clone());
+    if let Some(listener) = listener {
+        for (path, lane) in &updates {
+            listener(path, lane);
+        }
+    }
+}
+
+/// 分片流限速：看 `is_fast`，不要在开传时把「当前是慢传」拍成死速率。
+#[derive(Clone)]
+pub struct ByteThrottle {
+    pub bps: u64,
+    pub is_fast: Arc<AtomicBool>,
+    pub notify: Arc<Notify>,
 }
 
 /// 上传车道：小文件 / 大文件快车道 / 大文件慢传。
@@ -158,13 +268,10 @@ impl SmartUploadPermit {
     /// 把路径挂到本票号上，供控制台「提升全速」。
     pub fn bind_path(&self, path: &str) -> Option<PathBindGuard> {
         let ticket = self.ticket?;
-        path_lanes().insert(
-            path.to_string(),
-            LaneBinding {
-                ticket,
-                is_fast: self.is_fast.clone(),
-            },
-        );
+        path_lanes().insert(path.to_string(), LaneBinding {
+            ticket,
+            is_fast: self.is_fast.clone(),
+        });
         Some(PathBindGuard {
             path: path.to_string(),
         })
@@ -182,6 +289,24 @@ impl SmartUploadPermit {
     /// 供流式 PUT 使用的「是否已晋升全速」标志（限流读时可随时停限）。
     pub fn fast_flag(&self) -> Arc<AtomicBool> {
         self.is_fast.clone()
+    }
+
+    /// 对齐队列：若本票已是队首，立刻标成全速。分片循环在每片开始时调用。
+    pub fn sync_lane(&self) -> UploadLane {
+        let _ = self.try_promote();
+        self.lane()
+    }
+
+    /// 大文件分片流的实时限速参数。全速时流内不休眠，被挤回慢传后下一小块即限速。
+    pub fn stream_throttle(&self) -> Option<ByteThrottle> {
+        if self.ticket.is_none() {
+            return None;
+        }
+        Some(ByteThrottle {
+            bps: self.slow_bps.max(1),
+            is_fast: self.is_fast.clone(),
+            notify: Arc::clone(&self.sched.notify),
+        })
     }
 
     /// 上传 `bytes` **之前**调用（先付带宽再传）。
@@ -262,7 +387,7 @@ impl SmartUploadPermit {
         let _ = self.try_promote();
     }
 
-    /// 队首且快车道空闲时晋升为全速；成功返回 true。
+    /// 本票已是队首时确保标志为全速。成功（当前就是快车道）返回 true。
     fn try_promote(&self) -> bool {
         let Some(ticket) = self.ticket else {
             return false;
@@ -270,17 +395,19 @@ impl SmartUploadPermit {
         if self.is_fast.load(Ordering::Acquire) {
             return true;
         }
-        let mut st = self.sched.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.fast_holder.is_some() {
-            return false;
+        let flip = {
+            let mut st = self.sched.state.lock().unwrap_or_else(|e| e.into_inner());
+            let is_front = st.order.front().map(|entry| entry.ticket) == Some(ticket);
+            if !is_front {
+                return false;
+            }
+            ensure_fast_holder(&mut st)
+        };
+        let became = self.is_fast.load(Ordering::Acquire);
+        if became {
+            apply_flip(&self.sched, flip, true);
         }
-        if st.order.front().copied() != Some(ticket) {
-            return false;
-        }
-        st.fast_holder = Some(ticket);
-        self.is_fast.store(true, Ordering::Release);
-        debug!(ticket, "upload promoted to fast lane");
-        true
+        became
     }
 }
 
@@ -289,15 +416,13 @@ impl Drop for SmartUploadPermit {
         let Some(ticket) = self.ticket.take() else {
             return;
         };
-        {
+        let flip = {
             let mut st = self.sched.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.order.retain(|t| *t != ticket);
-            if st.fast_holder == Some(ticket) {
-                st.fast_holder = None;
-            }
-        }
-        // 立刻叫醒正在限速 sleep 的队首任务。
-        self.sched.notify.notify_waiters();
+            st.order.retain(|entry| entry.ticket != ticket);
+            // 队首离开后，下一位在这把锁里直接升全速，不等它自己来问。
+            ensure_fast_holder(&mut st)
+        };
+        apply_flip(&self.sched, flip, true);
         debug!(ticket, "upload left smart schedule");
     }
 }
@@ -329,73 +454,72 @@ pub fn promote_path(path: &str) -> PromoteResult {
     drop(binding);
 
     let sched = scheduler();
-    let mut st = sched.state.lock().unwrap_or_else(|e| e.into_inner());
-    if !st.order.iter().any(|t| *t == ticket) {
-        return PromoteResult {
-            ok: false,
-            demoted: Vec::new(),
-        };
-    }
-    st.order.retain(|t| *t != ticket);
-    st.order.push_front(ticket);
-    let mut demoted = Vec::new();
-    if let Some(old) = st.fast_holder {
-        if old != ticket {
-            for e in map.iter() {
-                if e.ticket == old {
-                    e.is_fast.store(false, Ordering::Release);
-                    demoted.push(e.key().clone());
-                }
-            }
+    let flip = {
+        let mut st = sched.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !move_to_front(&mut st, ticket) {
+            return PromoteResult {
+                ok: false,
+                demoted: Vec::new(),
+            };
         }
-    }
-    st.fast_holder = Some(ticket);
-    mine.store(true, Ordering::Release);
-    drop(st);
-    sched.notify.notify_waiters();
-    debug!(ticket, path, demoted = ?demoted, "upload manually promoted to fast lane");
-    PromoteResult { ok: true, demoted }
+        ensure_fast_holder(&mut st)
+    };
+    let demoted = flip
+        .demoted
+        .iter()
+        .flat_map(|ticket| paths_for_ticket(*ticket))
+        .collect::<Vec<_>>();
+    let ok = mine.load(Ordering::Acquire);
+    apply_flip(&sched, flip, true);
+    debug!(
+        ticket,
+        path,
+        ?demoted,
+        ok,
+        "upload manually promoted to fast lane"
+    );
+    PromoteResult { ok, demoted }
 }
 
-/// 加入智能调度：大文件拿 FIFO 票并立即尝试占快车道；小文件直接放行。
+/// 加入智能调度：大文件拿 FIFO 票；队首立即全速，其余慢传。小文件直接放行。
 pub async fn join(size: u64) -> SmartUploadPermit {
+    join_now(size)
+}
+
+fn join_now(size: u64) -> SmartUploadPermit {
     let sched = scheduler();
     if size < sched.large_threshold {
         return SmartUploadPermit::small();
     }
+    let is_fast = Arc::new(AtomicBool::new(false));
     let ticket = {
         let mut st = sched.state.lock().unwrap_or_else(|e| e.into_inner());
-        let t = st.next_ticket;
+        let ticket = st.next_ticket;
         st.next_ticket = st.next_ticket.saturating_add(1).max(1);
-        st.order.push_back(t);
-        // 空闲则队首立刻占快车道。
-        if st.fast_holder.is_none() && st.order.front().copied() == Some(t) {
-            st.fast_holder = Some(t);
-            debug!(ticket = t, size, "upload entered fast lane");
-            let permit = SmartUploadPermit {
-                sched: sched.clone(),
-                ticket: Some(t),
-                is_fast: Arc::new(AtomicBool::new(true)),
-                pace_lock: Mutex::new(PaceState {
-                    last: Instant::now(),
-                    debt_ns: 0,
-                }),
-                slow_bps: sched.slow_bps,
-            };
-            return permit;
-        }
-        debug!(ticket = t, size, "upload entered slow lane (queued)");
-        t
+        st.order.push_back(QueueEntry {
+            ticket,
+            is_fast: Arc::clone(&is_fast),
+        });
+        let flip = ensure_fast_holder(&mut st);
+        drop(st);
+        // 刚入队还没 bind_path，这里只改标志；UI 由调用方 set_lane。
+        apply_flip(&sched, flip, false);
+        ticket
     };
+    if is_fast.load(Ordering::Acquire) {
+        debug!(ticket, size, "upload entered fast lane");
+    } else {
+        debug!(ticket, size, "upload entered slow lane (queued)");
+    }
     SmartUploadPermit {
-        sched,
+        sched: sched.clone(),
         ticket: Some(ticket),
-        is_fast: Arc::new(AtomicBool::new(false)),
+        is_fast,
         pace_lock: Mutex::new(PaceState {
             last: Instant::now(),
             debt_ns: 0,
         }),
-        slow_bps: scheduler().slow_bps,
+        slow_bps: sched.slow_bps,
     }
 }
 
@@ -424,32 +548,24 @@ mod tests {
         assert_eq!(UploadLane::Small.as_str(), "small");
     }
 
+    fn big() -> u64 {
+        // 不依赖 init 是否已经用别的阈值抢先注册。
+        scheduler().large_threshold.saturating_add(1)
+    }
+
     #[test]
     fn slow_lane_exposes_throttle_bps() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_global_schedule();
-        init(1024, 256 * 1024);
-        let sched = scheduler();
-        let mut st = sched.state.lock().unwrap();
-        let t = st.next_ticket;
-        st.next_ticket += 1;
-        st.order.push_back(t);
-        st.fast_holder = Some(999); // 占住快车道，新票只能慢传
-        drop(st);
-        let p = SmartUploadPermit {
-            sched: sched.clone(),
-            ticket: Some(t),
-            is_fast: Arc::new(AtomicBool::new(false)),
-            pace_lock: Mutex::new(PaceState {
-                last: Instant::now(),
-                debt_ns: 0,
-            }),
-            slow_bps: 256 * 1024,
-        };
-        assert_eq!(p.lane(), UploadLane::Slow);
-        assert_eq!(p.throttle_bps(), Some(256 * 1024));
-        drop(p);
-        // Drop 只清本票；假 fast_holder(999) 仍在，显式复位。
+        let fast = join_now(big());
+        let slow = join_now(big());
+        assert_eq!(fast.lane(), UploadLane::Fast);
+        assert_eq!(slow.lane(), UploadLane::Slow);
+        assert_eq!(slow.throttle_bps(), Some(slow.slow_bps));
+        assert!(fast.throttle_bps().is_none());
+        assert!(slow.stream_throttle().is_some());
+        drop(slow);
+        drop(fast);
         reset_global_schedule();
     }
 
@@ -463,49 +579,78 @@ mod tests {
     }
 
     #[test]
+    fn dropping_fast_promotes_next_without_polling() {
+        // 回归：Open 流只读 is_fast，不会自己调用 try_promote。
+        // 快车道释放时，下一位的标志必须已经被调度器写上。
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_global_schedule();
+        let fast = join_now(big());
+        let next = join_now(big());
+        let tail = join_now(big());
+        let watched = next.stream_throttle().expect("大文件应带实时限速标志");
+        assert!(fast.is_fast());
+        assert!(!next.is_fast());
+        assert!(!watched.is_fast.load(Ordering::Acquire));
+        assert!(!tail.is_fast());
+        drop(fast);
+        assert!(next.is_fast(), "队首应在上一位 Drop 时直接升全速");
+        assert!(
+            watched.is_fast.load(Ordering::Acquire),
+            "分片流看到的标志必须和调度器是同一个"
+        );
+        assert!(!tail.is_fast());
+        assert_eq!(next.lane(), UploadLane::Fast);
+        assert!(next.throttle_bps().is_none());
+        drop(next);
+        assert!(tail.is_fast());
+        drop(tail);
+        reset_global_schedule();
+    }
+
+    #[test]
+    fn dropping_slow_does_not_steal_fast_lane() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_global_schedule();
+        let fast = join_now(big());
+        let slow = join_now(big());
+        let tail = join_now(big());
+        drop(slow);
+        assert!(fast.is_fast());
+        assert!(!tail.is_fast());
+        drop(tail);
+        drop(fast);
+        reset_global_schedule();
+    }
+
+    #[test]
     fn manual_promote_demotes_previous_fast() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_global_schedule();
-        // 直接往 PATH_LANES / order 塞两票验证抢车道。
-        init(1, 64 * 1024);
-        let sched = scheduler();
-        let fast_flag = Arc::new(AtomicBool::new(true));
-        let slow_flag = Arc::new(AtomicBool::new(false));
-        {
-            let mut st = sched.state.lock().unwrap();
-            st.order.clear();
-            st.order.push_back(100);
-            st.order.push_back(200);
-            st.fast_holder = Some(100);
-            st.next_ticket = 201;
-        }
-        let map = path_lanes();
-        map.insert(
-            "/fast.bin".into(),
-            LaneBinding {
-                ticket: 100,
-                is_fast: fast_flag.clone(),
-            },
-        );
-        map.insert(
-            "/slow.bin".into(),
-            LaneBinding {
-                ticket: 200,
-                is_fast: slow_flag.clone(),
-            },
-        );
+        let fast = join_now(big());
+        let mid = join_now(big());
+        let slow = join_now(big());
+        let _fast_bind = fast.bind_path("/fast.bin");
+        let _mid_bind = mid.bind_path("/mid.bin");
+        let _slow_bind = slow.bind_path("/slow.bin");
 
         let result = promote_path("/slow.bin");
         assert!(result.ok);
         assert_eq!(result.demoted, vec!["/fast.bin".to_string()]);
-        assert!(slow_flag.load(Ordering::Acquire));
-        assert!(!fast_flag.load(Ordering::Acquire));
+        assert!(slow.is_fast());
+        assert!(!fast.is_fast());
+        assert!(!mid.is_fast());
         {
+            let sched = scheduler();
             let st = sched.state.lock().unwrap();
-            assert_eq!(st.fast_holder, Some(200));
-            assert_eq!(st.order.front().copied(), Some(200));
+            assert_eq!(st.fast_holder, slow.ticket);
+            assert_eq!(st.order.front().map(|entry| entry.ticket), slow.ticket);
         }
 
+        drop(slow);
+        assert!(fast.is_fast(), "被手动提升的任务结束后，原队首回到快车道");
+        assert!(!mid.is_fast());
+        drop(fast);
+        drop(mid);
         reset_global_schedule();
     }
 
