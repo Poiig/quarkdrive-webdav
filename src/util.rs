@@ -15,8 +15,8 @@ pub fn is_cloudsync_metadata_dir(name: &str) -> bool {
     name == CLOUDSYNC_METADATA_DIR
 }
 
-/// 夸克禁止的文件名字符 → 全角可逆替换（WebDAV 仍用原名，落盘用编码名）。
-/// 官方提示大致包含：`\ : < > | * ? , / %`，并覆盖 `"`。
+/// 夸克禁止/易触发 `illegal text`(14014) 的字符 → 全角可逆替换。
+/// WebDAV/群晖仍见原名；落盘用编码名。含官方禁用符，以及 `.` `'` `&` 等实测会拒的字符。
 fn quark_forbidden_pairs() -> &'static [(char, char)] {
     &[
         ('\\', '\u{FF3C}'), // ＼
@@ -24,27 +24,55 @@ fn quark_forbidden_pairs() -> &'static [(char, char)] {
         ('*', '\u{FF0A}'),  // ＊
         ('?', '\u{FF1F}'),  // ？
         ('"', '\u{FF02}'),  // ＂
+        ('\'', '\u{FF07}'), // ＇
         ('<', '\u{FF1C}'),  // ＜
         ('>', '\u{FF1E}'),  // ＞
         ('|', '\u{FF5C}'),  // ｜
         (',', '\u{FF0C}'),  // ，
         ('%', '\u{FF05}'),  // ％
+        ('&', '\u{FF06}'),  // ＆
+        ('#', '\u{FF03}'),  // ＃
+        (';', '\u{FF1B}'),  // ；
+        // Open `dir_path` / 内容审核对半角 `.` 偶发 illegal text（如「家委会工作2020.09」）。
+        ('.', '\u{FF0E}'), // ．
         // 路径段里一般不会出现 `/`；若出现同样编码，避免 Open API 直接拒。
         ('/', '\u{FF0F}'), // ／
     ]
 }
 
+fn map_quark_char(ch: char, encode: bool) -> Option<char> {
+    for &(from, to) in quark_forbidden_pairs() {
+        if encode && ch == from {
+            return Some(to);
+        }
+        if !encode && ch == to {
+            return Some(from);
+        }
+    }
+    // 弯引号等常见变体也按直引号处理（编码时 → 全角＇，解码时 → ASCII '）。
+    if encode {
+        match ch {
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{FF07}' => Some('\u{FF07}'),
+            '\u{201C}' | '\u{201D}' | '\u{201E}' => Some('\u{FF02}'),
+            // C0 控制符不能进文件名
+            c if c.is_control() => Some('_'),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 /// 写入夸克前编码文件/目录名。
 pub fn quark_encode_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    'chars: for ch in name.chars() {
-        for &(from, to) in quark_forbidden_pairs() {
-            if ch == from {
-                out.push(to);
-                continue 'chars;
-            }
-        }
-        out.push(ch);
+    let trimmed = name.trim_matches(|c: char| c == ' ' || c == '\t');
+    let mut out = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        out.push(map_quark_char(ch, true).unwrap_or(ch));
+    }
+    if out.is_empty() {
+        // 全是空白时给一个可落盘占位，避免 Open 空名。
+        out.push('_');
     }
     out
 }
@@ -52,14 +80,8 @@ pub fn quark_encode_name(name: &str) -> String {
 /// 从夸克列表读回后解码，使 PROPFIND 与客户端路径一致。
 pub fn quark_decode_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
-    'chars: for ch in name.chars() {
-        for &(from, to) in quark_forbidden_pairs() {
-            if ch == to {
-                out.push(from);
-                continue 'chars;
-            }
-        }
-        out.push(ch);
+    for ch in name.chars() {
+        out.push(map_quark_char(ch, false).unwrap_or(ch));
     }
     out
 }
@@ -151,10 +173,20 @@ mod tests {
     fn test_quark_name_encode_roundtrip_star() {
         let raw = "*.poiig.top_ecc";
         let enc = quark_encode_name(raw);
-        assert_eq!(enc, "＊.poiig.top_ecc");
+        assert_eq!(enc, "＊．poiig．top_ecc");
         assert_ne!(enc, raw);
         assert_eq!(quark_decode_name(&enc), raw);
-        assert_eq!(quark_encode_name("normal.txt"), "normal.txt");
+        assert_eq!(quark_encode_name("normal.txt"), "normal．txt");
+        assert_eq!(quark_decode_name("normal．txt"), "normal.txt");
+    }
+
+    #[test]
+    fn test_quark_name_encode_dot_date_folder() {
+        // 复现：家委会工作2020.09 → Open API illegal text (errno=14014)
+        let raw = "家委会工作2020.09";
+        let enc = quark_encode_name(raw);
+        assert_eq!(enc, "家委会工作2020．09");
+        assert_eq!(quark_decode_name(&enc), raw);
     }
 
     #[test]
