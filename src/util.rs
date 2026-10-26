@@ -10,11 +10,11 @@ pub fn shanghai_offset() -> FixedOffset {
 
 /// 系统/同步垃圾文件：对齐 OpenList `IsSystemFile`，并补充群晖 Cloud Sync 常见项。
 /// 对这些名字的 PUT/MKCOL 做本地成功、不上云，避免同步任务被系统文件拖死。
+/// `cloudsync_encrypt.info` 必须实际上传，否则群晖会报「上传加密密钥失败」。
 pub fn is_ignored_system_file(name: &str) -> bool {
     match name {
         ".DS_Store" | "desktop.ini" | "Thumbs.db" | "@eaDir" | "@tmp" | "#recycle"
-        | "#snapshot" | ".SynologyWorkingDirectory" | "cloudsync_encrypt.info"
-        | "@SynologyCloudSync" | "@sharebin" => true,
+        | "#snapshot" | ".SynologyWorkingDirectory" | "@SynologyCloudSync" | "@sharebin" => true,
         _ => {
             // Apple Double / 临时备份前缀
             name.starts_with("._") || name.starts_with("~.")
@@ -105,6 +105,7 @@ mod tests {
         assert!(is_ignored_system_file("@eaDir"));
         assert!(is_ignored_system_file("._photo.jpg"));
         assert!(is_ignored_system_file(".SynologyWorkingDirectory"));
+        assert!(!is_ignored_system_file("cloudsync_encrypt.info"));
         assert!(!is_ignored_system_file("photo.jpg"));
         assert!(!is_ignored_system_file("readme.md"));
     }
