@@ -131,8 +131,10 @@ pub struct QuarkDriveFileSystem {
     /// 客户端 PUT 带来的文件 mtime（unix 毫秒）。PROPFIND 用它覆盖夸克的上传时间，
     /// 否则 CloudSync 每次对账都认为远端时间不对，把同一个文件再传一遍。
     client_mtimes: Arc<DashMap<String, u64>>,
-    /// CloudSync「移动」常是先删再上传。大文件删除先挂起，同名同大小再 PUT 时改走网盘内移动。
+    /// CloudSync「移动」常是先删再上传。删除可先挂起，同名再 PUT 时比对内容或改走网盘内移动。
     pending_relocate: Arc<DashMap<String, PendingRelocate>>,
+    /// 不小于此大小的删除才延迟真删（0=全部延迟，恢复旧行为可设 32MB）。
+    relocate_defer_min_size: u64,
 }
 
 /// 被 CloudSync 先删、可能马上在别处再传的大文件。
@@ -146,9 +148,7 @@ struct PendingRelocate {
     deleted_ms: u64,
 }
 
-/// 超过此大小的删除才延迟：小文件重传便宜，不必占着 fid。
-const RELOCATE_MIN_SIZE: u64 = 32 * 1024 * 1024;
-/// 延迟删除窗口：群晖移动大文件时，删与再传之间可能隔几十分钟。
+/// 延迟删除窗口：群晖删与再传之间可能隔较长时间。
 const RELOCATE_TTL_MS: u64 = 2 * 60 * 60 * 1000;
 
 impl QuarkDriveFileSystem {
@@ -186,6 +186,8 @@ impl QuarkDriveFileSystem {
             upload_inflight: Arc::new(DashMap::new()),
             client_mtimes: Arc::new(DashMap::new()),
             pending_relocate: Arc::new(DashMap::new()),
+            // 0=CloudSync 先删后传时一律挂起，PUT 阶段再比 hash，避免小文件先进回收站又重传。
+            relocate_defer_min_size: 0,
         })
     }
 
@@ -265,44 +267,80 @@ impl QuarkDriveFileSystem {
         );
     }
 
-    /// 上传前认领「刚被删的同名同大小」文件，改走网盘内移动。
-    fn take_pending_relocate(
+    /// 同路径「先删再传」：认领挂起中的 fid，供 decide_reupload 比对内容（不移除挂起）。
+    fn peek_pending_same_path(&self, dav_path: &str, name: &str) -> Option<PendingRelocate> {
+        self.expire_pending_relocate();
+        self.pending_relocate
+            .iter()
+            .find(|e| e.from_path == dav_path && file_names_equal(&e.name, name))
+            .map(|e| e.value().clone())
+    }
+
+    /// 内容一致或 relocate 成功后取消挂起，文件重新对 PROPFIND 可见且不会被过期任务删掉。
+    fn cancel_pending_relocate(&self, fid: &str) -> bool {
+        self.pending_relocate.remove(fid).is_some()
+    }
+
+    /// 远端内容与本次 PUT 算出的摘要是否一致（无证明则 false，避免同大小误判）。
+    async fn remote_content_matches(
+        &self,
+        fid: &str,
+        cloud_hash: Option<&str>,
+        local_sha1: &str,
+        local_md5: &str,
+    ) -> bool {
+        if hash_matches(cloud_hash, local_sha1, local_md5) {
+            return true;
+        }
+        match self.drive.get_file_md5(fid).await {
+            Ok(Some(api_md5)) => hash_matches(Some(&api_md5), local_sha1, local_md5),
+            _ => false,
+        }
+    }
+
+    /// 跨目录移动：仅当 hash 证明内容一致时才认领挂起 fid 并 move。
+    async fn take_pending_relocate_verified(
         &self,
         name: &str,
+        to_path: &str,
         size: u64,
         local_sha1: &str,
         local_md5: &str,
     ) -> Option<PendingRelocate> {
         self.expire_pending_relocate();
-        if size < RELOCATE_MIN_SIZE {
+        if size < self.relocate_defer_min_size {
             return None;
         }
         let mut candidates: Vec<(String, PendingRelocate)> = self
             .pending_relocate
             .iter()
-            .filter(|e| file_names_equal(&e.name, name) && e.size == size)
+            .filter(|e| {
+                file_names_equal(&e.name, name)
+                    && e.size == size
+                    && e.from_path != to_path
+            })
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
         if candidates.is_empty() {
             return None;
         }
-        // 有 hash 且对得上优先；否则取最近删除的。
         candidates.sort_by(|a, b| b.1.deleted_ms.cmp(&a.1.deleted_ms));
-        let picked = candidates
-            .iter()
-            .find(|(_, p)| {
-                p.content_hash
-                    .as_deref()
-                    .map(|h| hash_matches(Some(h), local_sha1, local_md5))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .or_else(|| candidates.first().cloned());
-        let Some((fid, pending)) = picked else {
-            return None;
-        };
-        self.pending_relocate.remove(&fid)?;
-        Some(pending)
+        for (fid, pending) in candidates {
+            let ok = self
+                .remote_content_matches(
+                    &pending.fid,
+                    pending.content_hash.as_deref(),
+                    local_sha1,
+                    local_md5,
+                )
+                .await;
+            if ok {
+                if self.pending_relocate.remove(&fid).is_some() {
+                    return Some(pending);
+                }
+            }
+        }
+        None
     }
 
     /// 记下 PUT 上的客户端 mtime，供列表和上传预创建使用。
@@ -413,6 +451,12 @@ impl QuarkDriveFileSystem {
 
     pub fn set_skip_upload_same_size(&mut self, skip_upload_same_size: bool) -> &mut Self {
         self.skip_upload_same_size = skip_upload_same_size;
+        self
+    }
+
+    /// CloudSync 删除延迟真删的体积下限；0 表示任意大小都先挂起。
+    pub fn set_relocate_defer_min_size(&mut self, bytes: u64) -> &mut Self {
+        self.relocate_defer_min_size = bytes;
         self
     }
 
@@ -1045,8 +1089,8 @@ impl DavFileSystem for QuarkDriveFileSystem {
             }
             let mode = self.drive_mode();
             let path_str = path.display().to_string();
-            // CloudSync 跨目录「移动」= 先删再整文件上传。大文件先挂起删除，后面同名同大小 PUT 时改 move。
-            if file.size >= RELOCATE_MIN_SIZE {
+            // CloudSync 常先删再传：挂起真删，PUT 时再比内容或 relocate。
+            if file.size >= self.relocate_defer_min_size {
                 self.note_pending_relocate(&file, &path_str);
                 self.oplog
                     .log_delete(&path_str, false, mode, "ok:pending_move")
@@ -1263,6 +1307,8 @@ struct QuarkDavFile {
     prefetch: Option<crate::prefetch::Prefetcher>,
     md5_ctx: Md5Context,
     sha1_ctx: Sha1,
+    /// 本次 PUT 认领了同路径挂起删除的 fid，跳过上传必须靠 hash 证明。
+    from_deferred_same_path: bool,
 }
 
 impl Debug for QuarkDavFile {
@@ -1301,6 +1347,7 @@ impl QuarkDavFile {
             http_download: false,
             md5_ctx: Md5Context::new(),
             sha1_ctx: Sha1::default(),
+            from_deferred_same_path: false,
         }
     }
 
@@ -1446,6 +1493,23 @@ impl QuarkDavFile {
         if !self.file.fid.is_empty() {
             return;
         }
+        let log_path = self.upload_log_path();
+        if let Some(pending) = self
+            .fs
+            .peek_pending_same_path(&log_path, &self.file.file_name)
+        {
+            info!(
+                file_name = %self.file.file_name,
+                fid = %pending.fid,
+                path = %log_path,
+                "adopt deferred-delete fid for content check"
+            );
+            self.file.fid = pending.fid;
+            self.file.size = pending.size;
+            self.file.content_hash = pending.content_hash;
+            self.from_deferred_same_path = true;
+            return;
+        }
         self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
         let path = self.parent_dir.join(&self.file.file_name);
         let Ok(Some(existing)) = self.fs.find_in_cache(&path).await else {
@@ -1542,11 +1606,16 @@ impl QuarkDavFile {
         let local_mtime_ms = self.fs.client_mtime_ms(&self.upload_log_path()).unwrap_or(0);
 
         // CloudSync 跨目录移动：刚才删的大文件同名同大小再 PUT → 网盘内 move，不重传 11GB。
-        if let Some(pending) =
-            self.fs
-                .take_pending_relocate(&self.file.file_name, size, &sha1, &md5)
+        let to_path = self.upload_log_path();
+        if let Some(pending) = self.fs.take_pending_relocate_verified(
+            &self.file.file_name,
+            &to_path,
+            size,
+            &sha1,
+            &md5,
+        )
+        .await
         {
-            let to_path = self.upload_log_path();
             let mode = self.fs.drive_mode();
             match self
                 .fs
@@ -1612,23 +1681,39 @@ impl QuarkDavFile {
                     None
                 }
             };
-            match decide_reupload(
-                self.file.content_hash.as_deref(),
-                api_md5.as_deref(),
-                self.file.size,
-                &sha1,
-                &md5,
-                size,
-                self.fs.skip_upload_same_size,
-            ) {
+            let decision = if self.from_deferred_same_path {
+                decide_reupload_after_deferred_delete(
+                    self.file.content_hash.as_deref(),
+                    api_md5.as_deref(),
+                    &sha1,
+                    &md5,
+                )
+            } else {
+                decide_reupload(
+                    self.file.content_hash.as_deref(),
+                    api_md5.as_deref(),
+                    self.file.size,
+                    &sha1,
+                    &md5,
+                    size,
+                    self.fs.skip_upload_same_size,
+                )
+            };
+            match decision {
                 ReuploadDecision::Skip(reason) => {
                     info!(file_name = %self.file.file_name, reason, size, "skip re-upload");
+                    if !self.file.fid.is_empty() {
+                        self.fs.cancel_pending_relocate(&self.file.fid);
+                    }
                     self.upload_state.is_finished = true;
                     self.log_upload_result(size, reason).await;
                     self.after_flush(true).await?;
                     return Ok(());
                 }
                 ReuploadDecision::Replace => {
+                    if !self.file.fid.is_empty() {
+                        self.fs.cancel_pending_relocate(&self.file.fid);
+                    }
                     old_fid = std::mem::take(&mut self.file.fid);
                 }
             }
@@ -2824,6 +2909,20 @@ enum ReuploadDecision {
     Replace,
 }
 
+/// 挂起删除后的同路径 PUT：只有摘要一致才跳过，禁止仅凭同大小猜测。
+fn decide_reupload_after_deferred_delete(
+    cloud_hash: Option<&str>,
+    api_md5: Option<&str>,
+    sha1: &str,
+    md5: &str,
+) -> ReuploadDecision {
+    if hash_matches(cloud_hash, sha1, md5) || hash_matches(api_md5, sha1, md5) {
+        ReuploadDecision::Skip("skip:hash")
+    } else {
+        ReuploadDecision::Replace
+    }
+}
+
 /// CloudSync 对账失败会把同一个大文件再 PUT 一次。
 /// Open 模式拿不到 md5，不能因为「对不上 hash」就删掉已传好的文件再传 11GB。
 fn decide_reupload(
@@ -3119,6 +3218,15 @@ mod tests {
         let url = "https://example.com/file?Expires=not_a_number";
         // Non-numeric Expires should not cause a panic, returns false
         assert!(!is_url_expired(url));
+    }
+
+    #[test]
+    fn deferred_delete_requires_hash_to_skip() {
+        let d = decide_reupload_after_deferred_delete(None, None, "abc", "def");
+        assert_eq!(d, ReuploadDecision::Replace);
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let d = decide_reupload_after_deferred_delete(Some(sha), None, sha, "def");
+        assert_eq!(d, ReuploadDecision::Skip("skip:hash"));
     }
 
     #[test]

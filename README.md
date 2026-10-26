@@ -77,6 +77,7 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录�
 | `UPLOAD_LARGE_THRESHOLD` | 智能调度大文件阈值（FIFO 快车道） | `32MB` |
 | `UPLOAD_SLOW_BPS` | 非快车道大文件慢传速率 | `512KB` |
 | `UPLOAD_WAIT_TIMEOUT` | 等待后台上传完成的最长秒数；`0`=一直等到传完再回客户端。大文件请保持 `0`，设成正数（如 900）会提前返回，CloudSync 易整文件重传 | `0` |
+| `RELOCATE_DEFER_MIN_SIZE` | CloudSync **先删后传**时，不小于此大小的删除才延迟进回收站；`0`=全部先挂起，等 PUT **比 hash 一致**再跳过或 relocate（不一致则照常重传，保证内容一致） | `0` |
 | `DIR_CACHE_SIZE` | 目录缓存最多目录数 | `1000` |
 | `DIR_CACHE_BYTES` | 目录缓存字节上限，如 `64MB` | `64MB` |
 | `CHUNK_CACHE_MB` | 播放预取块缓存（MB），`0` 关闭 | `128` |

@@ -170,6 +170,9 @@ struct Opt {
     /// 设为正数则超时后先返回、后台继续传（旧「快返回」行为）。
     #[arg(long, env = "UPLOAD_WAIT_TIMEOUT", default_value_t = 0)]
     upload_wait_timeout: u64,
+    /// CloudSync 先删后传时，不小于此大小的删除才延迟进回收站（0=全部延迟，32MB=仅大文件）。
+    #[arg(long, env = "RELOCATE_DEFER_MIN_SIZE", default_value = "0")]
+    relocate_defer_min_size: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -316,12 +319,14 @@ async fn main() -> anyhow::Result<()> {
     oplog.start_prune_task();
 
     let cache_bytes = parse_byte_size(&opt.cache_bytes)?;
+    let relocate_defer_min_size = parse_byte_size(&opt.relocate_defer_min_size)?;
     let mut fs =
         QuarkDriveFileSystem::new(drive, opt.root, opt.cache_size, cache_bytes, opt.cache_ttl)?;
     fs.set_no_trash(opt.no_trash)
         .set_read_only(opt.read_only)
         .set_upload_buffer_size(opt.upload_buffer_size)
         .set_upload_memory_limit(upload_memory_limit)
+        .set_relocate_defer_min_size(relocate_defer_min_size)
         .set_skip_upload_same_size(opt.skip_upload_same_size)
         .set_prefer_http_download(opt.prefer_http_download)
         .set_upload_wait_timeout(opt.upload_wait_timeout)
