@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -401,6 +401,43 @@ pub fn generate_req_sign(method: &str, pathname: &str, sign_key: &str) -> (Strin
     (tm, token, req_id)
 }
 
+/// 全局限流：并发上限 + 最小间隔，降低 CloudSync 扫目录时的 429。
+#[derive(Debug)]
+struct OpenApiGate {
+    sem: Semaphore,
+    last_start: Mutex<Option<Instant>>,
+    min_interval: Duration,
+}
+
+impl OpenApiGate {
+    fn new(max_concurrent: usize, min_interval_ms: u64) -> Self {
+        Self {
+            sem: Semaphore::new(max_concurrent.max(1)),
+            last_start: Mutex::new(None),
+            min_interval: Duration::from_millis(min_interval_ms.max(1)),
+        }
+    }
+
+    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        let permit = self
+            .sem
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("Open API 限流信号量已关闭"))?;
+        {
+            let mut last = self.last_start.lock().await;
+            if let Some(prev) = *last {
+                let elapsed = prev.elapsed();
+                if elapsed < self.min_interval {
+                    tokio::time::sleep(self.min_interval - elapsed).await;
+                }
+            }
+            *last = Some(Instant::now());
+        }
+        Ok(permit)
+    }
+}
+
 /// Open API 客户端：挂在 `QuarkDrive` 上，负责签名请求与上传。
 #[derive(Debug, Clone)]
 pub struct OpenClient {
@@ -408,9 +445,11 @@ pub struct OpenClient {
     pub api_base: String,
     alert: Alert,
     /// 授权探测成功后的短缓存，避免每次浏览都打 user/info。
-    auth_ok_until: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    auth_ok_until: Arc<Mutex<Option<Instant>>>,
     /// 刷新 token 单飞，避免并发请求把日志刷爆。
-    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    refresh_lock: Arc<Mutex<()>>,
+    /// Open API 调用节流（含 list/mkdir）。
+    api_gate: Arc<OpenApiGate>,
 }
 
 impl OpenClient {
@@ -419,8 +458,10 @@ impl OpenClient {
             creds,
             api_base: OPEN_API_BASE.to_string(),
             alert,
-            auth_ok_until: Arc::new(tokio::sync::Mutex::new(None)),
-            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auth_ok_until: Arc::new(Mutex::new(None)),
+            refresh_lock: Arc::new(Mutex::new(())),
+            // 2 路并发 + ≥200ms 间隔：同步建大量目录时比无节流少打很多 list。
+            api_gate: Arc::new(OpenApiGate::new(2, 200)),
         }
     }
 
@@ -949,7 +990,7 @@ impl OpenClient {
         Ok(etag)
     }
 
-    /// 带签名的 Open 请求；access_token 过期时自动刷新并重试一次。
+    /// 带签名的 Open 请求；429 退避重试；access_token 过期时刷新并重试一次。
     async fn request<T>(
         &self,
         client: &ClientWithMiddleware,
@@ -966,44 +1007,79 @@ impl OpenClient {
             return Err(err);
         }
 
-        match self
-            .request_once::<T>(client, pathname, method, body.as_ref(), manual, false)
-            .await
-        {
-            Ok(v) => Ok(v),
-            Err(err) if is_token_expired_error(&err) => {
-                let _guard = self.refresh_lock.lock().await;
-                // 其他请求可能已刷新成功，先用新 token 再试；仍失败再真正 refresh。
-                if let Ok(v) = self
-                    .request_once::<T>(client, pathname, method, body.as_ref(), manual, true)
+        const MAX_RATE_RETRIES: u32 = 5;
+        let mut rate_attempt = 0u32;
+        loop {
+            let result = {
+                let _permit = self.api_gate.acquire().await?;
+                self.request_once::<T>(client, pathname, method, body.as_ref(), manual, false)
                     .await
-                {
-                    return Ok(v);
+            };
+
+            match result {
+                Ok(v) => return Ok(v),
+                Err(err) if is_rate_limited_error(&err) && rate_attempt < MAX_RATE_RETRIES => {
+                    // 2s、4s、8s、16s、32s；限流时勿刷企微，退避后重试。
+                    let delay_secs = 2u64 << rate_attempt.min(4);
+                    warn!(
+                        pathname = %pathname,
+                        attempt = rate_attempt + 1,
+                        delay_secs,
+                        error = %err,
+                        "Open API 限流，退避后重试"
+                    );
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                    rate_attempt += 1;
+                    continue;
                 }
-                warn!(error = %err, "access_token 失效，尝试刷新后重试");
-                if let Err(refresh_err) = self.refresh_token(client).await {
-                    let msg = format!("{refresh_err:#}");
-                    if !msg.contains("尚未授权") && !msg.contains("缺少 refresh_token") {
-                        self.alert.notify("Open Token 刷新失败", &msg).await;
+                Err(err) if is_token_expired_error(&err) => {
+                    let _guard = self.refresh_lock.lock().await;
+                    {
+                        let _permit = self.api_gate.acquire().await?;
+                        if let Ok(v) = self
+                            .request_once::<T>(
+                                client,
+                                pathname,
+                                method,
+                                body.as_ref(),
+                                manual,
+                                true,
+                            )
+                            .await
+                        {
+                            return Ok(v);
+                        }
                     }
-                    return Err(refresh_err);
+                    warn!(error = %err, "access_token 失效，尝试刷新后重试");
+                    if let Err(refresh_err) = self.refresh_token(client).await {
+                        let msg = format!("{refresh_err:#}");
+                        if !msg.contains("尚未授权") && !msg.contains("缺少 refresh_token") {
+                            self.alert.notify("Open Token 刷新失败", &msg).await;
+                        }
+                        return Err(refresh_err);
+                    }
+                    let _permit = self.api_gate.acquire().await?;
+                    return self
+                        .request_once(client, pathname, method, body.as_ref(), manual, true)
+                        .await;
                 }
-                self.request_once(client, pathname, method, body.as_ref(), manual, true)
-                    .await
-            }
-            Err(err) => {
-                let msg = err.to_string();
-                if msg.contains("尚未授权") || msg.contains("缺少 refresh_token") {
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("尚未授权") || msg.contains("缺少 refresh_token") {
+                        return Err(err);
+                    }
+                    // 限流告警单独归类，且走 alert 去重，避免刷屏。
+                    if is_rate_limited_error(&err) {
+                        self.alert.notify("Open API 限流", &msg).await;
+                    } else if msg.contains("errno")
+                        || msg.contains("Open API")
+                        || msg.contains("令牌")
+                        || msg.contains("token")
+                    {
+                        self.alert.notify("Open API 请求失败", &msg).await;
+                    }
                     return Err(err);
                 }
-                if msg.contains("errno")
-                    || msg.contains("Open API")
-                    || msg.contains("令牌")
-                    || msg.contains("token")
-                {
-                    self.alert.notify("Open API 请求失败", &msg).await;
-                }
-                Err(err)
             }
         }
     }
@@ -1081,9 +1157,15 @@ impl OpenClient {
                         err_body.errno
                     );
                 }
+                if err_body.errno == 429 {
+                    bail!("Open API 错误: 限流 (status={}, errno=429)", err_body.status);
+                }
             }
         }
 
+        if status.as_u16() == 429 {
+            bail!("Open API 错误: 限流 (status=-1, errno=429)");
+        }
         if !status.is_success() {
             bail!("Open API HTTP {status}: {text}");
         }
@@ -1573,6 +1655,15 @@ impl std::fmt::Display for TokenExpiredError {
 
 impl std::error::Error for TokenExpiredError {}
 
+fn is_rate_limited_error(err: &anyhow::Error) -> bool {
+    let s = err.to_string();
+    s.contains("errno=429")
+        || s.contains("errno: 429")
+        || s.contains("限流")
+        || s.contains("HTTP 429")
+        || s.contains("Too Many Requests")
+}
+
 fn is_token_expired_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<TokenExpiredError>().is_some()
 }
@@ -1623,6 +1714,15 @@ mod tests {
         assert!(is_oss_url_expired_error(&anyhow!("SignatureDoesNotMatch")));
         assert!(!is_oss_url_expired_error(&anyhow!("HTTP 504 Gateway Timeout")));
         assert!(is_retryable_oss_put_error(&anyhow!("HTTP 504 Gateway Timeout")));
+    }
+
+    #[test]
+    fn test_rate_limited_detection() {
+        assert!(is_rate_limited_error(&anyhow!(
+            "Open API 错误: 限流 (status=-1, errno=429)"
+        )));
+        assert!(is_rate_limited_error(&anyhow!("HTTP 429 Too Many Requests")));
+        assert!(!is_rate_limited_error(&anyhow!("Open API 错误: bad request")));
     }
 
     #[test]

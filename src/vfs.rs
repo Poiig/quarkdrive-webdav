@@ -531,11 +531,13 @@ impl QuarkDriveFileSystem {
         parent_key: &str,
     ) -> bool {
         self.update_uploading_file(parent_key, file_name, size);
+        // 先靠占位满足 PROPFIND；稍后再开始刷列表，避免刚 finish 就打爆 Open API。
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         self.dir_cache.invalidate(parent_dir).await;
 
-        // 90s：小文件也偶发列表延迟；超时仍保留占位。
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
-        let mut delay = std::time::Duration::from_millis(300);
+        // 60s 内温和轮询；间隔更长，减少 list 触发限流。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut delay = std::time::Duration::from_secs(1);
         let key = Self::parent_cache_key(parent_dir);
         let mut visible = false;
 
@@ -561,7 +563,7 @@ impl QuarkDriveFileSystem {
             }
             self.dir_cache.invalidate(parent_dir).await;
             tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(std::time::Duration::from_secs(2));
+            delay = (delay * 2).min(std::time::Duration::from_secs(8));
         }
 
         // 延迟摘占位：给 CloudSync 紧接 PUT 的 PROPFIND 留窗口。
@@ -1068,17 +1070,21 @@ impl DavFileSystem for QuarkDriveFileSystem {
                         uploading.push(stub);
                     }
                 }
-                let visible = self
-                    .wait_until_remote_visible(parent_path, &name, 0, &parent_key)
-                    .await;
-                if !visible {
-                    warn!(
-                        path = %path_str,
-                        "mkdir not yet in remote listing; stub kept for PROPFIND"
-                    );
-                }
-                self.dir_cache.invalidate(&path).await;
-                self.dir_cache.invalidate_parent(&path).await;
+                // 不在 MKCOL 路径上轮询 list（CloudSync 批量建目录时会打爆 Open API → 429）。
+                // 占位已能让紧随其后的 PROPFIND 看见；后台延迟刷新一次缓存即可。
+                let fs = self.clone();
+                let parent_owned = parent_path.to_path_buf();
+                let path_owned = path.clone();
+                let parent_key_bg = parent_key;
+                let name_bg = name;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    fs.dir_cache.invalidate(&parent_owned).await;
+                    fs.dir_cache.invalidate(&path_owned).await;
+                    // 再等一会儿摘占位；若远端仍慢，占位最多留到这里。
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    fs.remove_uploading_file(&parent_key_bg, &name_bg);
+                });
                 Ok(())
             } else {
                 Err(FsError::Forbidden)
