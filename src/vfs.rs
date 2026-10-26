@@ -22,7 +22,7 @@ use crate::{
     drive::{QuarkDrive, QuarkFile, UploadSource},
     oplog::OpLog,
     upload_progress::UploadTracker,
-    util::is_ignored_system_file,
+    util::{is_cloudsync_metadata_dir, should_ignore_system_path},
 };
 use bytes::BufMut;
 
@@ -973,7 +973,13 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 error!(error = %err, "get quota failed");
                 FsError::GeneralFailure
             })?;
-            Ok((used, Some(total)))
+            // Open 无容量 API；total=0 会让部分客户端（含 Cloud Sync）认为远端不可写。
+            let total_opt = if self.drive.is_open_mode() && total == 0 {
+                None
+            } else {
+                Some(total)
+            };
+            Ok((used, total_opt))
         }
             .boxed()
     }
@@ -994,19 +1000,22 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 return Err(FsError::Forbidden);
             }
             // check if the folder already exists
-            if self.get_file(path.clone()).await?.is_some() {
-                return Err(FsError::Exists);
-            }
             if let Some(name) = path.file_name() {
                 let name = name.to_string_lossy().into_owned();
-                // OpenList IgnoreSystemFiles：系统目录 MKCOL 本地成功即可。
-                if is_ignored_system_file(&name) {
-                    debug!(path = %path.display(), "ignore system dir mkcol");
+                let path_str = path.display().to_string();
+                if self.get_file(path.clone()).await?.is_some() {
+                    if is_cloudsync_metadata_dir(&name) {
+                        debug!(path = %path_str, "cloudsync metadata dir mkcol idempotent ok");
+                        return Ok(());
+                    }
+                    return Err(FsError::Exists);
+                }
+                if should_ignore_system_path(&path_str, &name) {
+                    debug!(path = %path_str, "ignore system dir mkcol");
                     return Ok(());
                 }
                 self.dir_cache.invalidate(parent_path).await;
                 let mode = self.drive_mode();
-                let path_str = path.display().to_string();
                 match self.drive.create_folder(&parent_file.fid, &name).await {
                     Ok(()) => {
                         self.oplog.log_mkdir(&path_str, mode, "ok").await;
@@ -1355,9 +1364,9 @@ impl QuarkDavFile {
         if self.upload_state.is_finished {
             return Ok(false);
         }
-        // OpenList IgnoreSystemFiles：CloudSync 的 .DS_Store/@eaDir 等本地吞掉，不上云。
-        if is_ignored_system_file(&self.file.file_name) {
-            debug!(file_name = %self.file.file_name, "ignore system file upload");
+        let log_path = self.upload_log_path();
+        if should_ignore_system_path(&log_path, &self.file.file_name) {
+            debug!(file_name = %self.file.file_name, path = %log_path, "ignore system file upload");
             if let Some(ref parent) = self.file.parent_path {
                 self.fs
                     .remove_uploading_file(parent, &self.file.file_name);

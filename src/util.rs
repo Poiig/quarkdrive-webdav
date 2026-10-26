@@ -8,18 +8,38 @@ pub fn shanghai_offset() -> FixedOffset {
     FixedOffset::east_opt(8 * 3600).expect("UTC+8")
 }
 
-/// 系统/同步垃圾文件：对齐 OpenList `IsSystemFile`，并补充群晖 Cloud Sync 常见项。
-/// 对这些名字的 PUT/MKCOL 做本地成功、不上云，避免同步任务被系统文件拖死。
-/// `cloudsync_encrypt.info` 必须实际上传，否则群晖会报「上传加密密钥失败」。
+/// 群晖加密任务在远端创建的元数据目录名（须真实 MKCOL/上传，不能吞掉）。
+pub const CLOUDSYNC_METADATA_DIR: &str = "@SynologyCloudSync";
+
+pub fn is_cloudsync_metadata_dir(name: &str) -> bool {
+    name == CLOUDSYNC_METADATA_DIR
+}
+
+/// 路径是否在 `@SynologyCloudSync` 之下（该树下文件一律要落盘）。
+pub fn is_under_cloudsync_metadata(dav_path: &str) -> bool {
+    let norm = dav_path.trim().replace('\\', "/");
+    norm.split('/')
+        .any(|seg| !seg.is_empty() && is_cloudsync_metadata_dir(seg))
+}
+
+/// 系统/同步垃圾文件：对齐 OpenList `IsSystemFile`，并补充群晖常见项。
+/// 对普通用户目录下的这些名字 PUT/MKCOL 做本地成功、不上云。
 pub fn is_ignored_system_file(name: &str) -> bool {
     match name {
         ".DS_Store" | "desktop.ini" | "Thumbs.db" | "@eaDir" | "@tmp" | "#recycle"
-        | "#snapshot" | ".SynologyWorkingDirectory" | "@SynologyCloudSync" | "@sharebin" => true,
+        | "#snapshot" | ".SynologyWorkingDirectory" | "@sharebin" => true,
         _ => {
-            // Apple Double / 临时备份前缀
             name.starts_with("._") || name.starts_with("~.")
         }
     }
+}
+
+/// WebDAV 路径 + 文件名是否应忽略上传/建目录（元数据目录例外）。
+pub fn should_ignore_system_path(dav_path: &str, file_name: &str) -> bool {
+    if is_cloudsync_metadata_dir(file_name) || is_under_cloudsync_metadata(dav_path) {
+        return false;
+    }
+    is_ignored_system_file(file_name)
 }
 
 /// 当前 Asia/Shanghai 时间，不依赖容器 TZ。
@@ -106,8 +126,13 @@ mod tests {
         assert!(is_ignored_system_file("._photo.jpg"));
         assert!(is_ignored_system_file(".SynologyWorkingDirectory"));
         assert!(!is_ignored_system_file("cloudsync_encrypt.info"));
+        assert!(!is_ignored_system_file("@SynologyCloudSync"));
         assert!(!is_ignored_system_file("photo.jpg"));
         assert!(!is_ignored_system_file("readme.md"));
+        assert!(should_ignore_system_path("/photos", ".DS_Store"));
+        assert!(!should_ignore_system_path("/@SynologyCloudSync", "cloudsync_encrypt.info"));
+        assert!(!should_ignore_system_path("/homes/@SynologyCloudSync/x", "cloudsync_encrypt.info"));
+        assert!(is_under_cloudsync_metadata("/homes/@SynologyCloudSync/cloudsync_encrypt.info"));
     }
 
     #[test]
