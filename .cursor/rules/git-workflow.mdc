@@ -1,0 +1,9 @@
+---
+description: 提交直接进入 main，不开启 Pull Request
+alwaysApply: true
+---
+
+本仓库不需要开 Pull Request。改完后直接在 `main` 上提交并推送，不要开功能分支，不要创建 PR。
+
+- 在 `main` 上修改，然后 `git commit`、`git push origin main`
+- 远程是 GitHub 时，提交身份用命令行参数，不要改 git config：`git -c user.name=poiig -c user.email=poiigzhao@126.com commit`
