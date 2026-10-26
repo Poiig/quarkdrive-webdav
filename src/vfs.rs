@@ -22,7 +22,7 @@ use crate::{
     drive::{QuarkDrive, QuarkFile, UploadSource},
     oplog::OpLog,
     upload_progress::UploadTracker,
-    util::{is_cloudsync_metadata_dir, should_ignore_system_path},
+    util::is_cloudsync_metadata_dir,
 };
 use bytes::BufMut;
 
@@ -1010,10 +1010,6 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     }
                     return Err(FsError::Exists);
                 }
-                if should_ignore_system_path(&path_str, &name) {
-                    debug!(path = %path_str, "ignore system dir mkcol");
-                    return Ok(());
-                }
                 self.dir_cache.invalidate(parent_path).await;
                 let mode = self.drive_mode();
                 match self.drive.create_folder(&parent_file.fid, &name).await {
@@ -1362,16 +1358,6 @@ impl QuarkDavFile {
 
     async fn prepare_for_upload(&mut self) -> Result<bool, FsError> {
         if self.upload_state.is_finished {
-            return Ok(false);
-        }
-        let log_path = self.upload_log_path();
-        if should_ignore_system_path(&log_path, &self.file.file_name) {
-            debug!(file_name = %self.file.file_name, path = %log_path, "ignore system file upload");
-            if let Some(ref parent) = self.file.parent_path {
-                self.fs
-                    .remove_uploading_file(parent, &self.file.file_name);
-            }
-            self.upload_state.is_finished = true;
             return Ok(false);
         }
         if !self.upload_state.is_uploading {
