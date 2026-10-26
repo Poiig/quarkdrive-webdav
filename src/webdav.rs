@@ -149,6 +149,26 @@ impl QuarkDriveWebDav {
             .any(|p| p == "thumb=1" || p.starts_with("thumb=") || p == "thumb")
     }
 
+    /// PUT 上的 `X-OC-Mtime` 记下来。群晖 CloudSync 用它表示本地文件时间。
+    fn remember_put_mtime(&self, req: &Request<hyper::body::Incoming>, req_path: &str) {
+        if req.method() != Method::PUT {
+            return;
+        }
+        let raw = req
+            .headers()
+            .get("x-oc-mtime")
+            .or_else(|| req.headers().get("oc-mtime"))
+            .and_then(|v| v.to_str().ok());
+        let Some(raw) = raw else {
+            return;
+        };
+        let Some(ms) = crate::vfs::parse_client_mtime_ms(raw) else {
+            return;
+        };
+        let path = self.compute_fs_path(req_path);
+        self.fs.note_client_mtime(&path.to_string_lossy(), ms);
+    }
+
     fn compute_fs_path(&self, req_path: &str) -> PathBuf {
         let path = if let Some(ref prefix) = self.strip_prefix {
             let prefix = prefix.trim_end_matches('/');
@@ -2369,6 +2389,7 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
                 }
 
                 let config = DavConfig::new().principal(auth_user_val);
+                browser_handler.remember_put_mtime(&req, &req_path);
                 dav_server.handle_with(config, req).await
             } else {
                 if is_browser || Self::is_console_path(&req_path) {
@@ -2377,6 +2398,7 @@ impl Service<Request<hyper::body::Incoming>> for QuarkDriveWebDav {
                     }
                 }
 
+                browser_handler.remember_put_mtime(&req, &req_path);
                 dav_server.handle(req).await
             };
 

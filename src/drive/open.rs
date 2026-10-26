@@ -599,6 +599,8 @@ impl OpenClient {
         progress: Option<(&crate::upload_progress::UploadTracker, &str)>,
         smart: Option<&crate::upload_schedule::SmartUploadPermit>,
         cancel: Option<&AtomicBool>,
+        local_mtime_ms: u64,
+        old_fid: &str,
     ) -> Result<()> {
         let pathname = "/open/v1/file/upload_pre";
         let (tm, x_pan_token, req_id) =
@@ -611,16 +613,19 @@ impl OpenClient {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        // 群晖 X-OC-Mtime 带来的是本地文件时间。写进夸克后，列表 mtime 才能对上，
+        // 否则 CloudSync 每次扫描都觉得远端更旧，把同一个大文件再 PUT 一遍。
+        let stamp_ms = if local_mtime_ms > 0 { local_mtime_ms } else { now_ms };
         let body = json!({
             "file_name": file_name,
             "size": size,
             "format_type": get_format_type(file_name),
             "md5": md5,
             "sha1": sha1,
-            "l_created_at": now_ms,
-            "l_updated_at": now_ms,
+            "l_created_at": stamp_ms,
+            "l_updated_at": stamp_ms,
             "pdir_fid": pdir_fid,
-            // 重复上传走本项目 VFS「先删后传」，不用 OpenList 的同路径复用。
+            // 允许同名并存。VFS 等新文件传完再删旧的，分片失败时旧文件还在。
             "same_path_reuse": false,
             "proof_version": proof_version,
             "proof_seed1": proof_seed1,
@@ -647,6 +652,9 @@ impl OpenClient {
         if pre.data.task_id.is_empty() {
             bail!("upload_pre 未返回 task_id");
         }
+        // 失败时用来删本次预创建的文件；成功的 finish 不会走到清理。
+        let new_fid = pre.data.fid.clone();
+        let uploaded = async {
         // 夸克 get_upload_urls / finish 的 part list 上限约 256（超出会 part list exceed）。
         let part_size = effective_part_size(size, pre.data.part_size.max(0) as u64);
         let part_info = build_part_info(size, part_size);
@@ -748,8 +756,35 @@ impl OpenClient {
                 finish.data.task_id
             );
         }
-        let _ = pre.data.fid;
         Ok(())
+        }
+        .await;
+        if let Err(err) = uploaded {
+            // 分片失败不能把半成品留在网盘：下次 CloudSync 重试会把它当成已存在的同大小文件跳过。
+            self.discard_incomplete_upload(client, &new_fid, old_fid).await;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// 分片或 finish 失败后丢掉本次预创建的文件。和旧文件是同一个 fid 时不删。
+    async fn discard_incomplete_upload(
+        &self,
+        client: &ClientWithMiddleware,
+        fid: &str,
+        old_fid: &str,
+    ) {
+        if fid.is_empty() || fid == old_fid {
+            return;
+        }
+        match self.delete_file(client, fid).await {
+            Ok(()) => info!(fid, "removed incomplete open upload after failure"),
+            Err(err) => debug!(
+                fid,
+                error = %err,
+                "cleanup incomplete open upload failed (task may not be listed yet)"
+            ),
+        }
     }
 
     /// 向 Open API 申请一批分片的签名上传 URL（须在过期前用完）。

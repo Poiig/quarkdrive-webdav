@@ -305,6 +305,10 @@ impl QuarkDrive {
         progress: Option<(&crate::upload_progress::UploadTracker, &str)>,
         smart: Option<&crate::upload_schedule::SmartUploadPermit>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        // 客户端文件 mtime（unix 毫秒）。0 表示未知，上传时用当前时间。
+        local_mtime_ms: u64,
+        // 同名旧文件。失败清理时若预创建 fid 和它相同，不能删。
+        old_fid: &str,
     ) -> Result<()> {
         let open = self
             .open
@@ -322,6 +326,8 @@ impl QuarkDrive {
             progress,
             smart,
             cancel,
+            local_mtime_ms,
+            old_fid,
         )
         .await
     }
@@ -1004,9 +1010,18 @@ impl QuarkDrive {
         ))
     }
 
-    pub async fn up_pre(&self, file_name: &str, size: u64, pdir_fid: &str) -> Result<UpPreResponse> {
+    pub async fn up_pre(
+        &self,
+        file_name: &str,
+        size: u64,
+        pdir_fid: &str,
+        local_mtime_ms: u64,
+    ) -> Result<UpPreResponse> {
 
         let format_type = get_format_type(file_name);
+        let now_ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_millis() as u64;
+        // 有客户端 mtime 时写进夸克，PROPFIND 才能和群晖本地时间对齐。
+        let stamp_ms = if local_mtime_ms > 0 { local_mtime_ms } else { now_ms };
 
         let req = UpPreRequest {
             file_name: file_name.to_string(),
@@ -1014,8 +1029,8 @@ impl QuarkDrive {
             pdir_fid: pdir_fid.to_string(),
             format_type: format_type.to_string(),
             ccp_hash_update: true,
-            l_created_at: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_millis() as u64,
-            l_updated_at: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_millis() as u64,
+            l_created_at: stamp_ms,
+            l_updated_at: stamp_ms,
             // 上传文件夹？待确认
             dir_name: "".to_string(),
             parallel_upload:false,
@@ -1885,7 +1900,7 @@ mod tests {
         let drive = create_drive_from_env();
         // Test upload preparation (up_pre)
         let file_name = format!("_test_upload_{}.txt", chrono::Utc::now().timestamp_millis());
-        let res = drive.up_pre(&file_name, 11, "0").await.unwrap();
+        let res = drive.up_pre(&file_name, 11, "0", 0).await.unwrap();
 
         assert!(!res.data.task_id.is_empty(), "task_id should not be empty");
         assert!(!res.data.obj_key.is_empty(), "obj_key should not be empty");

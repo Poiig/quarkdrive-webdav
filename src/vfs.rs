@@ -128,6 +128,9 @@ pub struct QuarkDriveFileSystem {
     upload_tracker: UploadTracker,
     /// 正在向网盘上传的路径集合：防止 upload_wait_timeout 提前返回后客户端重 PUT 再开一条 OSS。
     upload_inflight: Arc<DashMap<String, ()>>,
+    /// 客户端 PUT 带来的文件 mtime（unix 毫秒）。PROPFIND 用它覆盖夸克的上传时间，
+    /// 否则 CloudSync 每次对账都认为远端时间不对，把同一个文件再传一遍。
+    client_mtimes: Arc<DashMap<String, u64>>,
 }
 
 impl QuarkDriveFileSystem {
@@ -163,7 +166,29 @@ impl QuarkDriveFileSystem {
             oplog: Arc::new(OpLog::new("./logs", 7)),
             upload_tracker: UploadTracker::new(),
             upload_inflight: Arc::new(DashMap::new()),
+            client_mtimes: Arc::new(DashMap::new()),
         })
+    }
+
+    /// 记下 PUT 上的客户端 mtime，供列表和上传预创建使用。
+    pub fn note_client_mtime(&self, path: &str, unix_ms: u64) {
+        if unix_ms == 0 || path.is_empty() {
+            return;
+        }
+        self.client_mtimes.insert(path.to_string(), unix_ms);
+    }
+
+    fn client_mtime_ms(&self, path: &str) -> Option<u64> {
+        self.client_mtimes.get(path).map(|v| *v)
+    }
+
+    /// 列表/PROPFIND 报客户端原始时间，而不是夸克记下的「上传完成时刻」。
+    fn apply_client_mtime(&self, file: &mut QuarkFile) {
+        let parent = file.parent_path.as_deref().unwrap_or("");
+        let key = join_dav_path(parent, &file.file_name);
+        if let Some(ms) = self.client_mtimes.get(&key) {
+            file.updated_at = *ms;
+        }
     }
 
     /// 尝试登记「此路径正在上传」；已有则返回 None（调用方应跳过重复 flush）。
@@ -366,6 +391,93 @@ impl QuarkDriveFileSystem {
         visible
     }
 
+    /// 新文件已经出现在列表里之后再删旧 fid。
+    /// 秒传若复用了旧 fid，列表里不会有另一份，这时不能删，否则唯一副本没了。
+    async fn delete_replaced_file(&self, old_fid: &str, parent_dir: &Path, file_name: &str) {
+        if old_fid.is_empty() {
+            return;
+        }
+        let key = Self::parent_cache_key(parent_dir);
+        // 30 秒：大文件 finish 后列表偶尔滞后；超时就留着旧文件，避免误删。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            self.dir_cache.invalidate(parent_dir).await;
+            let found_new = self.dir_cache.get_or_insert(&key).await.map(|files| {
+                files.iter().any(|f| {
+                    file_names_equal(&f.file_name, file_name)
+                        && !f.fid.is_empty()
+                        && f.fid != old_fid
+                })
+            }).unwrap_or(false);
+            if found_new {
+                match self.drive.remove_file(old_fid, !self.no_trash).await {
+                    Ok(()) => {
+                        self.dir_cache.invalidate(parent_dir).await;
+                    }
+                    Err(err) => {
+                        // 新文件已在列表里。删旧失败不能把这次成功报成失败。
+                        warn!(old_fid, error = %err, "new upload ok but deleting previous file failed");
+                    }
+                }
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(old_fid, file_name, "replacement not visible; keep previous file");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    /// 上传字节已经结束。这里才等列表，调用方必须先放开上传槽和快车道。
+    async fn complete_background_upload(
+        &self,
+        tracker: &UploadTracker,
+        progress_path: &str,
+        parent_dir: &Path,
+        file_name: &str,
+        size: u64,
+        parent_key: &str,
+        log_path: &str,
+        log_mode: &str,
+        old_fid: &str,
+    ) {
+        self.delete_replaced_file(old_fid, parent_dir, file_name).await;
+        let visible = self
+            .wait_until_remote_visible(parent_dir, file_name, size, parent_key)
+            .await;
+        let result = if visible { "ok" } else { "ok:list_pending" };
+        tracker.finish(progress_path, "ok", result);
+        self.oplog.log_upload(log_path, size, log_mode, result).await;
+    }
+
+    /// 失败：摘占位、作废目录缓存，让下一次 PUT 看到网盘真实状态而不是半截列表。
+    async fn fail_background_upload(
+        &self,
+        tracker: &UploadTracker,
+        progress_path: &str,
+        parent_dir: &Path,
+        file_name: &str,
+        parent_key: &str,
+        log_path: &str,
+        size: u64,
+        log_mode: &str,
+        detail: &str,
+    ) {
+        let detail = flatten_error(detail);
+        tracker.finish(progress_path, "error", &detail);
+        self.remove_uploading_file(parent_key, file_name);
+        self.dir_cache.invalidate(parent_dir).await;
+        let result = if detail.is_empty() {
+            "error".to_string()
+        } else if detail.starts_with("error") {
+            detail
+        } else {
+            format!("error:{detail}")
+        };
+        self.oplog.log_upload(log_path, size, log_mode, &result).await;
+    }
+
     async fn find_in_cache(&self, path: &Path) -> Result<Option<QuarkFile>, FsError> {
         if let Some(parent) = path.parent() {
             let parent_str = Self::parent_cache_key(parent);
@@ -382,7 +494,10 @@ impl QuarkDriveFileSystem {
                 }
                 None
             });
-            Ok(file)
+            Ok(file.map(|mut f| {
+                self.apply_client_mtime(&mut f);
+                f
+            }))
         } else {
             let root = QuarkFile::new_root();
             Ok(Some(root))
@@ -401,11 +516,12 @@ impl QuarkDriveFileSystem {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            if let Some(f) = self
+            if let Some(mut f) = self
                 .list_uploading_files(&parent_key)
                 .into_iter()
                 .find(|f| file_names_equal(&f.file_name, want))
             {
+                self.apply_client_mtime(&mut f);
                 return Ok(Some(f));
             }
         }
@@ -509,7 +625,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     .unwrap()
                     .as_millis();
 
-                let file = QuarkFile {
+                let mut file = QuarkFile {
                     fid: "".to_string(),
                     file_name: name,
                     pdir_fid: parent_file.fid.clone(),
@@ -525,6 +641,8 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     parent_path: Some(parent_path.to_string_lossy().into_owned()),
                     thumbnail_url: None,
                 };
+                // 占位期间 PROPFIND 也要报客户端 mtime，避免 PUT 还没返回群晖就觉得时间不对。
+                self.apply_client_mtime(&mut file);
 
                 let parent_key = Self::parent_cache_key(parent_path);
                 let mut uploading = self.uploading.entry(parent_key).or_default();
@@ -576,7 +694,8 @@ impl DavFileSystem for QuarkDriveFileSystem {
 
             let mut v: Vec<Result<Box<dyn DavDirEntry>, FsError>> =
                 Vec::with_capacity(files.len());
-            for file in files {
+            for mut file in files {
+                self.apply_client_mtime(&mut file);
                 v.push(Ok(Box::new(file)));
             }
 
@@ -1107,11 +1226,35 @@ impl QuarkDavFile {
     }
 
     fn upload_log_path(&self) -> String {
-        format!(
-            "{}/{}",
+        join_dav_path(
             self.file.parent_path.as_deref().unwrap_or(""),
-            self.file.file_name
+            &self.file.file_name,
         )
+    }
+
+    /// 占位的 fid 是空的。重 PUT 前强制刷一次父目录，认领已经在网盘上的同名文件，
+    /// 避免 same_path_reuse=false 再造出第二份。
+    async fn bind_existing_remote(&mut self) {
+        if !self.file.fid.is_empty() {
+            return;
+        }
+        self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
+        let path = self.parent_dir.join(&self.file.file_name);
+        let Ok(Some(existing)) = self.fs.find_in_cache(&path).await else {
+            return;
+        };
+        if existing.fid.is_empty() {
+            return;
+        }
+        info!(
+            file_name = %self.file.file_name,
+            fid = %existing.fid,
+            size = existing.size,
+            "adopt existing remote file before upload"
+        );
+        self.file.fid = existing.fid;
+        self.file.size = existing.size;
+        self.file.content_hash = existing.content_hash;
     }
 
     /// 丢弃客户端重试 PUT 产生的本地副本，并让本次 flush 成功返回（后台仍在传）。
@@ -1156,60 +1299,54 @@ impl QuarkDavFile {
         // Compute final SHA-1 and MD5 (all data has been written)
         let sha1 = format!("{:x}", self.sha1_ctx.clone().finalize());
         let md5 = format!("{:x}", self.md5_ctx.clone().compute());
+        let local_mtime_ms = self.fs.client_mtime_ms(&self.upload_log_path()).unwrap_or(0);
 
-        // 本项目重复上传逻辑：hash/同尺寸可跳过；否则先删再传（Cookie/Open 共用）。
+        // 占位没有 fid。先认领网盘上已有的同名文件，避免再传出第二份。
+        self.bind_existing_remote().await;
+        let mut old_fid = String::new();
         if !self.file.fid.is_empty() {
-            let mut skip = false;
-            // 列表里的 content_hash（多为 sha1）Open/Cookie 都能用，优先比对。
-            if let Some(ref cloud_hash) = self.file.content_hash {
-                if cloud_hash.eq_ignore_ascii_case(&sha1)
-                    || cloud_hash.eq_ignore_ascii_case(&md5)
-                {
-                    debug!(file_name = %self.file.file_name, hash = %cloud_hash,
-                           "skip uploading: content_hash unchanged");
-                    skip = true;
+            let api_md5 = match self.fs.drive.get_file_md5(&self.file.fid).await {
+                Ok(v) => v,
+                Err(err) => {
+                    debug!(file_name = %self.file.file_name, error = %err,
+                           "failed to get cloud file md5, will not treat as content change");
+                    None
+                }
+            };
+            match decide_reupload(
+                self.file.content_hash.as_deref(),
+                api_md5.as_deref(),
+                self.file.size,
+                &sha1,
+                &md5,
+                size,
+                self.fs.skip_upload_same_size,
+            ) {
+                ReuploadDecision::Skip(reason) => {
+                    info!(file_name = %self.file.file_name, reason, size, "skip re-upload");
+                    self.upload_state.is_finished = true;
+                    self.log_upload_result(size, reason).await;
+                    self.after_flush(true).await?;
+                    return Ok(());
+                }
+                ReuploadDecision::Replace => {
+                    old_fid = std::mem::take(&mut self.file.fid);
                 }
             }
-            if !skip {
-                match self.fs.drive.get_file_md5(&self.file.fid).await {
-                    Ok(Some(cloud_md5)) if cloud_md5.eq_ignore_ascii_case(&md5) => {
-                        debug!(file_name = %self.file.file_name, md5 = %md5,
-                               "skip uploading: content hash unchanged");
-                        skip = true;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        debug!(file_name = %self.file.file_name, error = %err,
-                               "failed to get cloud file md5, proceeding with upload");
-                    }
-                }
-            }
-            if !skip && self.fs.skip_upload_same_size && self.file.size == size {
-                debug!(file_name = %self.file.file_name, size = size,
-                       "skip uploading: same size");
-                skip = true;
-            }
-            if skip {
-                self.upload_state.is_finished = true;
-                self.log_upload_result(size, "skip").await;
-                self.after_flush(true).await?;
-                return Ok(());
-            }
-            // 内容不同：先删旧文件再上传（不用 OpenList same_path_reuse）。
-            // 删除失败必须中止，否则同名冲突 / 脏数据。
-            if let Err(err) = self.fs.drive
-                .remove_file(&self.file.fid, !self.fs.no_trash).await
-            {
-                error!(file_name = %self.file.file_name, error = %err,
-                       "delete file before upload failed");
-                return Err(FsError::GeneralFailure);
-            }
-            self.file.fid.clear();
         }
 
-        // Open API 上传链路与 Cookie 分片鉴权不同，整段交给 drive 完成。
+        // Open：同名可以并存（same_path_reuse=false），新文件成功后再删旧的。
+        // Cookie 同名会冲突，仍须先删；删失败就中止，避免脏数据。
         if self.fs.drive.is_open_mode() {
-            return self.do_flush_open(&md5, &sha1, size).await;
+            return self.do_flush_open(&md5, &sha1, size, &old_fid, local_mtime_ms).await;
+        }
+        if !old_fid.is_empty() {
+            if let Err(err) = self.fs.drive.remove_file(&old_fid, !self.fs.no_trash).await {
+                error!(file_name = %self.file.file_name, error = %err,
+                       "delete file before cookie upload failed");
+                return Err(FsError::GeneralFailure);
+            }
+            old_fid.clear();
         }
 
         // 空文件走专用路径，避免 chunk_count=0。
@@ -1232,7 +1369,7 @@ impl QuarkDavFile {
         let res = self
             .fs
             .drive
-            .up_pre(&self.file.file_name, size, &self.parent_file_id)
+            .up_pre(&self.file.file_name, size, &self.parent_file_id, local_mtime_ms)
             .await
             .map_err(|err| {
                 error!(file_name = %self.file.file_name, error = %err, "create file with proof failed");
@@ -1314,20 +1451,23 @@ impl QuarkDavFile {
 
         let cancel_flag = self.fs.upload_tracker.arm_cancel(&log_path);
         let abort_path = log_path.clone();
+        let new_fid = self.file.fid.clone();
         let handle = tokio::spawn(async move {
-            // 与后台任务同寿：提前返回给客户端后仍占坑，直到 OSS 传完。
+            // 路径锁留到任务结束（含等列表），挡住同路径的第二次 OSS。
+            // 上传槽和快车道只包住真正传字节的那段，等列表不能把并发名额占住。
             let _inflight_guard = inflight_guard;
-            let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
-            // 大文件 FIFO 快车道：队首全速，其余限速慢传且不可插队。
-            let smart = crate::upload_schedule::join(size).await;
-            let _path_bind = smart.bind_path(&progress_path);
-            tracker.set_lane(&progress_path, smart.lane().as_str());
-            let _memory_guard = UploadMemoryGuard {
-                pool: fs.upload_memory.clone(),
-                reserved: memory_reserved,
-            };
             let temp_path = upload_state.temp_file_path.clone();
-            let result = async {
+            let result = {
+                let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
+                // 大文件 FIFO 快车道：队首全速，其余限速慢传且不可插队。
+                let smart = crate::upload_schedule::join(size).await;
+                let _path_bind = smart.bind_path(&progress_path);
+                tracker.set_lane(&progress_path, smart.lane().as_str());
+                let _memory_guard = UploadMemoryGuard {
+                    pool: fs.upload_memory.clone(),
+                    reserved: memory_reserved,
+                };
+                async {
                 let chunk_size = upload_state.chunk_size as usize;
                 let chunk_count = upload_state.chunk_count;
                 let mut etags = vec![String::new(); chunk_count as usize];
@@ -1432,8 +1572,9 @@ impl QuarkDavFile {
                     FsError::GeneralFailure
                 })?;
                 Ok(false)
-            }
-            .await;
+                }
+                .await
+            };
 
             if !temp_path.is_empty() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
@@ -1450,28 +1591,40 @@ impl QuarkDavFile {
             } else {
                 match result {
                     Ok(_) => {
-                        // 先等列表/占位就绪再记 ok，避免「日志成功但群晖报未找到远程文件」。
-                        let visible = fs
-                            .wait_until_remote_visible(
-                                parent_dir.as_path(),
-                                &file_name,
-                                log_size,
-                                &parent_path,
-                            )
-                            .await;
-                        let result = if visible { "ok" } else { "ok:list_pending" };
-                        tracker.finish(&progress_path, "ok", result);
-                        fs.oplog
-                            .log_upload(&log_path, log_size, log_mode, result)
-                            .await;
+                        // Cookie 在 up_pre 前已删旧文件，这里 old_fid 为空。
+                        fs.complete_background_upload(
+                            &tracker,
+                            &progress_path,
+                            parent_dir.as_path(),
+                            &file_name,
+                            log_size,
+                            &parent_path,
+                            &log_path,
+                            log_mode,
+                            "",
+                        )
+                        .await;
                         Ok(())
                     }
                     Err(err) => {
-                        tracker.finish(&progress_path, "error", &format!("{err:?}"));
-                        fs.remove_uploading_file(&parent_path, &file_name);
-                        fs.oplog
-                            .log_upload(&log_path, log_size, log_mode, "error")
-                            .await;
+                        // 分片失败时丢掉这次预创建的文件，避免残片挡下一次重试。
+                        if !new_fid.is_empty() {
+                            if let Err(del_err) = fs.drive.remove_file(&new_fid, !fs.no_trash).await {
+                                debug!(fid = %new_fid, error = %del_err, "cleanup incomplete cookie upload failed");
+                            }
+                        }
+                        fs.fail_background_upload(
+                            &tracker,
+                            &progress_path,
+                            parent_dir.as_path(),
+                            &file_name,
+                            &parent_path,
+                            &log_path,
+                            log_size,
+                            log_mode,
+                            "上传失败",
+                        )
+                        .await;
                         Err(err)
                     }
                 }
@@ -1524,7 +1677,15 @@ impl QuarkDavFile {
 
 
     /// Open 模式上传：内容已在内存或临时文件，整段交给 drive。
-    async fn do_flush_open(&mut self, md5: &str, sha1: &str, size: u64) -> Result<(), FsError> {
+    /// `old_fid` 非空表示同名旧文件先留着，新文件成功后再删。
+    async fn do_flush_open(
+        &mut self,
+        md5: &str,
+        sha1: &str,
+        size: u64,
+        old_fid: &str,
+        local_mtime_ms: u64,
+    ) -> Result<(), FsError> {
         let log_path = self.upload_log_path();
         // 与 Cookie 路径相同：提前返回后客户端重试时勿再开一条 Open 上传。
         let Some(inflight_guard) = self.fs.try_begin_upload(&log_path) else {
@@ -1588,30 +1749,37 @@ impl QuarkDavFile {
         let progress_path = log_path.clone();
         let cancel_flag = self.fs.upload_tracker.arm_cancel(&log_path);
         let abort_path = log_path.clone();
+        let old_fid = old_fid.to_string();
 
         let handle = tokio::spawn(async move {
+            // 同路径锁一直握到等列表结束，避免 CloudSync 超时重 PUT 再开一条 OSS。
+            // 并发槽和快车道在字节传完就放开：等列表最多 90 秒，不能把后面的任务堵住。
             let _inflight_guard = inflight_guard;
-            let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
-            let smart = crate::upload_schedule::join(size).await;
-            let _path_bind = smart.bind_path(&progress_path);
-            tracker.set_lane(&progress_path, smart.lane().as_str());
-            let _memory_guard = UploadMemoryGuard {
-                pool: fs.upload_memory.clone(),
-                reserved: memory_reserved,
+            let result = {
+                let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
+                let smart = crate::upload_schedule::join(size).await;
+                let _path_bind = smart.bind_path(&progress_path);
+                tracker.set_lane(&progress_path, smart.lane().as_str());
+                let _memory_guard = UploadMemoryGuard {
+                    pool: fs.upload_memory.clone(),
+                    reserved: memory_reserved,
+                };
+                drive
+                    .upload_open_file(
+                        &file_name,
+                        size,
+                        &parent_file_id,
+                        &md5,
+                        &sha1,
+                        &source,
+                        Some((&tracker, progress_path.as_str())),
+                        Some(&smart),
+                        Some(cancel_flag.as_ref()),
+                        local_mtime_ms,
+                        &old_fid,
+                    )
+                    .await
             };
-            let result = drive
-                .upload_open_file(
-                    &file_name,
-                    size,
-                    &parent_file_id,
-                    &md5,
-                    &sha1,
-                    &source,
-                    Some((&tracker, progress_path.as_str())),
-                    Some(&smart),
-                    Some(cancel_flag.as_ref()),
-                )
-                .await;
             if !temp_path.is_empty() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
@@ -1625,28 +1793,35 @@ impl QuarkDavFile {
             } else {
                 match result {
                     Ok(()) => {
-                        let visible = fs
-                            .wait_until_remote_visible(
-                                parent_dir.as_path(),
-                                &file_name,
-                                size,
-                                &parent_path,
-                            )
-                            .await;
-                        let result = if visible { "ok" } else { "ok:list_pending" };
-                        tracker.finish(&progress_path, "ok", result);
-                        fs.oplog
-                            .log_upload(&log_path, size, log_mode, result)
-                            .await;
+                        fs.complete_background_upload(
+                            &tracker,
+                            &progress_path,
+                            parent_dir.as_path(),
+                            &file_name,
+                            size,
+                            &parent_path,
+                            &log_path,
+                            log_mode,
+                            &old_fid,
+                        )
+                        .await;
                         Ok(())
                     }
                     Err(err) => {
                         error!(file_name = %file_name, error = %err, "open upload failed");
-                        tracker.finish(&progress_path, "error", &format!("{err:#}"));
-                        fs.remove_uploading_file(&parent_path, &file_name);
-                        fs.oplog
-                            .log_upload(&log_path, size, log_mode, &format!("error:{err:#}"))
-                            .await;
+                        let detail = flatten_error(&format!("{err:#}"));
+                        fs.fail_background_upload(
+                            &tracker,
+                            &progress_path,
+                            parent_dir.as_path(),
+                            &file_name,
+                            &parent_path,
+                            &log_path,
+                            size,
+                            log_mode,
+                            &detail,
+                        )
+                        .await;
                         Err(FsError::GeneralFailure)
                     }
                 }
@@ -1727,7 +1902,13 @@ impl QuarkDavFile {
         }
 
         if self.fs.drive.is_open_mode() {
-            return self.do_flush_open(empty_md5, empty_sha1, 0).await;
+            return self.do_flush_open(
+                empty_md5,
+                empty_sha1,
+                0,
+                "",
+                self.fs.client_mtime_ms(&self.upload_log_path()).unwrap_or(0),
+            ).await;
         }
 
         // pre -> hash -> commit -> finish
@@ -1735,7 +1916,12 @@ impl QuarkDavFile {
         let res = self
             .fs
             .drive
-            .up_pre(&self.file.file_name, 0, &self.parent_file_id)
+            .up_pre(
+                &self.file.file_name,
+                0,
+                &self.parent_file_id,
+                self.fs.client_mtime_ms(&self.upload_log_path()).unwrap_or(0),
+            )
             .await
             .map_err(|err| {
                 error!(file_name = %self.file.file_name, error = %err, "create file with proof failed");
@@ -2287,6 +2473,95 @@ impl Drop for UploadMemoryGuard {
     }
 }
 
+/// 父目录 + 文件名，根目录下不要拼成 `//name`。
+fn join_dav_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() || parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{}", parent.trim_end_matches('/'), name)
+    }
+}
+
+/// 把错误收成一行，历史表才能显示分片号和 HTTP 状态，而不是被空格截断。
+fn flatten_error(msg: &str) -> String {
+    let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    // 操作日志一行展示；更长的错误链仍在控制台 error 日志里。
+    flat.chars().take(240).collect()
+}
+
+/// 解析群晖 / ownCloud 的 `X-OC-Mtime`。秒或毫秒都收成 unix 毫秒。
+pub(crate) fn parse_client_mtime_ms(value: &str) -> Option<u64> {
+    let secs: f64 = value.trim().parse().ok()?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    // 1e12 以上是毫秒时间戳；群晖 X-OC-Mtime 是 unix 秒。
+    if secs >= 1e12 {
+        Some(secs as u64)
+    } else {
+        Some((secs * 1000.0) as u64)
+    }
+}
+
+/// 同名文件已在网盘上时，要不要再整份上传。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReuploadDecision {
+    /// 结果字段，写入操作日志（skip:hash / skip:same_size）。
+    Skip(&'static str),
+    Replace,
+}
+
+/// CloudSync 对账失败会把同一个大文件再 PUT 一次。
+/// Open 模式拿不到 md5，不能因为「对不上 hash」就删掉已传好的文件再传 11GB。
+fn decide_reupload(
+    cloud_hash: Option<&str>,
+    api_md5: Option<&str>,
+    cloud_size: u64,
+    sha1: &str,
+    md5: &str,
+    local_size: u64,
+    force_same_size: bool,
+) -> ReuploadDecision {
+    if hash_matches(cloud_hash, sha1, md5) || hash_matches(api_md5, sha1, md5) {
+        return ReuploadDecision::Skip("skip:hash");
+    }
+    // 显式开关：只看大小，即使摘要对不上也跳过。
+    if force_same_size && local_size > 0 && cloud_size == local_size {
+        return ReuploadDecision::Skip("skip:same_size");
+    }
+    if let Some(h) = api_md5 {
+        if is_hex_digest(h, 32) {
+            return ReuploadDecision::Replace;
+        }
+    }
+    if let Some(h) = cloud_hash {
+        // 只有标准 md5/sha1 对不上才认定内容变了；其它 hash 算法不能当「内容不同」。
+        if is_hex_digest(h, 32) || is_hex_digest(h, 40) {
+            return ReuploadDecision::Replace;
+        }
+    }
+    if local_size > 0 && cloud_size == local_size {
+        return ReuploadDecision::Skip("skip:same_size");
+    }
+    ReuploadDecision::Replace
+}
+
+fn hash_matches(cloud: Option<&str>, sha1: &str, md5: &str) -> bool {
+    let Some(h) = cloud.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    eq_hash(h, sha1) || eq_hash(h, md5)
+}
+
+fn eq_hash(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && a.eq_ignore_ascii_case(b)
+}
+
+fn is_hex_digest(s: &str, len: usize) -> bool {
+    let s = s.trim();
+    s.len() == len && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// 文件名比较：兼容 Unicode 组合差异（部分客户端 NFC、列表 NFD 时避免「看不到」）。
 fn file_names_equal(a: &str, b: &str) -> bool {
     if a == b {
@@ -2485,5 +2760,62 @@ mod tests {
         let url = "https://example.com/file?Expires=not_a_number";
         // Non-numeric Expires should not cause a panic, returns false
         assert!(!is_url_expired(url));
+    }
+
+    #[test]
+    fn same_size_without_proof_does_not_reupload() {
+        // Open 模式没有 md5，content_hash 为空：同大小应跳过，而不是删了再传。
+        let d = decide_reupload(None, None, 11, "abc", "def", 11, false);
+        assert_eq!(d, ReuploadDecision::Skip("skip:same_size"));
+    }
+
+    #[test]
+    fn sha1_mismatch_still_replaces() {
+        let cloud = "0123456789abcdef0123456789abcdef01234567";
+        let local = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let d = decide_reupload(Some(cloud), None, 11, local, "def", 11, false);
+        assert_eq!(d, ReuploadDecision::Replace);
+    }
+
+    #[test]
+    fn matching_sha1_skips_even_if_size_differs() {
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let d = decide_reupload(Some(sha), None, 1, sha, "def", 11, false);
+        assert_eq!(d, ReuploadDecision::Skip("skip:hash"));
+    }
+
+    #[test]
+    fn different_size_replaces_when_hash_unknown() {
+        let d = decide_reupload(None, None, 10, "abc", "def", 11, false);
+        assert_eq!(d, ReuploadDecision::Replace);
+    }
+
+    #[test]
+    fn unknown_hash_algorithm_with_same_size_skips() {
+        // 夸克有时给的不是 md5/sha1。不能把「算法不同」当成「内容变了」。
+        let d = decide_reupload(Some("not-a-digest"), None, 5, "abc", "def", 5, false);
+        assert_eq!(d, ReuploadDecision::Skip("skip:same_size"));
+    }
+
+    #[test]
+    fn parse_oc_mtime_seconds_and_millis() {
+        assert_eq!(parse_client_mtime_ms("1741249367"), Some(1_741_249_367_000));
+        assert_eq!(parse_client_mtime_ms("1741249367000"), Some(1_741_249_367_000));
+        assert_eq!(parse_client_mtime_ms("0"), None);
+        assert_eq!(parse_client_mtime_ms("nope"), None);
+    }
+
+    #[test]
+    fn flatten_error_is_one_line() {
+        let s = flatten_error("上传分片 12 失败:\nHTTP 504");
+        assert_eq!(s, "上传分片 12 失败: HTTP 504");
+        assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn join_dav_path_root_has_single_slash() {
+        assert_eq!(join_dav_path("/", "a.MOV"), "/a.MOV");
+        assert_eq!(join_dav_path("", "a.MOV"), "/a.MOV");
+        assert_eq!(join_dav_path("/我的备份", "a.MOV"), "/我的备份/a.MOV");
     }
 }

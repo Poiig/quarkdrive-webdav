@@ -247,6 +247,21 @@ async fn list_op_log_files(dir: &Path) -> Vec<(PathBuf, NaiveDate, String)> {
     files
 }
 
+/// 取出 `key=` 到下一个已知字段之间的文本。值本身可以含空格。
+fn capture_field(body: &str, key: &str) -> String {
+    let pat = format!("{key}=");
+    let Some(start) = body.find(&pat) else {
+        return String::new();
+    };
+    let rest = &body[start + pat.len()..];
+    let end = [" result=", " mode=", " size=", " path=", " kind="]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .unwrap_or(rest.len());
+    rest[..end].trim().to_string()
+}
+
 /// 解析一行控制台/文件日志。格式：`时间 upload|delete ...`
 fn parse_op_line(line: &str, file: &str) -> Option<OpLogEntry> {
     // 新：`2026-10-24 14:22:15 upload result=ok ...`
@@ -271,40 +286,12 @@ fn parse_op_line(line: &str, file: &str) -> Option<OpLogEntry> {
     } else {
         return None;
     };
-    let fields = body.split_whitespace().collect::<Vec<_>>();
-    let mut result = String::new();
-    let mut mode = String::new();
-    let mut size = String::new();
-    let mut path = String::new();
-    for f in fields.iter().skip(1) {
-        if let Some(v) = f.strip_prefix("result=") {
-            result = v.to_string();
-        } else if let Some(v) = f.strip_prefix("mode=") {
-            mode = v.to_string();
-        } else if let Some(v) = f.strip_prefix("size=") {
-            size = v.to_string();
-        } else if let Some(v) = f.strip_prefix("path=") {
-            path = v.to_string();
-        } else if result.starts_with("error:") && f.contains('/') {
-            // result=error:msg 可能被空格拆开；path= 优先。
-        }
-    }
-    // size 可能是 `size=1.8` + 下一 token `MB`
-    if let Some(i) = fields.iter().position(|f| f.starts_with("size=")) {
-        let v = fields[i].strip_prefix("size=").unwrap_or("");
-        if i + 1 < fields.len()
-            && !fields[i + 1].contains('=')
-            && matches!(fields[i + 1], "B" | "KB" | "MB" | "GB" | "TB")
-        {
-            size = format!("{v} {}", fields[i + 1]);
-        } else {
-            size = v.to_string();
-        }
-    }
-    // path 从 path= 起吃到行尾（路径可含空格的极少，这里按无空格处理；若被截断用 raw）。
-    if let Some(idx) = body.find("path=") {
-        path = body[idx + 5..].trim().to_string();
-    }
+    // result 里会有空格（「上传分片 12 失败: HTTP 504」）。按下一个字段名截断，
+    // 不能按空白切，否则历史里只剩「error:上传分片」。
+    let result = capture_field(body, "result");
+    let mode = capture_field(body, "mode");
+    let size = capture_field(body, "size");
+    let path = capture_field(body, "path");
     if result.is_empty() {
         return None;
     }
@@ -347,5 +334,15 @@ mod tests {
         let e = parse_op_line(line, "op-2026-10-24.log").unwrap();
         assert_eq!(e.time, "2026-10-24 21:19:25");
         assert_eq!(e.result, "ok");
+    }
+
+    #[test]
+    fn parse_upload_error_keeps_spaces_in_result() {
+        let line = "2026-10-24 16:34:24 upload result=error:上传分片 12 失败: HTTP 504 mode=open size=11.5 GB path=/我的备份/a.MOV";
+        let e = parse_op_line(line, "op-2026-10-24.log").unwrap();
+        assert_eq!(e.result, "error:上传分片 12 失败: HTTP 504");
+        assert_eq!(e.mode, "open");
+        assert_eq!(e.size, "11.5 GB");
+        assert_eq!(e.path, "/我的备份/a.MOV");
     }
 }
