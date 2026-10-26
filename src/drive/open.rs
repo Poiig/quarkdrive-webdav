@@ -557,17 +557,36 @@ impl OpenClient {
         client: &ClientWithMiddleware,
         parent_fid: &str,
         name: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         // 调用方（QuarkDrive）已 encode；此处再 encode 一次幂等。
         let name = crate::util::quark_encode_name(name);
+        if parent_fid.trim().is_empty() {
+            bail!("Open API create_folder: parent_fid 为空");
+        }
         let body = json!({
             "dir_path": name,
             "pdir_fid": parent_fid,
         });
-        let _: serde_json::Value = self
+        let resp: serde_json::Value = self
             .request(client, "/open/v1/dir", "POST", Some(body), None)
             .await?;
-        Ok(())
+        // 响应里带上新目录 fid，给 WebDAV 占位用，避免随后 PUT 时 pdir_fid 空白。
+        let fid = resp
+            .pointer("/data/fid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                resp.get("fid")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        if fid.is_empty() {
+            warn!(parent_fid = %parent_fid, name = %name, body = %resp, "create_folder response missing fid");
+        }
+        Ok(fid)
     }
 
     pub async fn rename_file(

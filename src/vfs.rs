@@ -726,6 +726,69 @@ impl QuarkDriveFileSystem {
         Ok(None)
     }
 
+    /// 目录/文件占位可能 fid 为空。上传、再建子目录前必须解析出真实 fid，
+    /// 否则 Open API 会报 `upload dir blank`。
+    async fn ensure_resolved_file(&self, path: PathBuf) -> Result<QuarkFile, FsError> {
+        let mut file = self
+            .get_file(path.clone())
+            .await?
+            .ok_or(FsError::NotFound)?;
+        if !file.fid.is_empty() {
+            return Ok(file);
+        }
+        let Some(parent) = path.parent() else {
+            return Err(FsError::NotFound);
+        };
+        let want = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(FsError::NotFound)?;
+        let parent_key = Self::parent_cache_key(parent);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut delay = std::time::Duration::from_millis(400);
+        loop {
+            self.dir_cache.invalidate(parent).await;
+            if let Some(files) = self.dir_cache.get_or_insert(&parent_key).await {
+                if let Some(found) = files
+                    .iter()
+                    .find(|f| file_names_equal(&f.file_name, want) && !f.fid.is_empty())
+                    .cloned()
+                {
+                    self.patch_uploading_fid(&parent_key, want, &found.fid);
+                    info!(
+                        path = %path.display(),
+                        fid = %found.fid,
+                        "resolved empty stub fid from remote listing"
+                    );
+                    return Ok(found);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                error!(
+                    path = %path.display(),
+                    "directory stub still has empty fid; refusing upload"
+                );
+                return Err(FsError::GeneralFailure);
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(3));
+        }
+    }
+
+    fn patch_uploading_fid(&self, parent_key: &str, file_name: &str, fid: &str) {
+        if fid.is_empty() {
+            return;
+        }
+        if let Some(mut files) = self.uploading.get_mut(parent_key) {
+            if let Some(f) = files
+                .iter_mut()
+                .find(|x| file_names_equal(&x.file_name, file_name))
+            {
+                f.fid = fid.to_string();
+            }
+        }
+    }
+
 
     pub(crate) async fn get_file_md5_for_path(&self, path: &Path) -> Option<String> {
         let file = self.get_file(path.to_path_buf()).await.ok()??;
@@ -769,10 +832,14 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 return Err(FsError::NotImplemented);
             }
             let parent_path = path.parent().ok_or(FsError::NotFound)?;
-            let parent_file = self
-                .get_file(parent_path.to_path_buf())
-                .await?
-                .ok_or(FsError::NotFound)?;
+            // 写入必须用真实父目录 fid；空 stub 会导致 Open API「upload dir blank」。
+            let parent_file = if options.write {
+                self.ensure_resolved_file(parent_path.to_path_buf()).await?
+            } else {
+                self.get_file(parent_path.to_path_buf())
+                    .await?
+                    .ok_or(FsError::NotFound)?
+            };
             let sha1 = options.checksum.and_then(|c| {
                 if let Some((algo, hash)) = c.split_once(':') {
                     if algo.eq_ignore_ascii_case("sha1") {
@@ -993,10 +1060,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 return Err(FsError::Forbidden);
             }
             let parent_path = path.parent().ok_or(FsError::NotFound)?;
-            let parent_file = self
-                .get_file(parent_path.to_path_buf())
-                .await?
-                .ok_or(FsError::NotFound)?;
+            let parent_file = self.ensure_resolved_file(parent_path.to_path_buf()).await?;
             if !parent_file.dir {
                 return Err(FsError::Forbidden);
             }
@@ -1005,26 +1069,26 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 let name = name.to_string_lossy().into_owned();
                 let path_str = path.display().to_string();
                 // CloudSync 常对已存在目录再 MKCOL；405 Exists 会被当成失败并报「未找到远程文件」。
-                if self.get_file(path.clone()).await?.is_some() {
+                if let Some(existing) = self.get_file(path.clone()).await? {
+                    if existing.fid.is_empty() {
+                        let _ = self.ensure_resolved_file(path.clone()).await;
+                    }
                     debug!(path = %path_str, "mkcol idempotent ok (already exists)");
                     return Ok(());
                 }
                 self.dir_cache.invalidate(parent_path).await;
                 let mode = self.drive_mode();
+                let mut new_fid = String::new();
                 match self.drive.create_folder(&parent_file.fid, &name).await {
-                    Ok(()) => {
+                    Ok(fid) => {
+                        new_fid = fid;
                         self.oplog.log_mkdir(&path_str, mode, "ok").await;
                     }
                     Err(err) => {
                         // 并发建同名目录时 API 可能报错，但远端已有 → 仍按成功收尾。
                         self.dir_cache.invalidate(parent_path).await;
-                        if self
-                            .get_file(path.clone())
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some()
-                        {
+                        if let Ok(existing) = self.ensure_resolved_file(path.clone()).await {
+                            new_fid = existing.fid;
                             warn!(
                                 path = %path_str,
                                 error = %err,
@@ -1042,11 +1106,11 @@ impl DavFileSystem for QuarkDriveFileSystem {
                         }
                     }
                 }
-                // API 成功后立刻给 PROPFIND 占位，再等到列表真有这条，避免群晖「未找到远程文件」。
+                // API 成功后立刻给 PROPFIND 占位；fid 尽量用创建响应，避免随后 PUT 时 upload dir blank。
                 let parent_key = Self::parent_cache_key(parent_path);
                 let now = Self::now_ms();
                 let stub = QuarkFile {
-                    fid: String::new(),
+                    fid: new_fid,
                     file_name: name.clone(),
                     pdir_fid: parent_file.fid.clone(),
                     size: 0,
@@ -1063,10 +1127,14 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 };
                 {
                     let mut uploading = self.uploading.entry(parent_key.clone()).or_default();
-                    if !uploading
-                        .iter()
-                        .any(|f| file_names_equal(&f.file_name, &name))
+                    if let Some(existing) = uploading
+                        .iter_mut()
+                        .find(|f| file_names_equal(&f.file_name, &name))
                     {
+                        if existing.fid.is_empty() && !stub.fid.is_empty() {
+                            existing.fid = stub.fid.clone();
+                        }
+                    } else {
                         uploading.push(stub);
                     }
                 }

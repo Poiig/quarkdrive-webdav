@@ -964,9 +964,13 @@ impl QuarkDrive {
 
 
 
-    pub async fn create_folder(&self, parent_file_id: &str, name: &str) -> Result<()> {
+    /// 创建目录并返回新目录 fid（可能为空字符串：仅当远端响应未带 fid）。
+    pub async fn create_folder(&self, parent_file_id: &str, name: &str) -> Result<String> {
         let name = crate::util::quark_encode_name(name);
         debug!(parent_file_id = %parent_file_id, name = %name, "create folder");
+        if parent_file_id.trim().is_empty() {
+            anyhow::bail!("create_folder: parent_file_id 为空");
+        }
         if let Some(ref open) = self.open {
             return open.create_folder(&self.client, parent_file_id, &name).await;
         }
@@ -987,7 +991,7 @@ impl QuarkDrive {
         if res.status != 200 {
             return Err(anyhow::anyhow!("delete file failed: {}", res.message));
         }
-        Ok(())
+        Ok(res.data.fid)
     }
 
 
