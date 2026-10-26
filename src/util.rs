@@ -15,6 +15,55 @@ pub fn is_cloudsync_metadata_dir(name: &str) -> bool {
     name == CLOUDSYNC_METADATA_DIR
 }
 
+/// 夸克禁止的文件名字符 → 全角可逆替换（WebDAV 仍用原名，落盘用编码名）。
+/// 官方提示大致包含：`\ : < > | * ? , / %`，并覆盖 `"`。
+fn quark_forbidden_pairs() -> &'static [(char, char)] {
+    &[
+        ('\\', '\u{FF3C}'), // ＼
+        (':', '\u{FF1A}'),  // ：
+        ('*', '\u{FF0A}'),  // ＊
+        ('?', '\u{FF1F}'),  // ？
+        ('"', '\u{FF02}'),  // ＂
+        ('<', '\u{FF1C}'),  // ＜
+        ('>', '\u{FF1E}'),  // ＞
+        ('|', '\u{FF5C}'),  // ｜
+        (',', '\u{FF0C}'),  // ，
+        ('%', '\u{FF05}'),  // ％
+        // 路径段里一般不会出现 `/`；若出现同样编码，避免 Open API 直接拒。
+        ('/', '\u{FF0F}'), // ／
+    ]
+}
+
+/// 写入夸克前编码文件/目录名。
+pub fn quark_encode_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    'chars: for ch in name.chars() {
+        for &(from, to) in quark_forbidden_pairs() {
+            if ch == from {
+                out.push(to);
+                continue 'chars;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 从夸克列表读回后解码，使 PROPFIND 与客户端路径一致。
+pub fn quark_decode_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    'chars: for ch in name.chars() {
+        for &(from, to) in quark_forbidden_pairs() {
+            if ch == to {
+                out.push(from);
+                continue 'chars;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// 当前 Asia/Shanghai 时间，不依赖容器 TZ。
 pub fn now_shanghai() -> DateTime<FixedOffset> {
     Utc::now().with_timezone(&shanghai_offset())
@@ -96,6 +145,16 @@ mod tests {
     fn test_cloudsync_metadata_dir_name() {
         assert!(is_cloudsync_metadata_dir(CLOUDSYNC_METADATA_DIR));
         assert!(!is_cloudsync_metadata_dir("@sharebin"));
+    }
+
+    #[test]
+    fn test_quark_name_encode_roundtrip_star() {
+        let raw = "*.poiig.top_ecc";
+        let enc = quark_encode_name(raw);
+        assert_eq!(enc, "＊.poiig.top_ecc");
+        assert_ne!(enc, raw);
+        assert_eq!(quark_decode_name(&enc), raw);
+        assert_eq!(quark_encode_name("normal.txt"), "normal.txt");
     }
 
     #[test]

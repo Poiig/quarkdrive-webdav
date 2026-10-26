@@ -204,7 +204,8 @@ where
     D: serde::Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    Ok(htmlescape::decode_html(&s).unwrap_or(s))
+    let unescaped = htmlescape::decode_html(&s).unwrap_or(s);
+    Ok(crate::util::quark_decode_name(&unescaped))
 }
 
 impl From<OpenFile> for QuarkFile {
@@ -516,6 +517,8 @@ impl OpenClient {
         parent_fid: &str,
         name: &str,
     ) -> Result<()> {
+        // 调用方（QuarkDrive）已 encode；此处再 encode 一次幂等。
+        let name = crate::util::quark_encode_name(name);
         let body = json!({
             "dir_path": name,
             "pdir_fid": parent_fid,
@@ -532,6 +535,7 @@ impl OpenClient {
         fid: &str,
         name: &str,
     ) -> Result<()> {
+        let name = crate::util::quark_encode_name(name);
         let body = json!({
             "fid": fid,
             "file_name": name,
@@ -602,6 +606,8 @@ impl OpenClient {
         local_mtime_ms: u64,
         old_fid: &str,
     ) -> Result<()> {
+        let file_name = crate::util::quark_encode_name(file_name);
+        let file_name = file_name.as_str();
         let pathname = "/open/v1/file/upload_pre";
         let (tm, x_pan_token, req_id) =
             generate_req_sign("POST", pathname, &self.creds.sign_key);

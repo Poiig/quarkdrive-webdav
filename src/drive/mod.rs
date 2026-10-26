@@ -881,13 +881,14 @@ impl QuarkDrive {
         Ok(())
     }
     pub async fn rename_file(&self, file_id: &str, name: &str) -> Result<()> {
+        let name = crate::util::quark_encode_name(name);
         debug!(file_id = %file_id, name = %name, "rename file");
         if let Some(ref open) = self.open {
-            return open.rename_file(&self.client, file_id, name).await;
+            return open.rename_file(&self.client, file_id, &name).await;
         }
         let req = RenameFileRequest {
             fid: file_id.to_string(),
-            file_name: name.to_string(),
+            file_name: name,
         };
         let res: RenameFileResponse = self
             .post_request(
@@ -964,13 +965,14 @@ impl QuarkDrive {
 
 
     pub async fn create_folder(&self, parent_file_id: &str, name: &str) -> Result<()> {
+        let name = crate::util::quark_encode_name(name);
         debug!(parent_file_id = %parent_file_id, name = %name, "create folder");
         if let Some(ref open) = self.open {
-            return open.create_folder(&self.client, parent_file_id, name).await;
+            return open.create_folder(&self.client, parent_file_id, &name).await;
         }
         let req = CreateFolderRequest {
             pdir_fid: parent_file_id.to_string(),
-            file_name: name.to_string(),
+            file_name: name,
             dir_path: "".to_string(),
             dir_init_lock: false,
         };
@@ -1017,17 +1019,17 @@ impl QuarkDrive {
         pdir_fid: &str,
         local_mtime_ms: u64,
     ) -> Result<UpPreResponse> {
-
-        let format_type = get_format_type(file_name);
+        let file_name = crate::util::quark_encode_name(file_name);
+        let format_type = get_format_type(&file_name).to_string();
         let now_ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_millis() as u64;
         // 有客户端 mtime 时写进夸克，PROPFIND 才能和群晖本地时间对齐。
         let stamp_ms = if local_mtime_ms > 0 { local_mtime_ms } else { now_ms };
 
         let req = UpPreRequest {
-            file_name: file_name.to_string(),
+            file_name,
             size,
             pdir_fid: pdir_fid.to_string(),
-            format_type: format_type.to_string(),
+            format_type,
             ccp_hash_update: true,
             l_created_at: stamp_ms,
             l_updated_at: stamp_ms,

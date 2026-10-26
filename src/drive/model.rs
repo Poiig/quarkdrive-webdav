@@ -8,7 +8,8 @@ where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    Ok(htmlescape::decode_html(&s).unwrap_or(s))
+    let unescaped = htmlescape::decode_html(&s).unwrap_or(s);
+    Ok(crate::util::quark_decode_name(&unescaped))
 }
 
 #[derive(Debug, Serialize, Clone, Deserialize)]
