@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, NaiveDate};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, NaiveDateTime};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 
-use crate::util::{format_bytes, now_shanghai};
+use crate::util::{format_bytes, now_shanghai, shanghai_offset};
 
 /// 解析后的一条操作日志，供 Web 历史页展示。
 #[derive(Debug, Clone)]
@@ -137,17 +137,28 @@ impl OpLog {
     }
 
     /// 读取近期操作日志（新→旧），供 Web 历史页筛选。
+    ///
+    /// - `date`：只看某一天（`YYYY-MM-DD`，按文件名与行内时间）
+    /// - `since`：只看不早于该时刻的记录（Asia/Shanghai）
     pub async fn list_entries(
         &self,
         limit: usize,
         kind_filter: Option<&str>,
         result_filter: Option<&str>,
         path_query: Option<&str>,
+        date: Option<NaiveDate>,
+        since: Option<DateTime<FixedOffset>>,
     ) -> Vec<OpLogEntry> {
         let limit = limit.clamp(1, 2000);
         let mut files = list_op_log_files(&self.dir).await;
         // 新日期在前。
         files.sort_by(|a, b| b.1.cmp(&a.1));
+        if let Some(d) = date {
+            files.retain(|(_, file_date, _)| *file_date == d);
+        } else if let Some(since_dt) = since {
+            let since_day = since_dt.date_naive();
+            files.retain(|(_, file_date, _)| *file_date >= since_day);
+        }
         let mut out = Vec::new();
         for (path, _date, name) in files {
             let Ok(file) = fs::File::open(&path).await else {
@@ -165,6 +176,17 @@ impl OpLog {
                 let Some(entry) = parse_op_line(&line, &name) else {
                     continue;
                 };
+                if let Some(d) = date {
+                    if entry_date(&entry) != Some(d) {
+                        continue;
+                    }
+                }
+                if let Some(since_dt) = since {
+                    match entry_datetime(&entry) {
+                        Some(t) if t >= since_dt => {}
+                        _ => continue,
+                    }
+                }
                 if let Some(k) = kind_filter {
                     if k != "all" && entry.kind != k {
                         continue;
@@ -174,7 +196,8 @@ impl OpLog {
                     if r != "all" {
                         let okish = entry.result == "ok"
                             || entry.result.starts_with("ok:")
-                            || entry.result == "skip";
+                            || entry.result == "skip"
+                            || entry.result.starts_with("skip:");
                         match r {
                             "ok" if !okish => continue,
                             "error" if okish => continue,
@@ -186,6 +209,7 @@ impl OpLog {
                     let q = q.trim();
                     if !q.is_empty()
                         && !entry.path.to_ascii_lowercase().contains(&q.to_ascii_lowercase())
+                        && !entry.result.to_ascii_lowercase().contains(&q.to_ascii_lowercase())
                     {
                         continue;
                     }
@@ -260,6 +284,17 @@ fn capture_field(body: &str, key: &str) -> String {
         .min()
         .unwrap_or(rest.len());
     rest[..end].trim().to_string()
+}
+
+/// 行内时间 → 上海时区 DateTime。
+fn entry_datetime(entry: &OpLogEntry) -> Option<DateTime<FixedOffset>> {
+    NaiveDateTime::parse_from_str(entry.time.trim(), "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .and_then(|naive| naive.and_local_timezone(shanghai_offset()).single())
+}
+
+fn entry_date(entry: &OpLogEntry) -> Option<NaiveDate> {
+    entry_datetime(entry).map(|t| t.date_naive())
 }
 
 /// 解析一行控制台/文件日志。格式：`时间 upload|delete ...`
@@ -344,5 +379,17 @@ mod tests {
         assert_eq!(e.mode, "open");
         assert_eq!(e.size, "11.5 GB");
         assert_eq!(e.path, "/我的备份/a.MOV");
+    }
+
+    #[test]
+    fn entry_datetime_parses_shanghai_wall_clock() {
+        let e = parse_op_line(
+            "2026-10-26 11:20:00 upload result=ok mode=open size=1 B path=/a",
+            "op-2026-10-26.log",
+        )
+        .unwrap();
+        let dt = entry_datetime(&e).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S %z").to_string(), "2026-10-26 11:20:00 +0800");
+        assert_eq!(entry_date(&e), NaiveDate::from_ymd_opt(2026, 10, 26));
     }
 }

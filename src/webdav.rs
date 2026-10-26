@@ -719,6 +719,23 @@ impl QuarkDriveWebDav {
                 .get("limit")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100usize);
+            // date=YYYY-MM-DD：只看某一天；since_mins=N：最近 N 分钟（与 date 互斥，date 优先）。
+            let date = params
+                .get("date")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+            let since = if date.is_some() {
+                None
+            } else {
+                params
+                    .get("since_mins")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .filter(|&m| m > 0)
+                    .map(|mins| {
+                        crate::util::now_shanghai() - chrono::Duration::minutes(mins)
+                    })
+            };
             let entries = self
                 .fs
                 .oplog()
@@ -727,6 +744,8 @@ impl QuarkDriveWebDav {
                     Some(kind),
                     Some(result),
                     q.filter(|s| !s.is_empty()),
+                    date,
+                    since,
                 )
                 .await;
             let list: Vec<serde_json::Value> = entries
@@ -894,7 +913,7 @@ fn console_float_css() -> &'static str {
 }
 .qd-modal.open{display:flex}
 .qd-modal-card{
-  width:min(880px,100%);max-height:min(82vh,740px);background:#fff;border:1px solid var(--line);
+  width:min(1040px,100%);max-height:min(82vh,740px);background:#fff;border:1px solid var(--line);
   display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.25);
 }
 .qd-modal-hd{
@@ -915,32 +934,56 @@ fn console_float_css() -> &'static str {
   padding:8px 10px;border:1px solid var(--line);font:inherit;font-size:13px;min-width:120px;background:#fff;color:var(--ink);
 }
 .qd-modal-tools label.grow input{width:100%;min-width:0}
-.qd-modal-tools .btns{display:flex;gap:8px;margin-left:auto}
+.qd-modal-tools .btns{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
 .qd-modal-tools button{
   align-self:end;padding:8px 14px;border:1px solid var(--line);background:#fff;cursor:pointer;font:inherit;font-size:13px;
 }
 .qd-modal-tools button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 .qd-modal-tools button.danger{color:var(--bad);border-color:#fecaca;background:#fff}
+.qd-range{
+  display:flex;flex-wrap:wrap;gap:6px;align-items:center;width:100%;padding:0 28px 12px;background:#f7fafb;
+  border-bottom:1px solid var(--line);
+}
+.qd-range button{
+  appearance:none;border:1px solid var(--line);background:#fff;color:var(--muted);
+  font:inherit;font-size:12px;padding:5px 10px;cursor:pointer;
+}
+.qd-range button:hover{color:var(--ink);border-color:var(--accent)}
+.qd-range button.on{color:#fff;background:var(--accent);border-color:var(--accent)}
+.qd-range .qd-range-date{display:flex;align-items:center;gap:6px;margin-left:4px}
+.qd-range .qd-range-date input[type=date]{
+  padding:5px 8px;border:1px solid var(--line);font:inherit;font-size:12px;background:#fff;color:var(--ink);
+}
 .qd-modal-bd{overflow:auto;padding:8px 20px 24px;flex:1}
-.qd-modal table{width:100%;border-collapse:collapse;font-size:13px}
+.qd-modal table{width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed}
 .qd-modal th,.qd-modal td{
-  padding:11px 12px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:top;
+  padding:10px 12px;border-bottom:1px solid #eef2f5;text-align:left;vertical-align:middle;
 }
-.qd-modal th:first-child,.qd-modal td:first-child{
-  padding-left:8px;white-space:nowrap;font-variant-numeric:tabular-nums;
+.qd-modal th:nth-child(1),.qd-modal td:nth-child(1){width:9.6em;padding-left:8px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.qd-modal th:nth-child(2),.qd-modal td:nth-child(2){width:3.2em;white-space:nowrap}
+.qd-modal th:nth-child(3),.qd-modal td:nth-child(3){width:22%}
+.qd-modal th:nth-child(4),.qd-modal td:nth-child(4){width:5.2em;white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums}
+.qd-modal th:nth-child(5),.qd-modal td:nth-child(5){width:auto;padding-right:8px}
+.qd-modal th{color:var(--muted);font-weight:600;background:#fff;position:sticky;top:0;z-index:1}
+/* 路径/结果单行省略，避免窄列里逐字换行撑出超高行 */
+.qd-modal .path,.qd-modal .res{
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);max-width:100%;
 }
-.qd-modal th:last-child,.qd-modal td:last-child{padding-right:8px}
-.qd-modal th{color:var(--muted);font-weight:600;background:#fff;position:sticky;top:0}
-.qd-modal .path{word-break:break-all;color:var(--ink)}
 .qd-modal .ok{color:var(--ok)} .qd-modal .bad{color:var(--bad)}
-.qd-modal .empty-row td{text-align:center;color:var(--muted);padding:36px 16px}
+.qd-modal .empty-row td{text-align:center;color:var(--muted);padding:36px 16px;white-space:normal}
+.qd-item.is-done .pct{color:var(--muted);font-weight:600}
+.qd-item.is-done .qd-bar>i{background:#94a3b8}
+.qd-float-sec{
+  padding:6px 14px 2px;font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.02em;
+}
 @media (max-width:720px){
   .qd-float{top:auto;bottom:12px;right:12px;width:min(300px,calc(100vw - 24px))}
 
   .qd-modal{padding:16px}
-  .qd-modal-hd,.qd-modal-tools{padding-left:16px;padding-right:16px}
+  .qd-modal-hd,.qd-modal-tools,.qd-range{padding-left:16px;padding-right:16px}
   .qd-modal-bd{padding:4px 8px 16px}
   .qd-modal-tools .btns{margin-left:0;width:100%}
+  .qd-modal th:nth-child(3),.qd-modal td:nth-child(3){width:28%}
 }
 "#
 }
@@ -969,11 +1012,19 @@ fn console_float_html() -> &'static str {
     <div class="qd-modal-tools">
       <label>类型<select id="qdHistKind"><option value="upload">上传</option><option value="delete">删除</option><option value="all">全部</option></select></label>
       <label>结果<select id="qdHistResult"><option value="all">全部</option><option value="ok">成功</option><option value="error">失败</option></select></label>
-      <label class="grow">路径包含<input id="qdHistQ" placeholder="关键词"/></label>
+      <label class="grow">搜索<input id="qdHistQ" placeholder="路径或结果关键词" autocomplete="off"/></label>
       <div class="btns">
         <button type="button" class="primary" id="qdHistReload">筛选</button>
         <button type="button" class="danger" id="qdHistClear">清除日志</button>
       </div>
+    </div>
+    <div class="qd-range" id="qdHistRange" role="group" aria-label="时间范围">
+      <button type="button" data-range="all" class="on">全部</button>
+      <button type="button" data-range="15m">最近15分钟</button>
+      <button type="button" data-range="60m">最近1小时</button>
+      <button type="button" data-range="today">今天</button>
+      <button type="button" data-range="yesterday">昨天</button>
+      <span class="qd-range-date"><label for="qdHistDate">按日</label><input type="date" id="qdHistDate"/></span>
     </div>
     <div class="qd-modal-bd"><table><thead><tr><th>时间</th><th>类型</th><th>结果</th><th>大小</th><th>路径</th></tr></thead><tbody id="qdHistBody"></tbody></table></div>
   </div>
@@ -1003,11 +1054,17 @@ fn console_float_html() -> &'static str {
   const badge=document.getElementById("qdBadge");
   const clearBtn=document.getElementById("qdClearDone");
   const floatHint=document.getElementById("qdFloatHint");
+  // userCollapsed：有任务时用户主动收起；userPinned：空闲时用户主动展开看已完成。
   let userCollapsed=false;
+  let userPinned=false;
+  let recentHist=[];
+  let recentHistAt=0;
   document.getElementById("qdFloatToggle").addEventListener("click",()=>{
     const willOpen=!floatEl.classList.contains("open");
     floatEl.classList.toggle("open", willOpen);
-    userCollapsed=!willOpen;
+    floatEl.classList.toggle("idle", !willOpen);
+    if(willOpen){ userCollapsed=false; userPinned=true; }
+    else { userPinned=false; userCollapsed=true; }
   });
   clearBtn.addEventListener("click",async (e)=>{
     e.stopPropagation();
@@ -1016,6 +1073,8 @@ fn console_float_html() -> &'static str {
     try{
       const r=await fetch("/__uploads/clear",{method:"POST",credentials:"same-origin",headers:{Accept:"application/json"}});
       const data=await r.json();
+      recentHist=[];
+      recentHistAt=0;
       await poll();
       if(data.cleared!=null) floatHint.textContent="已清除 "+data.cleared+" 条";
     }catch(_){ floatHint.textContent="清除失败"; }
@@ -1056,6 +1115,7 @@ fn console_float_html() -> &'static str {
     if(it.status==="uploading") speed=fmt(it.speed_bps)+"/s";
     else if(it.status==="receiving") speed="等待上传";
     else if(it.avg_speed_bps) speed="均 "+fmt(it.avg_speed_bps)+"/s";
+    else if(it.from_history) speed=it.time||"";
     const name=it.name||String(it.path||"").split("/").filter(Boolean).pop()||it.path;
     const lane=LANE[it.lane]||"";
     const laneCls=it.lane==="fast"||it.lane==="slow"?it.lane:"";
@@ -1065,65 +1125,135 @@ fn console_float_html() -> &'static str {
     const detailShort=detail.length>80?detail.slice(0,80)+"…":detail;
     const stText=(it.status==="error"||it.status==="cancelled")&&detailShort?`${st}（${detailShort}）`:st;
     const title=detail?` title="${esc(detail)}"`:"";
-    // 接收阶段进度条保持 0，不显示假的一半进度。
-    const barPct=it.status==="receiving"?0:(unknown?40:pct);
+    // 接收阶段进度条保持 0，不显示假的一半进度；已完成固定满条。
+    const barPct=it.status==="receiving"?0:(unknown?40:(active?pct:100));
     const pctText=it.status==="receiving"?"0%":(unknown?"…":pct+"%");
+    const left=active?`${pctText} · ${esc(stText)}`:esc(stText);
     const done=!active;
     const durMs=Number(it.elapsed_ms)||Math.max(0,(Number(it.updated_ms)||0)-(Number(it.started_ms)||0));
-    const durHtml=done?`<span class="dur">耗时 ${esc(fmtDur(durMs))}</span>`:"";
+    const durHtml=done&&!it.from_history&&durMs>0?`<span class="dur">耗时 ${esc(fmtDur(durMs))}</span>`:"";
     const promoteHtml=active&&it.lane==="slow"
       ?`<button type="button" class="act promote" title="提升为全速" aria-label="提升为全速">↑</button>`:"";
     const cancelHtml=active
       ?`<button type="button" class="act cancel" title="取消上传" aria-label="取消上传">×</button>`:"";
     const acts=active?`<span class="acts">${promoteHtml}${cancelHtml}</span>`:"";
-    return `<div class="r1"${title}><span class="name">${esc(name)}</span><span class="size">${esc(fmt(it.size))}</span>${acts}</div>
+    const sizeText=it.size_label!=null?it.size_label:fmt(it.size);
+    return `<div class="r1"${title}><span class="name">${esc(name)}</span><span class="size">${esc(sizeText)}</span>${acts}</div>
       <div class="${barCls}"><i style="width:${barPct}%"></i></div>
-      <div class="r2"><span class="pct">${pctText} · ${esc(stText)}</span><span class="speed">${esc(speed)}</span>${durHtml}${laneHtml}</div>`;
+      <div class="r2"><span class="pct">${left}</span><span class="speed">${esc(speed)}</span>${durHtml}${laneHtml}</div>`;
   }
   function isActive(it){ return it.status==="receiving"||it.status==="uploading"; }
+  function histStatus(result){
+    const r=String(result||"");
+    if(r.startsWith("error")) return "error";
+    if(r==="cancelled"||r.startsWith("cancelled")) return "cancelled";
+    if(r==="skip"||r.startsWith("skip:")) return "skip";
+    return "ok";
+  }
+  function histToItem(e){
+    const path=e.path||"";
+    const result=String(e.result||"");
+    return {
+      path,
+      name:path.split("/").filter(Boolean).pop()||path,
+      size:0,
+      size_label:e.size||"",
+      status:histStatus(result),
+      detail:result,
+      percent:100,
+      speed_bps:0,
+      avg_speed_bps:0,
+      lane:"",
+      updated_ms:0,
+      started_ms:0,
+      elapsed_ms:0,
+      from_history:true,
+      time:e.time||"",
+    };
+  }
+  async function loadRecentHist(force){
+    const now=Date.now();
+    if(!force && recentHistAt && now-recentHistAt<15000) return recentHist;
+    try{
+      const qs=new URLSearchParams({kind:"upload",result:"all",limit:"8"});
+      const r=await fetch("/__history.json?"+qs.toString(),{credentials:"same-origin",headers:{Accept:"application/json"},cache:"no-store"});
+      if(!r.ok) return recentHist;
+      const data=await r.json();
+      recentHist=(data.entries||[]).map(histToItem);
+      recentHistAt=now;
+    }catch(_){}
+    return recentHist;
+  }
   function renderUploads(items, maxItems){
-    const activeN=items.filter(isActive).length;
-    const doneN=items.length-activeN;
+    const live=items||[];
+    const activeN=live.filter(isActive).length;
+    const liveDone=live.filter(it=>!isActive(it));
+    // 内存里没有已完成时，用操作日志补最近几条，避免点开一片空白。
+    const showHist=liveDone.length===0 && recentHist.length>0;
+    const done=showHist?recentHist:liveDone;
+    const doneN=done.length;
     badge.textContent=String(activeN);
     badge.dataset.n=String(activeN);
-    clearBtn.disabled=doneN===0;
+    clearBtn.disabled=liveDone.length===0;
     const cap=maxItems||30;
-    floatHint.textContent=doneN>0?("已完成 "+doneN+" · 上限 "+cap):("上限 "+cap+" 条");
+    if(activeN>0){
+      floatHint.textContent=doneN>0?("进行中 "+activeN+" · 已完成 "+doneN):("进行中 "+activeN+" · 上限 "+cap);
+    }else if(showHist){
+      floatHint.textContent="最近完成 "+doneN+" 条";
+    }else if(doneN>0){
+      floatHint.textContent="已完成 "+doneN+" · 上限 "+cap;
+    }else{
+      floatHint.textContent="上限 "+cap+" 条";
+    }
     const busy=activeN>0;
-    if(busy && !userCollapsed){
-      floatEl.classList.add("open");
-    }else if(!busy){
-      floatEl.classList.remove("open");
-      if(items.length===0) userCollapsed=false;
+    if(busy){
+      if(!userCollapsed) floatEl.classList.add("open");
+    }else{
+      // 无进行中：不再强制收起；有已完成/历史时保持用户展开。
+      if(doneN===0 && live.length===0){
+        if(!userPinned) floatEl.classList.remove("open");
+        userCollapsed=false;
+      }else if(!userPinned && !floatEl.classList.contains("open")){
+        // 空闲默认收成窄条，点开后因 userPinned 不会被轮询关掉。
+      }
     }
     floatEl.classList.toggle("idle", !floatEl.classList.contains("open"));
-    if(!items.length){
+    const active=live.filter(isActive).sort((a,b)=>(b.started_ms||0)-(a.started_ms||0)||String(a.path).localeCompare(b.path));
+    const doneSorted=showHist?done:done.slice().sort((a,b)=>(b.updated_ms||0)-(a.updated_ms||0)||String(a.path).localeCompare(b.path));
+    if(!active.length && !doneSorted.length){
       body.innerHTML='<div class="qd-empty">暂无上传任务</div>';
       return;
     }
-    const active=items.filter(isActive).sort((a,b)=>(b.started_ms||0)-(a.started_ms||0)||String(a.path).localeCompare(b.path));
-    const done=items.filter(it=>!isActive(it)).sort((a,b)=>(b.updated_ms||0)-(a.updated_ms||0)||String(a.path).localeCompare(b.path));
-    const ordered=[...active,...done];
-    const empty=body.querySelector(".qd-empty");
-    if(empty) empty.remove();
     const prevFirst=body.querySelector(".qd-item")?.dataset.path;
     const frag=document.createDocumentFragment();
-    const reuse=new Map([...body.querySelectorAll(".qd-item")].map(el=>[el.dataset.path,el]));
-    for(const it of ordered){
-      let el=reuse.get(it.path);
-      if(el) reuse.delete(it.path);
-      else{
-        el=document.createElement("div");
-        el.dataset.path=it.path;
+    const appendSection=(label, list, doneCls)=>{
+      if(!list.length) return;
+      if(label){
+        const sec=document.createElement("div");
+        sec.className="qd-float-sec";
+        sec.textContent=label;
+        frag.appendChild(sec);
       }
-      el.className="qd-item"+(it.status==="error"||it.status==="cancelled"?" is-error":"");
-      el.title=it.path;
-      el.innerHTML=itemHtml(it);
-      frag.appendChild(el);
+      for(const it of list){
+        const el=document.createElement("div");
+        el.dataset.path=it.path;
+        el.className="qd-item"+(it.status==="error"||it.status==="cancelled"?" is-error":"")+(doneCls?" is-done":"");
+        el.title=it.path+(it.detail?" · "+it.detail:"");
+        el.innerHTML=itemHtml(it);
+        frag.appendChild(el);
+      }
+    };
+    if(active.length && doneSorted.length){
+      appendSection("进行中", active, false);
+      appendSection(showHist?"最近完成":"已完成", doneSorted, true);
+    }else if(active.length){
+      appendSection("", active, false);
+    }else{
+      appendSection(showHist?"最近完成":"", doneSorted, true);
     }
     body.replaceChildren(frag);
     // 有更新的进行中任务置顶时，滚到顶部方便看到进度。
-    if(ordered[0] && ordered[0].path!==prevFirst && isActive(ordered[0])){
+    if(active[0] && active[0].path!==prevFirst){
       body.scrollTop=0;
     }
   }
@@ -1134,7 +1264,11 @@ fn console_float_html() -> &'static str {
       const r=await fetch("/__uploads.json",{credentials:"same-origin",cache:"no-store"});
       if(!r.ok) return;
       const data=await r.json();
-      renderUploads(data.items||[], data.max_items);
+      const items=data.items||[];
+      const liveDoneN=items.filter(it=>!isActive(it)).length;
+      if(liveDoneN===0) await loadRecentHist(false);
+      else { recentHist=[]; }
+      renderUploads(items, data.max_items);
     }catch(_){}
   }
   poll();
@@ -1146,6 +1280,23 @@ fn console_float_html() -> &'static str {
 
   const modal=document.getElementById("qdHistModal");
   const histBody=document.getElementById("qdHistBody");
+  const histRange=document.getElementById("qdHistRange");
+  const histDate=document.getElementById("qdHistDate");
+  let rangeMode="all";
+  function shanghaiYmd(d){
+    // en-CA → YYYY-MM-DD；用上海时区日历日，与日志文件名一致。
+    return new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Shanghai",year:"numeric",month:"2-digit",day:"2-digit"}).format(d);
+  }
+  function shiftYmd(ymd, deltaDays){
+    const [y,m,d]=ymd.split("-").map(Number);
+    const dt=new Date(Date.UTC(y, m-1, d+deltaDays));
+    return dt.getUTCFullYear()+"-"+String(dt.getUTCMonth()+1).padStart(2,"0")+"-"+String(dt.getUTCDate()).padStart(2,"0");
+  }
+  function setRangeButtons(){
+    histRange.querySelectorAll("button[data-range]").forEach(btn=>{
+      btn.classList.toggle("on", btn.dataset.range===rangeMode);
+    });
+  }
   function openHist(){ modal.classList.add("open"); loadHist(); }
   function closeHist(){ modal.classList.remove("open"); }
   document.querySelectorAll("[data-qd-history]").forEach(el=>el.addEventListener("click",e=>{e.preventDefault();openHist();}));
@@ -1153,12 +1304,33 @@ fn console_float_html() -> &'static str {
   modal.addEventListener("click",e=>{ if(e.target===modal) closeHist(); });
   document.addEventListener("keydown",e=>{ if(e.key==="Escape") closeHist(); });
 
+  histRange.addEventListener("click",e=>{
+    const btn=e.target.closest("button[data-range]");
+    if(!btn) return;
+    rangeMode=btn.dataset.range;
+    histDate.value="";
+    setRangeButtons();
+    loadHist();
+  });
+  histDate.addEventListener("change",()=>{
+    if(histDate.value){
+      rangeMode="date";
+      setRangeButtons();
+      loadHist();
+    }
+  });
+
   async function loadHist(){
     const kind=document.getElementById("qdHistKind").value;
     const result=document.getElementById("qdHistResult").value;
     const q=document.getElementById("qdHistQ").value.trim();
-    const qs=new URLSearchParams({kind,result,limit:"100"});
+    const qs=new URLSearchParams({kind,result,limit:"200"});
     if(q) qs.set("q",q);
+    if(rangeMode==="15m") qs.set("since_mins","15");
+    else if(rangeMode==="60m") qs.set("since_mins","60");
+    else if(rangeMode==="today") qs.set("date",shanghaiYmd(new Date()));
+    else if(rangeMode==="yesterday") qs.set("date",shiftYmd(shanghaiYmd(new Date()),-1));
+    else if(rangeMode==="date" && histDate.value) qs.set("date",histDate.value);
     histBody.innerHTML='<tr class="empty-row"><td colspan="5">加载中…</td></tr>';
     try{
       const r=await fetch("/__history.json?"+qs.toString(),{credentials:"same-origin",headers:{Accept:"application/json"}});
@@ -1167,13 +1339,18 @@ fn console_float_html() -> &'static str {
       if(!rows.length){ histBody.innerHTML='<tr class="empty-row"><td colspan="5">没有匹配记录</td></tr>'; return; }
       histBody.innerHTML=rows.map(e=>{
         const rc=String(e.result||"").startsWith("error")?"bad":"ok";
-        return `<tr><td>${esc(e.time)}</td><td>${esc(e.kind)}</td><td class="${rc}">${esc(e.result)}</td><td>${esc(e.size)}</td><td class="path">${esc(e.path)}</td></tr>`;
+        const res=String(e.result||"");
+        const path=String(e.path||"");
+        return `<tr><td>${esc(e.time)}</td><td>${esc(e.kind)}</td><td class="res ${rc}" title="${esc(res)}">${esc(res)}</td><td>${esc(e.size)}</td><td class="path" title="${esc(path)}">${esc(path)}</td></tr>`;
       }).join("");
     }catch(err){
       histBody.innerHTML=`<tr class="empty-row"><td colspan="5" class="bad">加载失败：${esc(err)}</td></tr>`;
     }
   }
   document.getElementById("qdHistReload").addEventListener("click",loadHist);
+  document.getElementById("qdHistQ").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); loadHist(); }});
+  document.getElementById("qdHistKind").addEventListener("change",loadHist);
+  document.getElementById("qdHistResult").addEventListener("change",loadHist);
   document.getElementById("qdHistClear").addEventListener("click",async()=>{
     if(!confirm("确认清除操作日志？不可恢复")) return;
     const date=prompt("只清除某一天？留空=全部（YYYY-MM-DD）","")||"";
