@@ -74,13 +74,12 @@ pub struct TokenFile {
 }
 
 impl OpenCredentials {
-    /// 使用内置 AppId/SignKey；token 文件里若有换票带回的密钥则覆盖。
+    /// 签名固定用内置 AppId/SignKey（与授权页 client_id 成对）。
+    /// token 文件只恢复 access/refresh。文件里的密钥若和内置不一致，拿去签名会 10001。
     /// token_file / refresh_token 任一有值即可启动，都没有时仍可起服务，由 Web 页扫码授权补齐。
     pub fn new(refresh_token: String, token_file: Option<String>) -> Result<Self> {
         let mut access = String::new();
         let mut refresh = refresh_token;
-        let mut app_id = BUILTIN_APP_ID.to_string();
-        let mut sign_key = BUILTIN_SIGN_KEY.to_string();
         if let Some(ref path) = token_file {
             if Path::new(path).exists() {
                 let raw = std::fs::read_to_string(path)
@@ -93,18 +92,26 @@ impl OpenCredentials {
                 if !saved.refresh_token.is_empty() {
                     refresh = saved.refresh_token;
                 }
-                // 空密钥保持内置值。旧 token 文件没有这两个字段，不能把签名清空。
-                if let Some(id) = saved.app_id.filter(|s| !s.is_empty()) {
-                    app_id = id;
-                }
-                if let Some(key) = saved.sign_key.filter(|s| !s.is_empty()) {
-                    sign_key = key;
+                let foreign_key = saved
+                    .sign_key
+                    .as_deref()
+                    .is_some_and(|k| !k.is_empty() && k != BUILTIN_SIGN_KEY)
+                    || saved
+                        .app_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty() && id != BUILTIN_APP_ID);
+                if foreign_key {
+                    // 上次刷新把不成对的 signKey 写进了文件，这里明确丢掉。
+                    tracing::warn!(
+                        path,
+                        "token 文件中的 AppId/SignKey 与内置签名不一致，已忽略"
+                    );
                 }
             }
         }
         Ok(Self {
-            app_id: Arc::new(StdRwLock::new(app_id)),
-            sign_key: Arc::new(StdRwLock::new(sign_key)),
+            app_id: Arc::new(StdRwLock::new(BUILTIN_APP_ID.to_string())),
+            sign_key: Arc::new(StdRwLock::new(BUILTIN_SIGN_KEY.to_string())),
             access_token: Arc::new(RwLock::new(access)),
             refresh_token: Arc::new(RwLock::new(refresh)),
             token_file,
@@ -113,16 +120,6 @@ impl OpenCredentials {
             api_max_concurrent: 2,
             api_min_interval_ms: 200,
         })
-    }
-
-    /// 换票或飞牛刷新带回非空密钥时替换内置值。空字符串忽略，避免把能用的签名抹掉。
-    pub fn set_app_keys(&self, app_id: Option<String>, sign_key: Option<String>) {
-        if let Some(id) = app_id.filter(|s| !s.trim().is_empty()) {
-            *self.app_id.write().unwrap_or_else(|e| e.into_inner()) = id;
-        }
-        if let Some(key) = sign_key.filter(|s| !s.trim().is_empty()) {
-            *self.sign_key.write().unwrap_or_else(|e| e.into_inner()) = key;
-        }
     }
 
     fn app_id_snapshot(&self) -> String {
@@ -1314,9 +1311,8 @@ impl OpenClient {
         refresh: &str,
     ) -> Result<()> {
         match self.refresh_via_fnnas(client, refresh).await {
-            Ok((new_refresh, new_access, app_id, sign_key)) => {
-                // 密钥和 token 一起换，避免只更新 token、签名还用旧的。
-                self.creds.set_app_keys(app_id, sign_key);
+            Ok((new_refresh, new_access)) => {
+                // 不采用响应里的 signKey：它和 x-pan-client-id 不成对时，后续请求 errno=10001。
                 self.apply_tokens(new_access, new_refresh).await?;
                 info!("Open token 已通过飞牛接口刷新");
                 return Ok(());
@@ -1389,7 +1385,7 @@ impl OpenClient {
         &self,
         client: &ClientWithMiddleware,
         refresh: &str,
-    ) -> Result<(String, String, Option<String>, Option<String>)> {
+    ) -> Result<(String, String)> {
         let body = json!({
             "authType": 4,
             "refreshToken": refresh,
@@ -1437,12 +1433,9 @@ impl OpenClient {
         if info.access_token.is_empty() || info.refresh_token.is_empty() {
             bail!("飞牛刷新返回空 token，请重新扫码授权");
         }
-        Ok((
-            info.refresh_token,
-            info.access_token,
-            info.app_id,
-            info.sign_key,
-        ))
+        // appId/signKey 只确认响应能解析，不拿去替换内置签名。
+        let _parsed_keys = (info.app_id.as_deref(), info.sign_key.as_deref());
+        Ok((info.refresh_token, info.access_token))
     }
 
     /// 用扫码得到的 nonce 换 token 并落盘。
@@ -1451,10 +1444,9 @@ impl OpenClient {
         client: &ClientWithMiddleware,
         nonce: &str,
     ) -> Result<()> {
-        let (access, refresh, app_id, sign_key) =
+        let (access, refresh, _app_id, _sign_key) =
             exchange_token_by_nonce(client, nonce).await?;
-        // 先换密钥再落 token，重启后签名和票是同一套。
-        self.creds.set_app_keys(app_id, sign_key);
+        // 授权 client_id 是内置 AppId，签名继续用配套的内置 SignKey。
         self.apply_tokens(access, refresh).await?;
         // 登录后立刻拉 user_id，供后续上传 proof。
         let mut resp: UserInfoResp = self
@@ -1968,7 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn token_file_restores_exchanged_keys() {
+    fn token_file_keeps_builtin_sign_keys() {
         let path = std::env::temp_dir().join(format!(
             "quark-token-keys-{}-{}.json",
             std::process::id(),
@@ -1983,23 +1975,12 @@ mod tests {
         )
         .unwrap();
         let creds = OpenCredentials::new(String::new(), Some(path.display().to_string())).unwrap();
-        assert_eq!(creds.app_id_snapshot(), "app-from-file");
-        assert_eq!(creds.sign_key_snapshot(), "key-from-file");
+        // 文件里的另一套密钥不能覆盖内置签名，否则请求 errno=10001。
+        assert_eq!(creds.app_id_snapshot(), BUILTIN_APP_ID);
+        assert_eq!(creds.sign_key_snapshot(), BUILTIN_SIGN_KEY);
+        let access = creds.access_token.try_read().unwrap().clone();
+        assert_eq!(access, "acc");
         let _ = std::fs::remove_file(&path);
-        // 没有密钥字段时仍用内置值，旧 token 文件不能把签名读成空。
-        let path2 = std::env::temp_dir().join(format!(
-            "quark-token-legacy-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::write(&path2, r#"{"access_token":"acc","refresh_token":"ref"}"#).unwrap();
-        let legacy = OpenCredentials::new(String::new(), Some(path2.display().to_string())).unwrap();
-        assert_eq!(legacy.app_id_snapshot(), BUILTIN_APP_ID);
-        assert_eq!(legacy.sign_key_snapshot(), BUILTIN_SIGN_KEY);
-        let _ = std::fs::remove_file(&path2);
     }
 
     #[test]
