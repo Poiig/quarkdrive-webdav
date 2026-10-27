@@ -50,6 +50,8 @@ fn punct_mark(ch: char) -> Option<char> {
         '\u{FF1A}' => '\u{FF46}', // ｆ 原文全角冒号（如「主题四：我们都是好朋友」）
         ',' => '\u{FF4D}',        // ｍ
         '\u{FF0C}' => '\u{FF4E}', // ｎ 原文全角逗号（如「班，家长活动2017.9」）
+        // 顿号不折成半角逗号，但内容审核同样判 illegal text。
+        '\u{3001}' => '\u{FF4B}', // ｋ 如「卫生保健计划、总结2018.02」
         _ => return None,
     })
 }
@@ -63,6 +65,7 @@ fn punct_from_mark(mark: char) -> Option<char> {
         '\u{FF46}' => '\u{FF1A}',
         '\u{FF4D}' => ',',
         '\u{FF4E}' => '\u{FF0C}',
+        '\u{FF4B}' => '\u{3001}',
         _ => return None,
     })
 }
@@ -101,7 +104,8 @@ fn map_other_decode(ch: char) -> char {
 }
 
 /// 写入夸克前编码文件/目录名。
-/// `. : ,` 及其中文全角形改成「间隔号 + 全角字母」，因为全角 `．：，` 仍会被判 illegal text。
+/// `. : ,`、顿号 `、` 及中文全角冒号/逗号改成「间隔号 + 全角字母」。
+/// 全角 `．：，` 会被折回半角，顿号本身也会被判 illegal text。
 /// 已是该形式的片段原样保留，建目录/上传路径上的二次编码不会把名字再改一层。
 pub fn quark_encode_name(name: &str) -> String {
     let trimmed = name.trim_matches(|c: char| c == ' ' || c == '\t');
@@ -306,6 +310,8 @@ mod tests {
             "a:b,c",
             "阿卜杜拉·买买提",
             "笔记·docx",
+            "2017-2018下",
+            "卫生保健计划、总结2018.02",
         ];
         for raw in samples {
             let enc = quark_encode_name(raw);
@@ -313,11 +319,18 @@ mod tests {
             assert_eq!(quark_encode_name(&enc), enc, "idempotent {raw}");
             assert!(
                 !enc.chars().any(|c| {
-                    matches!(c, '.' | ':' | ',' | '\u{FF0E}' | '\u{FF1A}' | '\u{FF0C}')
+                    matches!(
+                        c,
+                        '.' | ':' | ',' | '\u{FF0E}' | '\u{FF1A}' | '\u{FF0C}' | '\u{3001}'
+                    )
                 }),
-                "仍含会被折成半角的标点: {raw} -> {enc}"
+                "仍含会被拒的标点: {raw} -> {enc}"
             );
         }
+        assert_eq!(
+            quark_encode_name("卫生保健计划、总结2018.02"),
+            "卫生保健计划\u{00B7}\u{FF4B}总结2018\u{00B7}\u{FF44}02"
+        );
         assert_eq!(
             quark_encode_name("主题四：我们都是好朋友"),
             "主题四\u{00B7}\u{FF46}我们都是好朋友"
