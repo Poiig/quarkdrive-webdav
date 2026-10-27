@@ -2123,7 +2123,8 @@ impl QuarkDavFile {
                     Err(err) => {
                         // 分片失败时丢掉这次预创建的文件，避免残片挡下一次重试。
                         if !new_fid.is_empty() {
-                            if let Err(del_err) = fs.drive.remove_file(&new_fid, !fs.no_trash).await {
+                            // 半成品直接删，不进回收站，避免失败重试越积越多。
+                            if let Err(del_err) = fs.drive.remove_file(&new_fid, false).await {
                                 debug!(fid = %new_fid, error = %del_err, "cleanup incomplete cookie upload failed");
                             }
                         }

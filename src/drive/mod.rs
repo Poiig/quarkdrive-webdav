@@ -876,7 +876,22 @@ impl QuarkDrive {
     }
 
     pub async fn remove_file(&self, file_id: &str, trash: bool) -> Result<()> {
-        // no untrash api in quark
+        // Open：用户删除先进回收站。接口失败再彻底删除，避免 trash 路径不可用时删不掉。
+        // Cookie 仍走原来的删除接口（action_type=2，本身是回收站语义）。
+        if trash {
+            if let Some(ref open) = self.open {
+                match open.trash_file(&self.client, file_id).await {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        warn!(
+                            fid = %file_id,
+                            error = %err,
+                            "Open 移入回收站失败，改为彻底删除"
+                        );
+                    }
+                }
+            }
+        }
         self.delete_file(file_id).await?;
         Ok(())
     }

@@ -71,6 +71,23 @@ struct Opt {
     #[arg(long, env = "QUARK_TOKEN_FILE", default_value = "./quark-token.json")]
     quark_token_file: String,
 
+    /// 飞牛刷新失败时是否再请求 oplist。默认开；设 false 则只走飞牛。
+    #[arg(
+        long,
+        env = "QUARK_OPLIST_RENEW",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    quark_oplist_renew: bool,
+
+    /// Open API 同时在途请求数。默认 2，调大容易 429。
+    #[arg(long, env = "OPEN_API_MAX_CONCURRENT", default_value_t = 2)]
+    open_api_max_concurrent: usize,
+
+    /// 两次 Open API 请求的最小间隔（毫秒）。
+    #[arg(long, env = "OPEN_API_MIN_INTERVAL_MS", default_value_t = 200)]
+    open_api_min_interval_ms: u64,
+
     /// 企业微信机器人 webhook key（只填 key）
     #[arg(long, env = "WECOM_WEBHOOK_KEY")]
     wecom_webhook_key: Option<String>,
@@ -206,10 +223,13 @@ pub fn start_periodic_invalidate(cache: Arc<Cache>, secs: u64) {
 /// 组装 DriveConfig：Open 用内置 AppId/SignKey，Cookie 用 QUARK_COOKIE。
 fn build_drive_config(opt: &Opt, alert: Alert) -> anyhow::Result<DriveConfig> {
     if opt.quark_open {
-        let open = OpenCredentials::new(
+        let mut open = OpenCredentials::new(
             opt.quark_refresh_token.clone(),
             Some(opt.quark_token_file.clone()),
         )?;
+        open.oplist_renew_fallback = opt.quark_oplist_renew;
+        open.api_max_concurrent = opt.open_api_max_concurrent.max(1);
+        open.api_min_interval_ms = opt.open_api_min_interval_ms.max(1);
         return Ok(DriveConfig {
             api_base_url: OPEN_API_BASE.to_string(),
             cookie: Arc::new(DashMap::new()),
@@ -241,7 +261,8 @@ async fn main() -> anyhow::Result<()> {
     if env::var("RUST_LOG").is_err() {
         if opt.debug {
             unsafe {
-                env::set_var("RUST_LOG", "quarkdrive_webdav=debug,reqwest=debug");
+                // reqwest=debug 会把带 access_token 的完整 URL 打到日志。
+                env::set_var("RUST_LOG", "quarkdrive_webdav=debug,reqwest=warn");
             }
         } else {
             unsafe {

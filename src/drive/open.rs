@@ -4,7 +4,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -44,15 +44,22 @@ pub const BUILTIN_APP_ID: &str = "93b14d40cbef4e5d91945ec93d26fe8f";
 pub const BUILTIN_SIGN_KEY: &str = "6d27122d2d7b41598a1dbb9b5f605e00";
 
 /// Open 模式运行时凭证；token 可在刷新后写回，故用 RwLock 共享。
+/// AppId/SignKey 也放进 Arc：扫码换票后要让已经克隆出去的客户端一起换签。
 #[derive(Debug, Clone)]
 pub struct OpenCredentials {
-    pub app_id: String,
-    pub sign_key: String,
+    pub app_id: Arc<StdRwLock<String>>,
+    pub sign_key: Arc<StdRwLock<String>>,
     pub access_token: Arc<RwLock<String>>,
     pub refresh_token: Arc<RwLock<String>>,
     /// 刷新后可选落盘，避免进程重启后仍用已轮换的 refresh_token。
     pub token_file: Option<String>,
     pub user_id: Arc<RwLock<String>>,
+    /// 飞牛刷新失败时是否再试 oplist。默认开，避免飞牛短暂不可用就掉登录。
+    pub oplist_renew_fallback: bool,
+    /// Open API 并发上限。默认 2，避免建目录把接口打出 429。
+    pub api_max_concurrent: usize,
+    /// 两次 Open 请求的最小间隔（毫秒）。
+    pub api_min_interval_ms: u64,
 }
 
 /// 磁盘上的 token 文件格式，便于重启后复用。
@@ -67,11 +74,13 @@ pub struct TokenFile {
 }
 
 impl OpenCredentials {
-    /// 使用内置 AppId/SignKey；token_file / refresh_token 任一有值即可启动，
-    /// 都没有时仍可起服务，由 Web 页扫码授权补齐。
+    /// 使用内置 AppId/SignKey；token 文件里若有换票带回的密钥则覆盖。
+    /// token_file / refresh_token 任一有值即可启动，都没有时仍可起服务，由 Web 页扫码授权补齐。
     pub fn new(refresh_token: String, token_file: Option<String>) -> Result<Self> {
         let mut access = String::new();
         let mut refresh = refresh_token;
+        let mut app_id = BUILTIN_APP_ID.to_string();
+        let mut sign_key = BUILTIN_SIGN_KEY.to_string();
         if let Some(ref path) = token_file {
             if Path::new(path).exists() {
                 let raw = std::fs::read_to_string(path)
@@ -84,16 +93,50 @@ impl OpenCredentials {
                 if !saved.refresh_token.is_empty() {
                     refresh = saved.refresh_token;
                 }
+                // 空密钥保持内置值。旧 token 文件没有这两个字段，不能把签名清空。
+                if let Some(id) = saved.app_id.filter(|s| !s.is_empty()) {
+                    app_id = id;
+                }
+                if let Some(key) = saved.sign_key.filter(|s| !s.is_empty()) {
+                    sign_key = key;
+                }
             }
         }
         Ok(Self {
-            app_id: BUILTIN_APP_ID.to_string(),
-            sign_key: BUILTIN_SIGN_KEY.to_string(),
+            app_id: Arc::new(StdRwLock::new(app_id)),
+            sign_key: Arc::new(StdRwLock::new(sign_key)),
             access_token: Arc::new(RwLock::new(access)),
             refresh_token: Arc::new(RwLock::new(refresh)),
             token_file,
             user_id: Arc::new(RwLock::new(String::new())),
+            oplist_renew_fallback: true,
+            api_max_concurrent: 2,
+            api_min_interval_ms: 200,
         })
+    }
+
+    /// 换票或飞牛刷新带回非空密钥时替换内置值。空字符串忽略，避免把能用的签名抹掉。
+    pub fn set_app_keys(&self, app_id: Option<String>, sign_key: Option<String>) {
+        if let Some(id) = app_id.filter(|s| !s.trim().is_empty()) {
+            *self.app_id.write().unwrap_or_else(|e| e.into_inner()) = id;
+        }
+        if let Some(key) = sign_key.filter(|s| !s.trim().is_empty()) {
+            *self.sign_key.write().unwrap_or_else(|e| e.into_inner()) = key;
+        }
+    }
+
+    fn app_id_snapshot(&self) -> String {
+        self.app_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn sign_key_snapshot(&self) -> String {
+        self.sign_key
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub async fn has_refresh_token(&self) -> bool {
@@ -105,7 +148,8 @@ impl OpenCredentials {
         let access = self.access_token.read().await.clone();
         format!(
             "x_pan_client_id={}; x_pan_access_token={}",
-            self.app_id, access
+            self.app_id_snapshot(),
+            access
         )
     }
 
@@ -117,8 +161,8 @@ impl OpenCredentials {
         let data = TokenFile {
             access_token: self.access_token.read().await.clone(),
             refresh_token: self.refresh_token.read().await.clone(),
-            app_id: Some(self.app_id.clone()),
-            sign_key: Some(self.sign_key.clone()),
+            app_id: Some(self.app_id_snapshot()),
+            sign_key: Some(self.sign_key_snapshot()),
         };
         let json = serde_json::to_string_pretty(&data)?;
         let path_obj = Path::new(path);
@@ -385,6 +429,11 @@ struct FnnasTokenInfo {
     access_token: String,
     #[serde(rename = "refreshToken", default)]
     refresh_token: String,
+    /// 刷新成功时可能一并带回。无效 refresh 也会带内置密钥，但 token 为空，不能据此登录。
+    #[serde(rename = "appId", default)]
+    app_id: Option<String>,
+    #[serde(rename = "signKey", default)]
+    sign_key: Option<String>,
 }
 
 /// 生成 `x-pan-tm` / `x-pan-token` / `req_id`（OpenList generateReqSign）。
@@ -450,18 +499,24 @@ pub struct OpenClient {
     refresh_lock: Arc<Mutex<()>>,
     /// Open API 调用节流（含 list/mkdir）。
     api_gate: Arc<OpenApiGate>,
+    /// 飞牛刷新失败后再打 oplist。关掉则只走飞牛。
+    oplist_renew_fallback: bool,
 }
 
 impl OpenClient {
     pub fn new(creds: OpenCredentials, alert: Alert) -> Self {
+        let max_concurrent = creds.api_max_concurrent.max(1);
+        let min_interval_ms = creds.api_min_interval_ms.max(1);
+        let oplist_renew_fallback = creds.oplist_renew_fallback;
         Self {
             creds,
             api_base: OPEN_API_BASE.to_string(),
             alert,
             auth_ok_until: Arc::new(Mutex::new(None)),
             refresh_lock: Arc::new(Mutex::new(())),
-            // 2 路并发 + ≥200ms 间隔：同步建大量目录时比无节流少打很多 list。
-            api_gate: Arc::new(OpenApiGate::new(2, 200)),
+            // 默认 2 路 + 200ms：同步建大量目录时比无节流少打很多 list。
+            api_gate: Arc::new(OpenApiGate::new(max_concurrent, min_interval_ms)),
+            oplist_renew_fallback,
         }
     }
 
@@ -631,18 +686,27 @@ impl OpenClient {
     }
 
     pub async fn delete_file(&self, client: &ClientWithMiddleware, fid: &str) -> Result<()> {
+        self.fid_action(client, fid, "/open/v1/file/delete").await
+    }
+
+    /// 用户删除进回收站。半成品清理不要走这里，回收站会越积越多。
+    pub async fn trash_file(&self, client: &ClientWithMiddleware, fid: &str) -> Result<()> {
+        self.fid_action(client, fid, "/open/v1/file/trash").await
+    }
+
+    /// delete 与 trash 的 body 相同，只是路径不同。抓包没有解开 body，与 move/delete 的 fid_list 对齐。
+    async fn fid_action(
+        &self,
+        client: &ClientWithMiddleware,
+        fid: &str,
+        pathname: &str,
+    ) -> Result<()> {
         let body = json!({
             "action_type": 1,
             "fid_list": [fid],
         });
         let _: serde_json::Value = self
-            .request(
-                client,
-                "/open/v1/file/delete",
-                "POST",
-                Some(body),
-                None,
-            )
+            .request(client, pathname, "POST", Some(body), None)
             .await?;
         Ok(())
     }
@@ -672,7 +736,7 @@ impl OpenClient {
         let file_name = file_name.as_str();
         let pathname = "/open/v1/file/upload_pre";
         let (tm, x_pan_token, req_id) =
-            generate_req_sign("POST", pathname, &self.creds.sign_key);
+            generate_req_sign("POST", pathname, &self.creds.sign_key_snapshot());
         let (proof_version, proof_seed1, proof_seed2, proof_code1, proof_code2) = self
             .generate_proof(source, size, &x_pan_token)
             .await?;
@@ -1139,10 +1203,12 @@ impl OpenClient {
     where
         T: for<'de> Deserialize<'de>,
     {
+        let sign_key = self.creds.sign_key_snapshot();
+        let app_id = self.creds.app_id_snapshot();
         let (tm, token, req_id) = if let Some(m) = manual {
             (m.tm.clone(), m.token.clone(), m.req_id.clone())
         } else {
-            generate_req_sign(method, pathname, &self.creds.sign_key)
+            generate_req_sign(method, pathname, &sign_key)
         };
         let access = self.creds.access_token.read().await.clone();
         let url = format!(
@@ -1165,14 +1231,19 @@ impl OpenClient {
             .header("User-Agent", OPEN_UA)
             .header("x-pan-tm", &tm)
             .header("x-pan-token", &token)
-            .header("x-pan-client-id", &self.creds.app_id);
+            .header("x-pan-client-id", &app_id);
         if let Some(b) = body {
             req = req.json(b);
         }
         let res = req.send().await?;
         let status = res.status();
         let text = res.text().await?;
-        debug!(pathname = %pathname, http_status = %status, body = %text, "open api response");
+        debug!(
+            pathname = %pathname,
+            http_status = %status,
+            body = %crate::alert::redact_secrets(&text),
+            "open api response"
+        );
 
         if let Ok(err_body) = serde_json::from_str::<OpenErrorBody>(&text) {
             // 「不能为空」是未登录，不是过期；避免误走 refresh 风暴。
@@ -1217,7 +1288,7 @@ impl OpenClient {
             .with_context(|| format!("解析 Open API 响应失败 ({pathname}): {text}"))
     }
 
-    /// 优先走在线 renew API；失败再试飞牛本地刷新。错误信息区分「不可达」与「令牌无效」。
+    /// 先打飞牛（票是它发的）。失败且允许回退时再打 oplist，避免把 refresh_token 默认交给第三方。
     pub async fn refresh_token(&self, client: &ClientWithMiddleware) -> Result<()> {
         let refresh = self.creds.refresh_token.read().await.clone();
         if refresh.is_empty() {
@@ -1242,21 +1313,27 @@ impl OpenClient {
         client: &ClientWithMiddleware,
         refresh: &str,
     ) -> Result<()> {
-        match self.refresh_via_online(client, refresh).await {
-            Ok((new_refresh, new_access)) => {
+        match self.refresh_via_fnnas(client, refresh).await {
+            Ok((new_refresh, new_access, app_id, sign_key)) => {
+                // 密钥和 token 一起换，避免只更新 token、签名还用旧的。
+                self.creds.set_app_keys(app_id, sign_key);
                 self.apply_tokens(new_access, new_refresh).await?;
+                info!("Open token 已通过飞牛接口刷新");
                 return Ok(());
             }
             Err(err) => {
-                warn!(error = %err, "在线 renew API 失败，尝试飞牛本地刷新");
-                // 保留在线错误，飞牛也失败时一并带回
-                match self.refresh_via_fnnas(client, refresh).await {
+                if !self.oplist_renew_fallback {
+                    return Err(err);
+                }
+                warn!(error = %err, "飞牛刷新失败，尝试 oplist 回退");
+                match self.refresh_via_online(client, refresh).await {
                     Ok((new_refresh, new_access)) => {
                         self.apply_tokens(new_access, new_refresh).await?;
+                        info!("Open token 已通过 oplist 回退刷新");
                         Ok(())
                     }
-                    Err(fnnas_err) => Err(anyhow!(
-                        "刷新失败：在线 renew API（{DEFAULT_RENEW_API}）→ {err}；飞牛本地刷新 → {fnnas_err}"
+                    Err(online_err) => Err(anyhow!(
+                        "刷新失败：飞牛 → {err}；oplist（{DEFAULT_RENEW_API}）→ {online_err}"
                     )),
                 }
             }
@@ -1288,10 +1365,17 @@ impl OpenClient {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("renew API 返回 HTTP {status}: {text}");
+            bail!(
+                "renew API 返回 HTTP {status}: {}",
+                crate::alert::redact_secrets(&text)
+            );
         }
-        let body: OnlineRenewResp = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("renew API 响应无法解析: {e}; body={text}"))?;
+        let body: OnlineRenewResp = serde_json::from_str(&text).map_err(|e| {
+            anyhow!(
+                "renew API 响应无法解析: {e}; body={}",
+                crate::alert::redact_secrets(&text)
+            )
+        })?;
         if body.refresh_token.is_empty() || body.access_token.is_empty() {
             if !body.text.is_empty() {
                 bail!("renew API 拒绝刷新（令牌可能已失效）: {}", body.text);
@@ -1305,7 +1389,7 @@ impl OpenClient {
         &self,
         client: &ClientWithMiddleware,
         refresh: &str,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, String, Option<String>, Option<String>)> {
         let body = json!({
             "authType": 4,
             "refreshToken": refresh,
@@ -1327,21 +1411,38 @@ impl OpenClient {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("飞牛刷新 HTTP {status}: {text}");
+            bail!(
+                "飞牛刷新 HTTP {status}: {}",
+                crate::alert::redact_secrets(&text)
+            );
         }
-        let parsed: FnnasResp<FnnasRefreshData> = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("飞牛刷新响应无法解析: {e}; body={text}"))?;
+        let parsed: FnnasResp<FnnasRefreshData> = serde_json::from_str(&text).map_err(|e| {
+            anyhow!(
+                "飞牛刷新响应无法解析: {e}; body={}",
+                crate::alert::redact_secrets(&text)
+            )
+        })?;
         if parsed.code != 0 {
-            bail!("飞牛刷新失败（令牌可能已失效）: {}", parsed.msg);
+            bail!(
+                "飞牛刷新失败（令牌可能已失效）: {}",
+                crate::alert::redact_secrets(&parsed.msg)
+            );
         }
         let info = parsed
             .data
             .ok_or_else(|| anyhow!("飞牛刷新无 data"))?
             .token_info;
+        // 实测无效 refresh 仍是 HTTP 200 + code=0，但 access/refresh 为空，并带回内置密钥。
+        // 当成成功会把当前登录态写成空 token。
         if info.access_token.is_empty() || info.refresh_token.is_empty() {
             bail!("飞牛刷新返回空 token，请重新扫码授权");
         }
-        Ok((info.refresh_token, info.access_token))
+        Ok((
+            info.refresh_token,
+            info.access_token,
+            info.app_id,
+            info.sign_key,
+        ))
     }
 
     /// 用扫码得到的 nonce 换 token 并落盘。
@@ -1350,7 +1451,10 @@ impl OpenClient {
         client: &ClientWithMiddleware,
         nonce: &str,
     ) -> Result<()> {
-        let (access, refresh, _, _) = exchange_token_by_nonce(client, nonce).await?;
+        let (access, refresh, app_id, sign_key) =
+            exchange_token_by_nonce(client, nonce).await?;
+        // 先换密钥再落 token，重启后签名和票是同一套。
+        self.creds.set_app_keys(app_id, sign_key);
         self.apply_tokens(access, refresh).await?;
         // 登录后立刻拉 user_id，供后续上传 proof。
         let mut resp: UserInfoResp = self
@@ -1843,6 +1947,59 @@ mod tests {
         assert!(is_oss_url_expired_error(&anyhow!("SignatureDoesNotMatch")));
         assert!(!is_oss_url_expired_error(&anyhow!("HTTP 504 Gateway Timeout")));
         assert!(is_retryable_oss_put_error(&anyhow!("HTTP 504 Gateway Timeout")));
+    }
+
+    #[test]
+    fn fnnas_empty_refresh_is_not_a_login() {
+        // 无效 refresh 实测仍是 code=0，token 为空，同时带回内置密钥。
+        let text = r#"{"code":0,"msg":"","data":{"tokenInfo":{"accessToken":"","refreshToken":"","expiresIn":0,"appId":"93b14d40cbef4e5d91945ec93d26fe8f","signKey":"6d27122d2d7b41598a1dbb9b5f605e00"}}}"#;
+        let parsed: FnnasResp<FnnasRefreshData> = serde_json::from_str(text).unwrap();
+        let info = parsed.data.unwrap().token_info;
+        assert!(info.access_token.is_empty());
+        assert!(info.refresh_token.is_empty());
+        assert_eq!(
+            info.app_id.as_deref(),
+            Some("93b14d40cbef4e5d91945ec93d26fe8f")
+        );
+        assert_eq!(
+            info.sign_key.as_deref(),
+            Some("6d27122d2d7b41598a1dbb9b5f605e00")
+        );
+    }
+
+    #[test]
+    fn token_file_restores_exchanged_keys() {
+        let path = std::env::temp_dir().join(format!(
+            "quark-token-keys-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"access_token":"acc","refresh_token":"ref","app_id":"app-from-file","sign_key":"key-from-file"}"#,
+        )
+        .unwrap();
+        let creds = OpenCredentials::new(String::new(), Some(path.display().to_string())).unwrap();
+        assert_eq!(creds.app_id_snapshot(), "app-from-file");
+        assert_eq!(creds.sign_key_snapshot(), "key-from-file");
+        let _ = std::fs::remove_file(&path);
+        // 没有密钥字段时仍用内置值，旧 token 文件不能把签名读成空。
+        let path2 = std::env::temp_dir().join(format!(
+            "quark-token-legacy-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&path2, r#"{"access_token":"acc","refresh_token":"ref"}"#).unwrap();
+        let legacy = OpenCredentials::new(String::new(), Some(path2.display().to_string())).unwrap();
+        assert_eq!(legacy.app_id_snapshot(), BUILTIN_APP_ID);
+        assert_eq!(legacy.sign_key_snapshot(), BUILTIN_SIGN_KEY);
+        let _ = std::fs::remove_file(&path2);
     }
 
     #[test]

@@ -73,15 +73,52 @@ impl Alert {
     }
 }
 
-/// 把常见粘连错误拆成多行，便于企微阅读。
+/// 把常见粘连错误拆成多行，便于企微阅读。先去掉 token，避免告警把凭证发出去。
 fn format_detail(detail: &str) -> String {
-    detail
+    redact_secrets(detail)
         .replace("\r\n", "\n")
         .replace('；', "\n")
         .replace("; ", "\n")
         .replace(" → ", "\n→ ")
         .trim()
         .to_string()
+}
+
+/// 日志和告警里去掉 access/refresh/sign。query 和 JSON 两种写法都盖住。
+pub fn redact_secrets(input: &str) -> String {
+    let mut out = input.to_string();
+    for key in [
+        "access_token",
+        "refresh_token",
+        "refresh_ui",
+        "sign_key",
+        "signKey",
+        "accessToken",
+        "refreshToken",
+    ] {
+        out = redact_delimited(&out, &format!("{key}="), "&");
+        out = redact_delimited(&out, &format!("\"{key}\":\""), "\"");
+        out = redact_delimited(&out, &format!("\"{key}\": \""), "\"");
+    }
+    out
+}
+
+/// 从 marker 之后盖到 end 字符（不含 end）或字符串结尾。
+fn redact_delimited(input: &str, marker: &str, end: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(idx) = rest.find(marker) {
+        out.push_str(&rest[..idx + marker.len()]);
+        out.push_str("***");
+        rest = &rest[idx + marker.len()..];
+        if let Some(stop) = rest.find(end) {
+            rest = &rest[stop..];
+        } else {
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 impl AlertInner {
@@ -118,5 +155,16 @@ mod tests {
         let s = format_detail("刷新失败：A → err1；飞牛本地刷新 → err2");
         assert!(s.contains('\n'));
         assert!(s.lines().count() >= 2);
+    }
+
+    #[test]
+    fn redact_secrets_hides_query_and_json() {
+        let raw = "url?access_token=abc&x=1 {\"refreshToken\":\"xyz\",\"signKey\":\"k\"}";
+        let got = redact_secrets(raw);
+        assert!(!got.contains("abc"));
+        assert!(!got.contains("xyz"));
+        assert!(!got.contains("\"k\""));
+        assert!(got.contains("access_token=***"));
+        assert!(got.contains("refreshToken\":\"***"));
     }
 }
