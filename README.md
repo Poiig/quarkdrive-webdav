@@ -72,7 +72,6 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录�
 | `QUARK_OPEN` | `true` 启用 Open 模式 | `false` |
 | `QUARK_TOKEN_FILE` | Open token 落盘路径 | `./quark-token.json` |
 | `QUARK_REFRESH_TOKEN` | 可选，已有 refresh token 时可直接填 | 空 |
-| `QUARK_OPLIST_RENEW` | 飞牛刷新失败后是否再试 oplist。`false` 则只走飞牛 | `true` |
 | `OPEN_API_MAX_CONCURRENT` | Open API 同时在途请求数。调大容易 429 | `2` |
 | `OPEN_API_MIN_INTERVAL_MS` | 两次 Open API 请求的最小间隔（毫秒） | `200` |
 | `UPLOAD_MEMORY_LIMIT` | **仅**限制「接收上传内容」的内存池（并行合计，超限落盘）；**不是**容器/进程 RSS 上限；`0`=始终落盘 | `64MB` |
@@ -84,7 +83,7 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录�
 
 **Cloud Sync 加密**：群晖会在 WebDAV **当前路径的同级**创建 `@SynologyCloudSync` 并写入 `cloudsync_encrypt.info`。服务器地址请指向**可写的具体目录**（例如 `http://host:8080/备份目录`），不要填只读聚合根；Open 模式容量接口为空时已按「不限容量」回报，避免误判不可写。
 
-**Open API 限流（errno=429）**：服务端已对 Open 请求做并发/间隔节流（默认 2 路、间隔 200ms，可用 `OPEN_API_MAX_CONCURRENT` / `OPEN_API_MIN_INTERVAL_MS` 调整），并对 429 **退避重试**；建目录不再疯狂轮询列表。若仍频繁限流，可把 Cloud Sync 任务错开、降低并发同步任务数，或暂时减小同步范围。刷新默认先走飞牛 `oauth.fnnas.com`，失败才回退 oplist。
+**Open API 限流（errno=429）**：服务端已对 Open 请求做并发/间隔节流（默认 2 路、间隔 200ms，可用 `OPEN_API_MAX_CONCURRENT` / `OPEN_API_MIN_INTERVAL_MS` 调整），并对 429 **退避重试**；建目录不再疯狂轮询列表。若仍频繁限流，可把 Cloud Sync 任务错开、降低并发同步任务数，或暂时减小同步范围。access token 过期或签名失败（errno=10001）时，用 OpenList 在线接口刷新，不走飞牛刷新。
 | `DIR_CACHE_SIZE` | 目录缓存最多目录数 | `1000` |
 | `DIR_CACHE_BYTES` | 目录缓存字节上限，如 `64MB` | `64MB` |
 | `CHUNK_CACHE_MB` | 播放预取块缓存（MB），`0` 关闭 | `128` |

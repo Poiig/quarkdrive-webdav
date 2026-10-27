@@ -71,15 +71,6 @@ struct Opt {
     #[arg(long, env = "QUARK_TOKEN_FILE", default_value = "./quark-token.json")]
     quark_token_file: String,
 
-    /// 飞牛刷新失败时是否再请求 oplist。默认开；设 false 则只走飞牛。
-    #[arg(
-        long,
-        env = "QUARK_OPLIST_RENEW",
-        default_value_t = true,
-        action = clap::ArgAction::Set
-    )]
-    quark_oplist_renew: bool,
-
     /// Open API 同时在途请求数。默认 2，调大容易 429。
     #[arg(long, env = "OPEN_API_MAX_CONCURRENT", default_value_t = 2)]
     open_api_max_concurrent: usize,
@@ -227,7 +218,6 @@ fn build_drive_config(opt: &Opt, alert: Alert) -> anyhow::Result<DriveConfig> {
             opt.quark_refresh_token.clone(),
             Some(opt.quark_token_file.clone()),
         )?;
-        open.oplist_renew_fallback = opt.quark_oplist_renew;
         open.api_max_concurrent = opt.open_api_max_concurrent.max(1);
         open.api_min_interval_ms = opt.open_api_min_interval_ms.max(1);
         return Ok(DriveConfig {

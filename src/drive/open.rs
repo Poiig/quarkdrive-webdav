@@ -28,11 +28,9 @@ use super::get_format_type;
 
 /// Open API 默认基址（与 OpenList Conf.api 一致）。
 pub const OPEN_API_BASE: &str = "https://open-api-drive.quark.cn";
-/// 在线刷新默认地址（与 OpenList meta 默认值一致）。
+/// 在线刷新默认地址（与 OpenList meta 默认值一致）。只走这条，不用飞牛刷新。
 pub const DEFAULT_RENEW_API: &str = "https://api.oplist.org/quarkyun/renewapi";
-/// 飞牛 OAuth 刷新地址：在线 API 不可用时的本地续期回退。
-const FNNAS_REFRESH_URL: &str = "https://oauth.fnnas.com/api/v1/oauth/refreshToken";
-/// 飞牛 OAuth 获取授权页。
+/// 飞牛 OAuth 获取授权页。扫码登录仍走飞牛，刷新不走。
 const FNNAS_AUTH_URL: &str = "https://oauth.fnnas.com/api/v1/oauth/getAuthUrl";
 /// 飞牛 OAuth 用 nonce 换 token。
 const FNNAS_EXCHANGE_URL: &str = "https://oauth.fnnas.com/api/v1/oauth/exchangeToken";
@@ -54,8 +52,6 @@ pub struct OpenCredentials {
     /// 刷新后可选落盘，避免进程重启后仍用已轮换的 refresh_token。
     pub token_file: Option<String>,
     pub user_id: Arc<RwLock<String>>,
-    /// 飞牛刷新失败时是否再试 oplist。默认开，避免飞牛短暂不可用就掉登录。
-    pub oplist_renew_fallback: bool,
     /// Open API 并发上限。默认 2，避免建目录把接口打出 429。
     pub api_max_concurrent: usize,
     /// 两次 Open 请求的最小间隔（毫秒）。
@@ -116,7 +112,6 @@ impl OpenCredentials {
             refresh_token: Arc::new(RwLock::new(refresh)),
             token_file,
             user_id: Arc::new(RwLock::new(String::new())),
-            oplist_renew_fallback: true,
             api_max_concurrent: 2,
             api_min_interval_ms: 200,
         })
@@ -414,25 +409,6 @@ struct FnnasTokenData {
     sign_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct FnnasRefreshData {
-    #[serde(rename = "tokenInfo")]
-    token_info: FnnasTokenInfo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct FnnasTokenInfo {
-    #[serde(rename = "accessToken", default)]
-    access_token: String,
-    #[serde(rename = "refreshToken", default)]
-    refresh_token: String,
-    /// 刷新成功时可能一并带回。无效 refresh 也会带内置密钥，但 token 为空，不能据此登录。
-    #[serde(rename = "appId", default)]
-    app_id: Option<String>,
-    #[serde(rename = "signKey", default)]
-    sign_key: Option<String>,
-}
-
 /// 生成 `x-pan-tm` / `x-pan-token` / `req_id`（OpenList generateReqSign）。
 pub fn generate_req_sign(method: &str, pathname: &str, sign_key: &str) -> (String, String, String) {
     let tm = SystemTime::now()
@@ -496,15 +472,12 @@ pub struct OpenClient {
     refresh_lock: Arc<Mutex<()>>,
     /// Open API 调用节流（含 list/mkdir）。
     api_gate: Arc<OpenApiGate>,
-    /// 飞牛刷新失败后再打 oplist。关掉则只走飞牛。
-    oplist_renew_fallback: bool,
 }
 
 impl OpenClient {
     pub fn new(creds: OpenCredentials, alert: Alert) -> Self {
         let max_concurrent = creds.api_max_concurrent.max(1);
         let min_interval_ms = creds.api_min_interval_ms.max(1);
-        let oplist_renew_fallback = creds.oplist_renew_fallback;
         Self {
             creds,
             api_base: OPEN_API_BASE.to_string(),
@@ -513,7 +486,6 @@ impl OpenClient {
             refresh_lock: Arc::new(Mutex::new(())),
             // 默认 2 路 + 200ms：同步建大量目录时比无节流少打很多 list。
             api_gate: Arc::new(OpenApiGate::new(max_concurrent, min_interval_ms)),
-            oplist_renew_fallback,
         }
     }
 
@@ -1249,8 +1221,11 @@ impl OpenClient {
             {
                 bail!("尚未授权，请打开 Web 页扫码登录");
             }
+            // 10001 签名失败：飞牛刷新换过的 access_token 和内置签名对不上。
+            // 当成过期，改用 OpenList 换票后再试一次。
             if err_body.status == -1
                 && (err_body.errno == 11001
+                    || err_body.errno == 10001
                     || (err_body.errno == 14001
                         && err_body.error_info.contains("access_token")))
             {
@@ -1285,7 +1260,7 @@ impl OpenClient {
             .with_context(|| format!("解析 Open API 响应失败 ({pathname}): {text}"))
     }
 
-    /// 先打飞牛（票是它发的）。失败且允许回退时再打 oplist，避免把 refresh_token 默认交给第三方。
+    /// 只走 OpenList 在线刷新。飞牛刷新换回的票和内置签名对不上，会一直 10001。
     pub async fn refresh_token(&self, client: &ClientWithMiddleware) -> Result<()> {
         let refresh = self.creds.refresh_token.read().await.clone();
         if refresh.is_empty() {
@@ -1310,30 +1285,10 @@ impl OpenClient {
         client: &ClientWithMiddleware,
         refresh: &str,
     ) -> Result<()> {
-        match self.refresh_via_fnnas(client, refresh).await {
-            Ok((new_refresh, new_access)) => {
-                // 不采用响应里的 signKey：它和 x-pan-client-id 不成对时，后续请求 errno=10001。
-                self.apply_tokens(new_access, new_refresh).await?;
-                info!("Open token 已通过飞牛接口刷新");
-                return Ok(());
-            }
-            Err(err) => {
-                if !self.oplist_renew_fallback {
-                    return Err(err);
-                }
-                warn!(error = %err, "飞牛刷新失败，尝试 oplist 回退");
-                match self.refresh_via_online(client, refresh).await {
-                    Ok((new_refresh, new_access)) => {
-                        self.apply_tokens(new_access, new_refresh).await?;
-                        info!("Open token 已通过 oplist 回退刷新");
-                        Ok(())
-                    }
-                    Err(online_err) => Err(anyhow!(
-                        "刷新失败：飞牛 → {err}；oplist（{DEFAULT_RENEW_API}）→ {online_err}"
-                    )),
-                }
-            }
-        }
+        let (new_refresh, new_access) = self.refresh_via_online(client, refresh).await?;
+        self.apply_tokens(new_access, new_refresh).await?;
+        info!("Open token 已通过 OpenList 刷新");
+        Ok(())
     }
 
     async fn refresh_via_online(
@@ -1379,63 +1334,6 @@ impl OpenClient {
             bail!("renew API 返回空 token，请重新扫码授权");
         }
         Ok((body.refresh_token, body.access_token))
-    }
-
-    async fn refresh_via_fnnas(
-        &self,
-        client: &ClientWithMiddleware,
-        refresh: &str,
-    ) -> Result<(String, String)> {
-        let body = json!({
-            "authType": 4,
-            "refreshToken": refresh,
-            "trimAppId": FNNAS_TRIM_APP_ID,
-        });
-        let res = client
-            .post(FNNAS_REFRESH_URL)
-            .json(&body)
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() || e.is_connect() {
-                    anyhow!("无法访问飞牛刷新接口（网络超时/连接失败）: {e}")
-                } else {
-                    anyhow!("请求飞牛刷新接口失败: {e}")
-                }
-            })?;
-        let status = res.status();
-        let text = res.text().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!(
-                "飞牛刷新 HTTP {status}: {}",
-                crate::alert::redact_secrets(&text)
-            );
-        }
-        let parsed: FnnasResp<FnnasRefreshData> = serde_json::from_str(&text).map_err(|e| {
-            anyhow!(
-                "飞牛刷新响应无法解析: {e}; body={}",
-                crate::alert::redact_secrets(&text)
-            )
-        })?;
-        if parsed.code != 0 {
-            bail!(
-                "飞牛刷新失败（令牌可能已失效）: {}",
-                crate::alert::redact_secrets(&parsed.msg)
-            );
-        }
-        let info = parsed
-            .data
-            .ok_or_else(|| anyhow!("飞牛刷新无 data"))?
-            .token_info;
-        // 实测无效 refresh 仍是 HTTP 200 + code=0，但 access/refresh 为空，并带回内置密钥。
-        // 当成成功会把当前登录态写成空 token。
-        if info.access_token.is_empty() || info.refresh_token.is_empty() {
-            bail!("飞牛刷新返回空 token，请重新扫码授权");
-        }
-        // appId/signKey 只确认响应能解析，不拿去替换内置签名。
-        let _parsed_keys = (info.app_id.as_deref(), info.sign_key.as_deref());
-        Ok((info.refresh_token, info.access_token))
     }
 
     /// 用扫码得到的 nonce 换 token 并落盘。
@@ -1939,24 +1837,6 @@ mod tests {
         assert!(is_oss_url_expired_error(&anyhow!("SignatureDoesNotMatch")));
         assert!(!is_oss_url_expired_error(&anyhow!("HTTP 504 Gateway Timeout")));
         assert!(is_retryable_oss_put_error(&anyhow!("HTTP 504 Gateway Timeout")));
-    }
-
-    #[test]
-    fn fnnas_empty_refresh_is_not_a_login() {
-        // 无效 refresh 实测仍是 code=0，token 为空，同时带回内置密钥。
-        let text = r#"{"code":0,"msg":"","data":{"tokenInfo":{"accessToken":"","refreshToken":"","expiresIn":0,"appId":"93b14d40cbef4e5d91945ec93d26fe8f","signKey":"6d27122d2d7b41598a1dbb9b5f605e00"}}}"#;
-        let parsed: FnnasResp<FnnasRefreshData> = serde_json::from_str(text).unwrap();
-        let info = parsed.data.unwrap().token_info;
-        assert!(info.access_token.is_empty());
-        assert!(info.refresh_token.is_empty());
-        assert_eq!(
-            info.app_id.as_deref(),
-            Some("93b14d40cbef4e5d91945ec93d26fe8f")
-        );
-        assert_eq!(
-            info.sign_key.as_deref(),
-            Some("6d27122d2d7b41598a1dbb9b5f605e00")
-        );
     }
 
     #[test]
