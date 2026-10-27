@@ -15,12 +15,11 @@ pub fn is_cloudsync_metadata_dir(name: &str) -> bool {
     name == CLOUDSYNC_METADATA_DIR
 }
 
-/// 夸克禁止/易触发 `illegal text`(14014) 的字符 → 全角可逆替换。
-/// WebDAV/群晖仍见原名；落盘用编码名。含官方禁用符，以及 `.` `'` `&` 等实测会拒的字符。
+/// 官方禁用符里、换成全角后不会再触发 14014 的那一组。
+/// `. : ,` 不在这里：它们的全角形属于兼容区，内容审核 NFKC 之后仍是半角。
 fn quark_forbidden_pairs() -> &'static [(char, char)] {
     &[
         ('\\', '\u{FF3C}'), // ＼
-        (':', '\u{FF1A}'),  // ：
         ('*', '\u{FF0A}'),  // ＊
         ('?', '\u{FF1F}'),  // ？
         ('"', '\u{FF02}'),  // ＂
@@ -28,47 +27,113 @@ fn quark_forbidden_pairs() -> &'static [(char, char)] {
         ('<', '\u{FF1C}'),  // ＜
         ('>', '\u{FF1E}'),  // ＞
         ('|', '\u{FF5C}'),  // ｜
-        (',', '\u{FF0C}'),  // ，
         ('%', '\u{FF05}'),  // ％
         ('&', '\u{FF06}'),  // ＆
         ('#', '\u{FF03}'),  // ＃
         (';', '\u{FF1B}'),  // ；
-        // Open `dir_path` / 内容审核对半角 `.` 偶发 illegal text（如「家委会工作2020.09」）。
-        ('.', '\u{FF0E}'), // ．
         // 路径段里一般不会出现 `/`；若出现同样编码，避免 Open API 直接拒。
         ('/', '\u{FF0F}'), // ／
     ]
 }
 
-fn map_quark_char(ch: char, encode: bool) -> Option<char> {
+/// 间隔号。中文文件名里合法，用来给「审核会拒的标点」当转义前缀。
+const MIDDOT: char = '\u{00B7}';
+
+/// 会触发 illegal text 的标点 → 间隔号后面的标记。
+/// 标记用全角拉丁字母：NFKC 后是普通字母，不会折回 `. : ,`。
+/// 半角与全角各用不同标记，避免「主题四：…」「班，…」和 ASCII 标点互相串名。
+fn punct_mark(ch: char) -> Option<char> {
+    Some(match ch {
+        '.' => '\u{FF44}',        // ｄ
+        '\u{FF0E}' => '\u{FF45}', // ｅ 原文全角句点，不能再原样落盘
+        ':' => '\u{FF43}',        // ｃ
+        '\u{FF1A}' => '\u{FF46}', // ｆ 原文全角冒号（如「主题四：我们都是好朋友」）
+        ',' => '\u{FF4D}',        // ｍ
+        '\u{FF0C}' => '\u{FF4E}', // ｎ 原文全角逗号（如「班，家长活动2017.9」）
+        _ => return None,
+    })
+}
+
+/// `punct_mark` 的逆。只认全角字母，避免把「笔记·docx」里的 ASCII d 当成标记。
+fn punct_from_mark(mark: char) -> Option<char> {
+    Some(match mark {
+        '\u{FF44}' => '.',
+        '\u{FF45}' => '\u{FF0E}',
+        '\u{FF43}' => ':',
+        '\u{FF46}' => '\u{FF1A}',
+        '\u{FF4D}' => ',',
+        '\u{FF4E}' => '\u{FF0C}',
+        _ => return None,
+    })
+}
+
+/// 其余禁用符、弯引号、控制符。不处理 `. : ,` 和间隔号。
+fn map_other_encode(ch: char) -> char {
     for &(from, to) in quark_forbidden_pairs() {
-        if encode && ch == from {
-            return Some(to);
-        }
-        if !encode && ch == to {
-            return Some(from);
+        if ch == from {
+            return to;
         }
     }
-    // 弯引号等常见变体也按直引号处理（编码时 → 全角＇，解码时 → ASCII '）。
-    if encode {
-        match ch {
-            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{FF07}' => Some('\u{FF07}'),
-            '\u{201C}' | '\u{201D}' | '\u{201E}' => Some('\u{FF02}'),
-            // C0 控制符不能进文件名
-            c if c.is_control() => Some('_'),
-            _ => None,
-        }
-    } else {
-        None
+    match ch {
+        // 弯引号按直引号收成全角，避免 HTML 转义把名字改掉。
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{FF07}' => '\u{FF07}',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' => '\u{FF02}',
+        // C0 控制符不能进文件名。
+        c if c.is_control() => '_',
+        c => c,
     }
 }
 
+/// 列表读回：旧版本直接落盘的全角 `．：，` 仍还原成半角，已同步的文件不用改名。
+fn map_other_decode(ch: char) -> char {
+    match ch {
+        '\u{FF0E}' => return '.',
+        '\u{FF1A}' => return ':',
+        '\u{FF0C}' => return ',',
+        _ => {}
+    }
+    for &(from, to) in quark_forbidden_pairs() {
+        if ch == to {
+            return from;
+        }
+    }
+    ch
+}
+
 /// 写入夸克前编码文件/目录名。
+/// `. : ,` 及其中文全角形改成「间隔号 + 全角字母」，因为全角 `．：，` 仍会被判 illegal text。
+/// 已是该形式的片段原样保留，建目录/上传路径上的二次编码不会把名字再改一层。
 pub fn quark_encode_name(name: &str) -> String {
     let trimmed = name.trim_matches(|c: char| c == ' ' || c == '\t');
-    let mut out = String::with_capacity(trimmed.len());
-    for ch in trimmed.chars() {
-        out.push(map_quark_char(ch, true).unwrap_or(ch));
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut out = String::with_capacity(trimmed.len() + 8);
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == MIDDOT {
+            if let Some(nxt) = chars.get(i + 1).copied() {
+                // 二次编码：间隔号本身、或已经带标记的标点，都不再展开。
+                if nxt == MIDDOT || punct_from_mark(nxt).is_some() {
+                    out.push(MIDDOT);
+                    out.push(nxt);
+                    i += 2;
+                    continue;
+                }
+            }
+            // 原文里的间隔号（姓名里常见）写成两个，解码时再折回一个。
+            out.push(MIDDOT);
+            out.push(MIDDOT);
+            i += 1;
+            continue;
+        }
+        if let Some(mark) = punct_mark(ch) {
+            out.push(MIDDOT);
+            out.push(mark);
+            i += 1;
+            continue;
+        }
+        out.push(map_other_encode(ch));
+        i += 1;
     }
     if out.is_empty() {
         // 全是空白时给一个可落盘占位，避免 Open 空名。
@@ -79,9 +144,31 @@ pub fn quark_encode_name(name: &str) -> String {
 
 /// 从夸克列表读回后解码，使 PROPFIND 与客户端路径一致。
 pub fn quark_decode_name(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
     let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        out.push(map_quark_char(ch, false).unwrap_or(ch));
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == MIDDOT {
+            if let Some(nxt) = chars.get(i + 1).copied() {
+                if nxt == MIDDOT {
+                    out.push(MIDDOT);
+                    i += 2;
+                    continue;
+                }
+                if let Some(orig) = punct_from_mark(nxt) {
+                    out.push(orig);
+                    i += 2;
+                    continue;
+                }
+            }
+            // 网盘上本来就有的单个间隔号，不是我们写的转义。
+            out.push(MIDDOT);
+            i += 1;
+            continue;
+        }
+        out.push(map_other_decode(ch));
+        i += 1;
     }
     out
 }
@@ -173,11 +260,15 @@ mod tests {
     fn test_quark_name_encode_roundtrip_star() {
         let raw = "*.poiig.top_ecc";
         let enc = quark_encode_name(raw);
-        assert_eq!(enc, "＊．poiig．top_ecc");
+        // ＊ 仍是全角星号；点号改成间隔号 + 全角 ｄ，避免 NFKC 折回半角点。
+        assert_eq!(enc, "＊\u{00B7}\u{FF44}poiig\u{00B7}\u{FF44}top_ecc");
         assert_ne!(enc, raw);
         assert_eq!(quark_decode_name(&enc), raw);
-        assert_eq!(quark_encode_name("normal.txt"), "normal．txt");
+        assert_eq!(quark_encode_name(&enc), enc);
+        assert_eq!(quark_encode_name("normal.txt"), "normal\u{00B7}\u{FF44}txt");
+        // 旧落盘名（全角句点）仍能还原，已同步文件不用重传。
         assert_eq!(quark_decode_name("normal．txt"), "normal.txt");
+        assert_eq!(quark_decode_name("＊．poiig．top_ecc"), raw);
     }
 
     #[test]
@@ -185,8 +276,58 @@ mod tests {
         // 复现：家委会工作2020.09 → Open API illegal text (errno=14014)
         let raw = "家委会工作2020.09";
         let enc = quark_encode_name(raw);
-        assert_eq!(enc, "家委会工作2020．09");
+        assert_eq!(enc, "家委会工作2020\u{00B7}\u{FF44}09");
         assert_eq!(quark_decode_name(&enc), raw);
+        assert_eq!(quark_encode_name(&enc), enc);
+    }
+
+    #[test]
+    fn test_illegal_text_reported_folder_names() {
+        // 群晖同步仍 14014 的目录段：半角点、原文里的全角冒号/逗号。
+        let samples = [
+            "2018.09教育教学资料",
+            "教师备课2018.09",
+            "中2班2018.09",
+            "蔡叶婷备课",
+            "主题四：我们都是好朋友",
+            "2017.9教育教学资料",
+            "家长工作2017.9",
+            "班，家长活动2017.9",
+            "中2",
+            "教研2017.9",
+            "区域活动材料记录2017.9",
+            "大2班",
+            "2020.9中心资料",
+            "缴费2020.9",
+            "天怡2020.9",
+            "中心",
+            "家长工作2020.09",
+            "家委会工作2020.09",
+            "a:b,c",
+            "阿卜杜拉·买买提",
+            "笔记·docx",
+        ];
+        for raw in samples {
+            let enc = quark_encode_name(raw);
+            assert_eq!(quark_decode_name(&enc), raw, "roundtrip {raw}");
+            assert_eq!(quark_encode_name(&enc), enc, "idempotent {raw}");
+            assert!(
+                !enc.chars().any(|c| {
+                    matches!(c, '.' | ':' | ',' | '\u{FF0E}' | '\u{FF1A}' | '\u{FF0C}')
+                }),
+                "仍含会被折成半角的标点: {raw} -> {enc}"
+            );
+        }
+        assert_eq!(
+            quark_encode_name("主题四：我们都是好朋友"),
+            "主题四\u{00B7}\u{FF46}我们都是好朋友"
+        );
+        assert_eq!(
+            quark_encode_name("班，家长活动2017.9"),
+            "班\u{00B7}\u{FF4E}家长活动2017\u{00B7}\u{FF44}9"
+        );
+        // 旧编码把 ASCII 冒号/逗号存成全角，列表仍还原成半角。
+        assert_eq!(quark_decode_name("a：b，c"), "a:b,c");
     }
 
     #[test]

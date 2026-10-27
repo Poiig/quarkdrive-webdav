@@ -1023,8 +1023,9 @@ impl QuarkDrive {
         pdir_fid: &str,
         local_mtime_ms: u64,
     ) -> Result<UpPreResponse> {
+        // MIME 看客户端原名。落盘名里的扩展名点号已换成间隔号标记，不能再 rsplit('.')。
+        let format_type = get_format_type(file_name).to_string();
         let file_name = crate::util::quark_encode_name(file_name);
-        let format_type = get_format_type(&file_name).to_string();
         let now_ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_millis() as u64;
         // 有客户端 mtime 时写进夸克，PROPFIND 才能和群晖本地时间对齐。
         let stamp_ms = if local_mtime_ms > 0 { local_mtime_ms } else { now_ms };

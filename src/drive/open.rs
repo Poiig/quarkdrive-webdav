@@ -666,6 +666,8 @@ impl OpenClient {
         local_mtime_ms: u64,
         old_fid: &str,
     ) -> Result<()> {
+        // MIME 看客户端原名。落盘名里的扩展名点号已换成间隔号标记，不能再 rsplit('.')。
+        let format_type = get_format_type(file_name).to_string();
         let file_name = crate::util::quark_encode_name(file_name);
         let file_name = file_name.as_str();
         let pathname = "/open/v1/file/upload_pre";
@@ -685,7 +687,7 @@ impl OpenClient {
         let body = json!({
             "file_name": file_name,
             "size": size,
-            "format_type": get_format_type(file_name),
+            "format_type": format_type,
             "md5": md5,
             "sha1": sha1,
             "l_created_at": stamp_ms,
