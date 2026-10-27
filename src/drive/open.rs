@@ -674,10 +674,18 @@ impl OpenClient {
             "action_type": 1,
             "fid_list": [fid],
         });
-        let _: serde_json::Value = self
-            .request(client, pathname, "POST", Some(body), None)
-            .await?;
-        Ok(())
+        match self
+            .request::<serde_json::Value>(client, pathname, "POST", Some(body), None)
+            .await
+        {
+            Ok(_) => Ok(()),
+            // 预创建文件在连接重置时经常还没落盘，再删就是 21001。视为已经不在，下一轮 PUT 会重传。
+            Err(err) if is_file_not_found_error(&err) => {
+                debug!(fid, pathname, "目标已不存在，删除视为完成");
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Open 上传全流程：pre（含 proof）→ 分片 URL → PUT → finish。
@@ -1084,7 +1092,9 @@ impl OpenClient {
         }
 
         const MAX_RATE_RETRIES: u32 = 5;
+        const MAX_TRANSIENT_RETRIES: u32 = 4;
         let mut rate_attempt = 0u32;
+        let mut transient_attempt = 0u32;
         loop {
             let result = {
                 let _permit = self.api_gate.acquire().await?;
@@ -1106,6 +1116,22 @@ impl OpenClient {
                     );
                     tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                     rate_attempt += 1;
+                    continue;
+                }
+                Err(err)
+                    if is_transient_open_error(&err) && transient_attempt < MAX_TRANSIENT_RETRIES =>
+                {
+                    // 夸克 Java 侧 Connection reset。同一请求再试，避免整文件失败后等群晖重传。
+                    let delay_secs = 1u64 << transient_attempt.min(3);
+                    warn!(
+                        pathname = %pathname,
+                        attempt = transient_attempt + 1,
+                        delay_secs,
+                        error = %err,
+                        "Open API 连接被重置，退避后重试"
+                    );
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                    transient_attempt += 1;
                     continue;
                 }
                 Err(err) if is_token_expired_error(&err) => {
@@ -1147,6 +1173,9 @@ impl OpenClient {
                     // 限流告警单独归类，且走 alert 去重，避免刷屏。
                     if is_rate_limited_error(&err) {
                         self.alert.notify("Open API 限流", &msg).await;
+                    } else if is_file_not_found_error(&err) {
+                        // 编号已经没了。删除会当成成功；列表/上传仍把错误交回客户端以便补传。
+                        warn!(pathname = %pathname, error = %err, "Open API 目标文件已不存在");
                     } else if msg.contains("errno")
                         || msg.contains("Open API")
                         || msg.contains("令牌")
@@ -1778,6 +1807,20 @@ impl std::fmt::Display for TokenExpiredError {
 
 impl std::error::Error for TokenExpiredError {}
 
+/// 夸克网关把上游 Java 连接重置包成 errno=20001。过一会儿重试通常能继续。
+fn is_transient_open_error(err: &anyhow::Error) -> bool {
+    let s = err.to_string();
+    s.contains("errno=20001")
+        || s.contains("Connection reset")
+        || s.contains("connection reset")
+}
+
+/// 操作的 fid 在网盘上已经没有了。删除可以当成成功，上传则交给客户端重试。
+fn is_file_not_found_error(err: &anyhow::Error) -> bool {
+    let s = err.to_string();
+    s.contains("errno=21001") || s.contains("文件找不到")
+}
+
 fn is_rate_limited_error(err: &anyhow::Error) -> bool {
     let s = err.to_string();
     s.contains("errno=429")
@@ -1861,6 +1904,21 @@ mod tests {
         let access = creds.access_token.try_read().unwrap().clone();
         assert_eq!(access, "acc");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transient_reset_and_missing_file() {
+        let reset = anyhow!(
+            "Open API 错误: 网盘请求异常, 错误信息: 15000 java.net.SocketException: Connection reset (status=-1, errno=20001)"
+        );
+        let missing = anyhow!("Open API 错误: 文件找不到 (status=-1, errno=21001)");
+        let illegal = anyhow!("Open API 错误: illegal text (status=-1, errno=14014)");
+        assert!(is_transient_open_error(&reset));
+        assert!(is_file_not_found_error(&missing));
+        assert!(!is_transient_open_error(&missing));
+        assert!(!is_file_not_found_error(&reset));
+        assert!(!is_transient_open_error(&illegal));
+        assert!(!is_file_not_found_error(&illegal));
     }
 
     #[test]

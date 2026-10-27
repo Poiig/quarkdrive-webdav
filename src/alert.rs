@@ -1,5 +1,6 @@
 //! 企业微信群机器人告警：凭证过期、刷新失败、API 报错时推送。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,8 @@ pub struct Alert {
 struct AlertInner {
     webhook_key: String,
     client: reqwest::Client,
-    last_sent: Mutex<Option<(String, Instant)>>,
+    /// 按「事件+正文」分别去重。只记上一条的话，21001 和 20001 交替出现会每条都推。
+    last_sent: Mutex<HashMap<String, Instant>>,
 }
 
 impl Alert {
@@ -34,7 +36,7 @@ impl Alert {
             Arc::new(AlertInner {
                 webhook_key,
                 client: reqwest::Client::new(),
-                last_sent: Mutex::new(None),
+                last_sent: Mutex::new(HashMap::new()),
             })
         });
         Self { inner }
@@ -59,13 +61,13 @@ impl Alert {
         let dedup_key = format!("{event}|{detail}");
         {
             let mut last = inner.last_sent.lock().await;
-            if let Some((ref prev, at)) = *last {
-                if prev == &dedup_key && at.elapsed() < Duration::from_secs(DEDUP_SECS) {
-                    debug!(event = %event, "skip duplicate wecom alert");
-                    return;
-                }
+            let window = Duration::from_secs(DEDUP_SECS);
+            last.retain(|_, at| at.elapsed() < window);
+            if last.contains_key(&dedup_key) {
+                debug!(event = %event, "skip duplicate wecom alert");
+                return;
             }
-            *last = Some((dedup_key, Instant::now()));
+            last.insert(dedup_key, Instant::now());
         }
         if let Err(err) = inner.send_markdown(&content).await {
             warn!(error = %err, "wecom webhook send failed");
