@@ -3,7 +3,7 @@
 //! 用 AppId/SignKey 签请求头，并用 refresh_token 续期 access_token。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -423,12 +423,25 @@ pub fn generate_req_sign(method: &str, pathname: &str, sign_key: &str) -> (Strin
     (tm, token, req_id)
 }
 
+/// Open API 调用优先级：上传不能被目录 list / 后台刷新饿死。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiPriority {
+    /// upload_pre / get_upload_urls / upload_finish
+    High,
+    /// mkdir / move / delete 等普通写
+    Normal,
+    /// list：有 High 在等时主动让路
+    Low,
+}
+
 /// 全局限流：并发上限 + 最小间隔，降低 CloudSync 扫目录时的 429。
 #[derive(Debug)]
 struct OpenApiGate {
     sem: Semaphore,
     last_start: Mutex<Option<Instant>>,
     min_interval: Duration,
+    /// 正在排队或已占用间隔槽的 High 调用数；Low 看见 >0 就让路。
+    high_waiting: AtomicUsize,
 }
 
 impl OpenApiGate {
@@ -437,26 +450,101 @@ impl OpenApiGate {
             sem: Semaphore::new(max_concurrent.max(1)),
             last_start: Mutex::new(None),
             min_interval: Duration::from_millis(min_interval_ms.max(1)),
+            high_waiting: AtomicUsize::new(0),
         }
     }
 
-    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+    async fn acquire(&self, priority: ApiPriority) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        match priority {
+            ApiPriority::High => {
+                self.high_waiting.fetch_add(1, Ordering::SeqCst);
+                let result = self.acquire_slot().await;
+                self.high_waiting.fetch_sub(1, Ordering::SeqCst);
+                result
+            }
+            ApiPriority::Normal => self.acquire_slot().await,
+            ApiPriority::Low => self.acquire_low().await,
+        }
+    }
+
+    async fn acquire_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
         let permit = self
             .sem
             .acquire()
             .await
             .map_err(|_| anyhow!("Open API 限流信号量已关闭"))?;
-        {
-            let mut last = self.last_start.lock().await;
-            if let Some(prev) = *last {
-                let elapsed = prev.elapsed();
-                if elapsed < self.min_interval {
-                    tokio::time::sleep(self.min_interval - elapsed).await;
-                }
-            }
-            *last = Some(Instant::now());
-        }
+        self.pace_interval().await;
         Ok(permit)
+    }
+
+    /// 目录 list：不与上传抢槽。High 一出现就放下 permit 重等。
+    async fn acquire_low(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        loop {
+            while self.high_waiting.load(Ordering::SeqCst) > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let permit = self
+                .sem
+                .acquire()
+                .await
+                .map_err(|_| anyhow!("Open API 限流信号量已关闭"))?;
+            if self.high_waiting.load(Ordering::SeqCst) > 0 {
+                drop(permit);
+                continue;
+            }
+            // 间隔等待期间若有上传插队，放掉名额再让。
+            let paced = self.pace_interval_preemptible().await;
+            if !paced || self.high_waiting.load(Ordering::SeqCst) > 0 {
+                drop(permit);
+                continue;
+            }
+            return Ok(permit);
+        }
+    }
+
+    async fn pace_interval(&self) {
+        let mut last = self.last_start.lock().await;
+        if let Some(prev) = *last {
+            let elapsed = prev.elapsed();
+            if elapsed < self.min_interval {
+                tokio::time::sleep(self.min_interval - elapsed).await;
+            }
+        }
+        *last = Some(Instant::now());
+    }
+
+    /// 可抢占的间隔等待：被 High 打断时返回 false（调用方应丢弃 permit）。
+    async fn pace_interval_preemptible(&self) -> bool {
+        let wait = {
+            let last = self.last_start.lock().await;
+            match *last {
+                Some(prev) => {
+                    let elapsed = prev.elapsed();
+                    if elapsed < self.min_interval {
+                        Some(self.min_interval - elapsed)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        if let Some(wait) = wait {
+            let steps = (wait.as_millis() / 20).max(1) as u32;
+            let slice = wait / steps;
+            for _ in 0..steps {
+                if self.high_waiting.load(Ordering::SeqCst) > 0 {
+                    return false;
+                }
+                tokio::time::sleep(slice).await;
+            }
+        }
+        if self.high_waiting.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        let mut last = self.last_start.lock().await;
+        *last = Some(Instant::now());
+        true
     }
 }
 
@@ -507,7 +595,14 @@ impl OpenClient {
     /// 启动时拉 user/info，缓存 user_id（上传 proof_seed1 需要）。
     pub async fn init(&self, client: &ClientWithMiddleware) -> Result<()> {
         let mut resp: UserInfoResp = self
-            .request(client, "/open/v1/user/info", "GET", None, None)
+            .request(
+                client,
+                "/open/v1/user/info",
+                "GET",
+                None,
+                None,
+                ApiPriority::Normal,
+            )
             .await?;
         if resp.data.user_id.is_empty() {
             bail!("Open API 未能获取 user_id");
@@ -540,6 +635,7 @@ impl OpenClient {
                     "POST",
                     Some(body),
                     None,
+                    ApiPriority::Low,
                 )
                 .await?;
             files.extend(resp.data.file_list.into_iter().map(QuarkFile::from));
@@ -568,6 +664,7 @@ impl OpenClient {
                 "POST",
                 Some(body),
                 None,
+                ApiPriority::Normal,
             )
             .await?;
         if resp.data.download_url.is_empty() {
@@ -592,7 +689,14 @@ impl OpenClient {
             "pdir_fid": parent_fid,
         });
         let resp: serde_json::Value = self
-            .request(client, "/open/v1/dir", "POST", Some(body), None)
+            .request(
+                client,
+                "/open/v1/dir",
+                "POST",
+                Some(body),
+                None,
+                ApiPriority::Normal,
+            )
             .await?;
         // 响应里带上新目录 fid，给 WebDAV 占位用，避免随后 PUT 时 pdir_fid 空白。
         let fid = resp
@@ -632,6 +736,7 @@ impl OpenClient {
                 "POST",
                 Some(body),
                 None,
+                ApiPriority::Normal,
             )
             .await?;
         Ok(())
@@ -649,7 +754,14 @@ impl OpenClient {
             "to_pdir_fid": to_parent_fid,
         });
         let _: serde_json::Value = self
-            .request(client, "/open/v1/file/move", "POST", Some(body), None)
+            .request(
+                client,
+                "/open/v1/file/move",
+                "POST",
+                Some(body),
+                None,
+                ApiPriority::Normal,
+            )
             .await?;
         Ok(())
     }
@@ -675,7 +787,14 @@ impl OpenClient {
             "fid_list": [fid],
         });
         match self
-            .request::<serde_json::Value>(client, pathname, "POST", Some(body), None)
+            .request::<serde_json::Value>(
+                client,
+                pathname,
+                "POST",
+                Some(body),
+                None,
+                ApiPriority::Normal,
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -748,7 +867,14 @@ impl OpenClient {
             req_id,
         };
         let pre: UpPreResp = self
-            .request(client, pathname, "POST", Some(body), Some(&manual))
+            .request(
+                client,
+                pathname,
+                "POST",
+                Some(body),
+                Some(&manual),
+                ApiPriority::High,
+            )
             .await?;
         if pre.data.finish {
             debug!(file_name = %file_name, "open upload finished by rapid upload");
@@ -877,6 +1003,7 @@ impl OpenClient {
                 "POST",
                 Some(finish_body),
                 None,
+                ApiPriority::High,
             )
             .await?;
         if !finish.data.finish {
@@ -934,6 +1061,7 @@ impl OpenClient {
                 "POST",
                 Some(url_body),
                 None,
+                ApiPriority::High,
             )
             .await?;
         Ok((up_urls.data.common_headers, up_urls.data.upload_urls))
@@ -1082,6 +1210,7 @@ impl OpenClient {
         method: &str,
         body: Option<serde_json::Value>,
         manual: Option<&ManualSign>,
+        priority: ApiPriority,
     ) -> Result<T>
     where
         T: for<'de> Deserialize<'de>,
@@ -1097,7 +1226,7 @@ impl OpenClient {
         let mut transient_attempt = 0u32;
         loop {
             let result = {
-                let _permit = self.api_gate.acquire().await?;
+                let _permit = self.api_gate.acquire(priority).await?;
                 self.request_once::<T>(client, pathname, method, body.as_ref(), manual, false)
                     .await
             };
@@ -1137,7 +1266,7 @@ impl OpenClient {
                 Err(err) if is_token_expired_error(&err) => {
                     let _guard = self.refresh_lock.lock().await;
                     {
-                        let _permit = self.api_gate.acquire().await?;
+                        let _permit = self.api_gate.acquire(priority).await?;
                         if let Ok(v) = self
                             .request_once::<T>(
                                 client,
@@ -1160,7 +1289,7 @@ impl OpenClient {
                         }
                         return Err(refresh_err);
                     }
-                    let _permit = self.api_gate.acquire().await?;
+                    let _permit = self.api_gate.acquire(priority).await?;
                     return self
                         .request_once(client, pathname, method, body.as_ref(), manual, true)
                         .await;
@@ -1377,7 +1506,14 @@ impl OpenClient {
         self.apply_tokens(access, refresh).await?;
         // 登录后立刻拉 user_id，供后续上传 proof。
         let mut resp: UserInfoResp = self
-            .request(client, "/open/v1/user/info", "GET", None, None)
+            .request(
+                client,
+                "/open/v1/user/info",
+                "GET",
+                None,
+                None,
+                ApiPriority::Normal,
+            )
             .await?;
         if !resp.data.user_id.is_empty() {
             *self.creds.user_id.write().await = std::mem::take(&mut resp.data.user_id);
@@ -1402,7 +1538,14 @@ impl OpenClient {
             }
         }
         match self
-            .request::<UserInfoResp>(client, "/open/v1/user/info", "GET", None, None)
+            .request::<UserInfoResp>(
+                client,
+                "/open/v1/user/info",
+                "GET",
+                None,
+                None,
+                ApiPriority::Normal,
+            )
             .await
         {
             Ok(resp) => {

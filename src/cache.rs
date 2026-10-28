@@ -156,6 +156,11 @@ impl Cache {
         self.inner.get(key).await
     }
 
+    /// 只读命中，不触发远端 list。上传前认领同名文件时用来判断目录是否已热。
+    pub async fn get_cached(&self, key: &str) -> Option<Vec<QuarkFile>> {
+        self.get(key).await
+    }
+
     async fn insert(&self, key: String, value: Vec<QuarkFile>) {
         debug!(
             key = %key,

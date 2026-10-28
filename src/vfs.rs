@@ -133,6 +133,19 @@ pub struct QuarkDriveFileSystem {
     pending_relocate: Arc<DashMap<String, PendingRelocate>>,
     /// 不小于此大小的删除才延迟真删（0=全部延迟，恢复旧行为可设 32MB）。
     relocate_defer_min_size: u64,
+    /// 上传完成后待刷新的父目录条目（按 parent_key 合并，避免每个小文件都打一次全量 list）。
+    dir_refresh_pending: Arc<DashMap<String, Vec<DirRefreshItem>>>,
+    /// 已在跑的父目录刷新工人（一父一任务）。
+    dir_refresh_workers: Arc<DashMap<String, ()>>,
+}
+
+/// 上传成功后挂到父目录刷新队列的一项。
+#[derive(Debug, Clone)]
+struct DirRefreshItem {
+    parent_dir: PathBuf,
+    file_name: String,
+    size: u64,
+    old_fid: String,
 }
 
 /// 被 CloudSync 先删、可能马上在别处再传的大文件。
@@ -193,6 +206,8 @@ impl QuarkDriveFileSystem {
             pending_relocate: Arc::new(DashMap::new()),
             // 0=CloudSync 先删后传时一律挂起，PUT 阶段再比 hash，避免小文件先进回收站又重传。
             relocate_defer_min_size: 0,
+            dir_refresh_pending: Arc::new(DashMap::new()),
+            dir_refresh_workers: Arc::new(DashMap::new()),
         })
     }
 
@@ -535,7 +550,8 @@ impl QuarkDriveFileSystem {
         true
     }
 
-    /// 后台刷新父目录，并在新文件出现后删掉被替换的旧 fid。
+    /// 后台按父目录合并刷新：同一目录里连传几百个小文件时，只打少量 list，
+    /// 避免每个文件都 invalidate + 全量分页，把 OpenApiGate 堵死、接收/发起上传变慢。
     fn schedule_dir_refresh_after_upload(
         &self,
         parent_dir: &Path,
@@ -545,98 +561,183 @@ impl QuarkDriveFileSystem {
         old_fid: &str,
     ) {
         self.update_uploading_file(parent_key, file_name, size);
-        let fs = self.clone();
-        let parent_dir = parent_dir.to_path_buf();
-        let file_name = file_name.to_string();
         let parent_key = parent_key.to_string();
-        let old_fid = old_fid.to_string();
+        self.dir_refresh_pending
+            .entry(parent_key.clone())
+            .or_default()
+            .push(DirRefreshItem {
+                parent_dir: parent_dir.to_path_buf(),
+                file_name: file_name.to_string(),
+                size,
+                old_fid: old_fid.to_string(),
+            });
+        // 一父一工人；后续条目只入队，由同一任务批量消化。
+        if self
+            .dir_refresh_workers
+            .insert(parent_key.clone(), ())
+            .is_some()
+        {
+            return;
+        }
+        let fs = self.clone();
         tokio::spawn(async move {
-            // 先作废缓存，下一次 PROPFIND / 后台轮询都会重新 list。
-            fs.dir_cache.invalidate(&parent_dir).await;
-            // 略等夸克把新文件放进列表，这段不占用 PUT 响应。
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            let visible = fs.poll_remote_visible(&parent_dir, &file_name).await;
-            if !visible {
-                warn!(
-                    parent = %parent_dir.display(),
-                    file_name = %file_name,
-                    "remote listing still missing file after upload; keep uploading stub for PROPFIND"
-                );
-            }
-            if !old_fid.is_empty() {
-                fs.delete_replaced_file(&old_fid, &parent_dir, &file_name).await;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-            fs.remove_uploading_file(&parent_key, &file_name);
-            debug!(
-                parent = %parent_key,
-                file_name = %file_name,
-                "deferred remove uploading stub"
-            );
+            fs.run_dir_refresh_worker(parent_key).await;
         });
     }
 
-    /// 后台轮询父目录列表。不在 PUT 的响应路径上调用。
-    async fn poll_remote_visible(&self, parent_dir: &Path, file_name: &str) -> bool {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut delay = std::time::Duration::from_secs(1);
-        let key = Self::parent_cache_key(parent_dir);
+    async fn run_dir_refresh_worker(&self, parent_key: String) {
+        // 先等一会儿：把短时间内的后续完成项攒进同一批，也给夸克列表一点时间。
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let mut rounds = 0u32;
+        let mut pending_remove: Vec<(String, String)> = Vec::new();
         loop {
-            if let Some(files) = self.dir_cache.get_or_insert(&key).await {
-                if files.iter().any(|f| file_names_equal(&f.file_name, file_name)) {
-                    debug!(
-                        parent = %parent_dir.display(),
-                        file_name = %file_name,
-                        "upload visible in remote listing"
-                    );
-                    return true;
+            let batch = self
+                .dir_refresh_pending
+                .get_mut(&parent_key)
+                .map(|mut v| std::mem::take(&mut *v))
+                .unwrap_or_default();
+            if batch.is_empty() {
+                self.dir_refresh_workers.remove(&parent_key);
+                // 与入队竞态：摘工人后又有新项，重新抢工人。
+                let again = self
+                    .dir_refresh_pending
+                    .get(&parent_key)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+                if again
+                    && self
+                        .dir_refresh_workers
+                        .insert(parent_key.clone(), ())
+                        .is_none()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    continue;
+                }
+                break;
+            }
+
+            let parent_dir = batch[0].parent_dir.clone();
+            // 整批只作废 + list 一次（list 走 Low 优先级，上传仍能插队）。
+            self.dir_cache.invalidate(&parent_dir).await;
+            let files = self.dir_cache.get_or_insert(&parent_key).await;
+            let mut retry = Vec::new();
+            for item in batch {
+                self.update_uploading_file(&parent_key, &item.file_name, item.size);
+                let visible = files.as_ref().map(|list| {
+                    list.iter()
+                        .any(|f| file_names_equal(&f.file_name, &item.file_name))
+                });
+                match visible {
+                    Some(true) => {
+                        if !item.old_fid.is_empty() {
+                            let replaced = self
+                                .try_delete_replaced_after_list(
+                                    &item.old_fid,
+                                    &parent_dir,
+                                    &item.file_name,
+                                    files.as_ref(),
+                                )
+                                .await;
+                            // 列表里可能还是旧 fid（新文件未进表）。再等几轮，勿过早摘占位。
+                            if !replaced && rounds < 6 {
+                                retry.push(item);
+                                continue;
+                            }
+                            if !replaced {
+                                warn!(
+                                    old_fid = %item.old_fid,
+                                    file_name = %item.file_name,
+                                    "replacement not visible; keep previous file"
+                                );
+                            }
+                        }
+                        pending_remove.push((parent_key.clone(), item.file_name));
+                    }
+                    _ if rounds < 6 => {
+                        retry.push(item);
+                    }
+                    _ => {
+                        warn!(
+                            parent = %parent_dir.display(),
+                            file_name = %item.file_name,
+                            "remote listing still missing file after upload; keep uploading stub for PROPFIND"
+                        );
+                        pending_remove.push((parent_key.clone(), item.file_name));
+                    }
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
+            if !retry.is_empty() {
+                self.dir_refresh_pending
+                    .entry(parent_key.clone())
+                    .or_default()
+                    .extend(retry);
             }
-            self.dir_cache.invalidate(parent_dir).await;
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(std::time::Duration::from_secs(8));
+            rounds += 1;
+            // 还有未看见的 / 新入队的：拉长间隔再刷，别跟上传抢 gate。
+            let more = self
+                .dir_refresh_pending
+                .get(&parent_key)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            if more {
+                let delay_secs = (1u64 << rounds.min(3)).min(8);
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            }
+        }
+
+        // 占位再留一会，给 CloudSync 紧随其后的 PROPFIND；合并移除减少定时器数量。
+        if !pending_remove.is_empty() {
+            let fs = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                for (pk, name) in pending_remove {
+                    fs.remove_uploading_file(&pk, &name);
+                    debug!(parent = %pk, file_name = %name, "deferred remove uploading stub");
+                }
+            });
         }
     }
 
-    /// 新文件已经出现在列表里之后再删旧 fid。
-    /// 秒传若复用了旧 fid，列表里不会有另一份，这时不能删，否则唯一副本没了。
-    async fn delete_replaced_file(&self, old_fid: &str, parent_dir: &Path, file_name: &str) {
-        if old_fid.is_empty() {
-            return;
-        }
-        let key = Self::parent_cache_key(parent_dir);
-        // 30 秒：大文件 finish 后列表偶尔滞后；超时就留着旧文件，避免误删。
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            self.dir_cache.invalidate(parent_dir).await;
-            let found_new = self.dir_cache.get_or_insert(&key).await.map(|files| {
-                files.iter().any(|f| {
-                    file_names_equal(&f.file_name, file_name)
-                        && !f.fid.is_empty()
-                        && f.fid != old_fid
-                })
-            }).unwrap_or(false);
-            if found_new {
-                match self.drive.remove_file(old_fid, !self.no_trash).await {
-                    Ok(()) => {
-                        self.dir_cache.invalidate(parent_dir).await;
-                    }
-                    Err(err) => {
-                        // 新文件已在列表里。删旧失败不能把这次成功报成失败。
-                        warn!(old_fid, error = %err, "new upload ok but deleting previous file failed");
-                    }
-                }
-                return;
+    /// 列表里已能看见新文件（不同 fid）时再删旧的；秒传复用旧 fid 则返回 true（不用删）。
+    /// 返回是否已处理完替换（已删或确认无需删）。
+    async fn try_delete_replaced_after_list(
+        &self,
+        old_fid: &str,
+        parent_dir: &Path,
+        file_name: &str,
+        files: Option<&Vec<QuarkFile>>,
+    ) -> bool {
+        let Some(files) = files else {
+            return false;
+        };
+        let found_new = files.iter().any(|f| {
+            file_names_equal(&f.file_name, file_name)
+                && !f.fid.is_empty()
+                && f.fid != old_fid
+        });
+        if !found_new {
+            // 仅有同名旧 fid / 列表滞后：下一轮合并刷新再看，不单独每秒 invalidate。
+            let only_old = files.iter().any(|f| {
+                file_names_equal(&f.file_name, file_name) && f.fid == old_fid
+            });
+            if only_old {
+                debug!(
+                    old_fid,
+                    file_name,
+                    "replacement not in this listing yet; defer delete"
+                );
             }
-            if tokio::time::Instant::now() >= deadline {
-                warn!(old_fid, file_name, "replacement not visible; keep previous file");
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            return false;
         }
+        match self.drive.remove_file(old_fid, !self.no_trash).await {
+            Ok(()) => {
+                self.dir_cache.invalidate(parent_dir).await;
+            }
+            Err(err) => {
+                warn!(old_fid, error = %err, "new upload ok but deleting previous file failed");
+            }
+        }
+        true
     }
 
     /// 上传字节已经结束。这里才等列表，调用方必须先放开上传槽和快车道。
@@ -1625,8 +1726,11 @@ impl QuarkDavFile {
         )
     }
 
-    /// 占位的 fid 是空的。重 PUT 前强制刷一次父目录，认领已经在网盘上的同名文件，
+    /// 占位的 fid 是空的。上传前认领网盘上已有的同名文件，
     /// 避免 same_path_reuse=false 再造出第二份。
+    ///
+    /// 父目录列表若已在缓存里，绝不再 invalidate 强刷：每个小文件 flush 都全量 list
+    /// 会把 OpenApiGate 堵死，表现就是「接收中」卡住、几十 KB 也要两分多钟。
     async fn bind_existing_remote(&mut self) {
         if !self.file.fid.is_empty() {
             return;
@@ -1648,8 +1752,28 @@ impl QuarkDavFile {
             self.from_deferred_same_path = true;
             return;
         }
-        self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
         let path = self.parent_dir.join(&self.file.file_name);
+        let parent_key = QuarkDriveFileSystem::parent_cache_key(self.parent_dir.as_path());
+        // 热缓存：有同名就认领，没有就当新文件，不打 API。
+        if let Some(files) = self.fs.dir_cache.get_cached(&parent_key).await {
+            if let Some(existing) = files
+                .into_iter()
+                .find(|f| file_names_equal(&f.file_name, &self.file.file_name) && !f.fid.is_empty())
+            {
+                info!(
+                    file_name = %self.file.file_name,
+                    fid = %existing.fid,
+                    size = existing.size,
+                    "adopt existing remote file from warm cache"
+                );
+                self.file.fid = existing.fid;
+                self.file.size = existing.size;
+                self.file.content_hash = existing.content_hash;
+            }
+            return;
+        }
+        // 冷目录：只拉一次，仍然不作无条件 invalidate。
+        let _ = self.fs.dir_cache.get_or_insert(&parent_key).await;
         let Ok(Some(existing)) = self.fs.find_in_cache(&path).await else {
             return;
         };
