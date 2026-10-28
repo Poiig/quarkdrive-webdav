@@ -174,8 +174,7 @@ struct Opt {
     #[arg(long, env = "REFRESH_CACHE_SECS_INTERVAL", default_value = "300")]
     refresh_cache_secs_interval: u64,
 
-    /// 等待上传完成的最长秒数。默认 0=一直等到夸克上传完成再返回客户端；
-    /// 设为正数则超时后先返回、后台继续传（旧「快返回」行为）。
+    /// 已忽略。大文件必须等夸克上传成功后才回客户端，提前返回会导致整份重传。
     #[arg(long, env = "UPLOAD_WAIT_TIMEOUT", default_value_t = 0)]
     upload_wait_timeout: u64,
     /// CloudSync 先删后传时，不小于此大小的删除才延迟进回收站（0=全部延迟，32MB=仅大文件）。
@@ -333,6 +332,12 @@ async fn main() -> anyhow::Result<()> {
     let relocate_defer_min_size = parse_byte_size(&opt.relocate_defer_min_size)?;
     let mut fs =
         QuarkDriveFileSystem::new(drive, opt.root, opt.cache_size, cache_bytes, opt.cache_ttl)?;
+    if opt.upload_wait_timeout > 0 {
+        tracing::warn!(
+            secs = opt.upload_wait_timeout,
+            "UPLOAD_WAIT_TIMEOUT 已忽略：WebDAV 只在夸克上传成功后返回成功"
+        );
+    }
     fs.set_no_trash(opt.no_trash)
         .set_read_only(opt.read_only)
         .set_upload_buffer_size(opt.upload_buffer_size)
@@ -340,7 +345,6 @@ async fn main() -> anyhow::Result<()> {
         .set_relocate_defer_min_size(relocate_defer_min_size)
         .set_skip_upload_same_size(opt.skip_upload_same_size)
         .set_prefer_http_download(opt.prefer_http_download)
-        .set_upload_wait_timeout(opt.upload_wait_timeout)
         .set_chunk_cache_bytes(opt.chunk_cache_mb * 1024 * 1024)
         .set_oplog(oplog);
     let cache = Arc::new(fs.dir_cache.clone());

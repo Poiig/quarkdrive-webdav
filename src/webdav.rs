@@ -1185,7 +1185,9 @@ fn console_float_html() -> &'static str {
       <div class="${barCls}"><i style="width:${barPct}%"></i></div>
       <div class="r2"><span class="pct">${left}</span><span class="speed">${esc(speed)}</span>${durHtml}${laneHtml}</div>`;
   }
-  function isActive(it){ return it.status==="receiving"||it.status==="uploading"; }
+  function isUploading(it){ return it.status==="uploading"; }
+  function isReceiving(it){ return it.status==="receiving"; }
+  function isActive(it){ return isUploading(it)||isReceiving(it); }
   function histStatus(result){
     const r=String(result||"");
     if(r.startsWith("error")) return "error";
@@ -1229,7 +1231,10 @@ fn console_float_html() -> &'static str {
   }
   function renderUploads(items, maxItems){
     const live=items||[];
-    const activeN=live.filter(isActive).length;
+    const uploading=live.filter(isUploading);
+    const receiving=live.filter(isReceiving);
+    const activeN=uploading.length;
+    const recvN=receiving.length;
     const liveDone=live.filter(it=>!isActive(it));
     // 内存里没有已完成时，用操作日志补最近几条，避免点开一片空白。
     const showHist=liveDone.length===0 && recentHist.length>0;
@@ -1239,8 +1244,11 @@ fn console_float_html() -> &'static str {
     badge.dataset.n=String(activeN);
     clearBtn.disabled=liveDone.length===0;
     const cap=maxItems||30;
+    const recvHint=recvN>0?(" · 接收 "+recvN):"";
     if(activeN>0){
-      floatHint.textContent=doneN>0?("进行中 "+activeN+" · 已完成 "+doneN):("进行中 "+activeN+" · 上限 "+cap);
+      floatHint.textContent=(doneN>0?("上传中 "+activeN+" · 已完成 "+doneN):("上传中 "+activeN+" · 上限 "+cap))+recvHint;
+    }else if(recvN>0){
+      floatHint.textContent="接收中 "+recvN+" · 尚未上传";
     }else if(showHist){
       floatHint.textContent="最近完成 "+doneN+" 条";
     }else if(doneN>0){
@@ -1248,7 +1256,7 @@ fn console_float_html() -> &'static str {
     }else{
       floatHint.textContent="上限 "+cap+" 条";
     }
-    const busy=activeN>0;
+    const busy=activeN>0||recvN>0;
     if(busy){
       if(!userCollapsed) floatEl.classList.add("open");
     }else{
@@ -1261,9 +1269,14 @@ fn console_float_html() -> &'static str {
       }
     }
     floatEl.classList.toggle("idle", !floatEl.classList.contains("open"));
-    const active=live.filter(isActive).sort((a,b)=>(b.started_ms||0)-(a.started_ms||0)||String(a.path).localeCompare(b.path));
+    const sortLive=(a,b)=>(b.started_ms||0)-(a.started_ms||0)||String(a.path).localeCompare(b.path);
+    const uploadingSorted=uploading.slice().sort(sortLive);
+    const receivingSorted=receiving.slice().sort(sortLive);
+    const RECV_SHOW=8;
+    const receivingShown=receivingSorted.slice(0, RECV_SHOW);
+    const receivingMore=receivingSorted.length-receivingShown.length;
     const doneSorted=showHist?done:done.slice().sort((a,b)=>(b.updated_ms||0)-(a.updated_ms||0)||String(a.path).localeCompare(b.path));
-    if(!active.length && !doneSorted.length){
+    if(!uploadingSorted.length && !receivingShown.length && !doneSorted.length){
       body.innerHTML='<div class="qd-empty">暂无上传任务</div>';
       return;
     }
@@ -1286,17 +1299,18 @@ fn console_float_html() -> &'static str {
         frag.appendChild(el);
       }
     };
-    if(active.length && doneSorted.length){
-      appendSection("进行中", active, false);
-      appendSection(showHist?"最近完成":"已完成", doneSorted, true);
-    }else if(active.length){
-      appendSection("", active, false);
-    }else{
-      appendSection(showHist?"最近完成":"", doneSorted, true);
+    appendSection(uploadingSorted.length?"上传中":"", uploadingSorted, false);
+    if(receivingShown.length){
+      const recvLabel=receivingMore>0?("接收中 · 另有 "+receivingMore+" 个"):"接收中";
+      appendSection(recvLabel, receivingShown, false);
+    }
+    if(doneSorted.length){
+      appendSection(showHist?"最近完成":(uploadingSorted.length||receivingShown.length?"已完成":""), doneSorted, true);
     }
     body.replaceChildren(frag);
     // 有更新的进行中任务置顶时，滚到顶部方便看到进度。
-    if(active[0] && active[0].path!==prevFirst){
+    const first=uploadingSorted[0]||receivingShown[0];
+    if(first && first.path!==prevFirst){
       body.scrollTop=0;
     }
   }

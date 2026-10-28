@@ -121,7 +121,6 @@ pub struct QuarkDriveFileSystem {
     upload_buffer_size: usize,
     skip_upload_same_size: bool,
     prefer_http_download: bool,
-    upload_wait_timeout: u64,
     oplog: Arc<OpLog>,
     /// Web 控制台上传进度（与 CloudSync uploading stub 独立）。
     upload_tracker: UploadTracker,
@@ -179,7 +178,6 @@ impl QuarkDriveFileSystem {
             upload_buffer_size: 16 * 1024 * 1024,
             skip_upload_same_size: false,
             prefer_http_download: false,
-            upload_wait_timeout: 0,
             oplog: Arc::new(OpLog::new("./logs", 7)),
             upload_tracker: {
                 let upload_tracker = UploadTracker::new();
@@ -472,11 +470,6 @@ impl QuarkDriveFileSystem {
         self
     }
 
-    pub fn set_upload_wait_timeout(&mut self, upload_wait_timeout: u64) -> &mut Self {
-        self.upload_wait_timeout = upload_wait_timeout;
-        self
-    }
-
     pub fn set_oplog(&mut self, oplog: Arc<OpLog>) -> &mut Self {
         self.oplog = oplog;
         self
@@ -645,6 +638,8 @@ impl QuarkDriveFileSystem {
         let visible = self
             .wait_until_remote_visible(parent_dir, file_name, size, parent_key)
             .await;
+        // finish 已成功才走到这里。列表滞后仍对客户端算成功，否则大文件会被整份重传。
+        // 占位继续挡住紧接着的 PROPFIND。
         let result = if visible { "ok" } else { "ok:list_pending" };
         tracker.finish(progress_path, "ok", result);
         self.oplog.log_upload(log_path, size, log_mode, result).await;
@@ -1447,8 +1442,6 @@ struct QuarkDavFile {
     sha1_ctx: Sha1,
     /// 本次 PUT 认领了同路径挂起删除的 fid，跳过上传必须靠 hash 证明。
     from_deferred_same_path: bool,
-    /// 占着上传并发名额。正文开始前拿到，交给后台任务，传完字节就释放。
-    upload_slot: Option<crate::upload_limit::UploadPermit>,
 }
 
 impl Debug for QuarkDavFile {
@@ -1488,7 +1481,6 @@ impl QuarkDavFile {
             md5_ctx: Md5Context::new(),
             sha1_ctx: Sha1::default(),
             from_deferred_same_path: false,
-            upload_slot: None,
         }
     }
 
@@ -1517,12 +1509,8 @@ impl QuarkDavFile {
             self.upload_state.temp_file_path =
                 format!("/tmp/{}_{}", timestamp, sanitize_temp_name(&self.file.file_name));
             // 内存池可用则先走内存；limit=0 或预留失败时仍可稍后在写入时落盘。
+            // 大文件收正文可能持续很久，这里不占上传槽，避免挡住别的文件传夸克。
             self.upload_state.use_memory = self.fs.upload_memory.limit() > 0;
-            // 群晖会并行开几百个 PUT。先占上传名额再记进度，否则每个连接都显示「等待上传」。
-            // 名额满时堵在读正文之前，客户端自己排队，面板里只留真正占槽的文件。
-            if self.upload_slot.is_none() {
-                self.upload_slot = Some(crate::upload_limit::acquire_upload_slot().await);
-            }
             self.fs
                 .upload_tracker
                 .start_receiving(&self.upload_log_path(), self.upload_state.size);
@@ -1665,14 +1653,14 @@ impl QuarkDavFile {
         self.file.content_hash = existing.content_hash;
     }
 
-    /// 丢弃客户端重试 PUT 产生的本地副本，并让本次 flush 成功返回（后台仍在传）。
+    /// 接收阶段被取消：正文还没进夸克，不能对客户端报成功。
     async fn abandon_duplicate_retry_upload(&mut self) -> Result<(), FsError> {
         self.upload_state.handed_off = false;
         self.delete_temp_file().await?;
         self.release_upload_memory();
         self.upload_state.is_finished = true;
         self.upload_state = UploadState::default();
-        Ok(())
+        Err(FsError::GeneralFailure)
     }
 
     async fn log_upload_result(&self, size: u64, result: &str) {
@@ -1972,15 +1960,13 @@ impl QuarkDavFile {
         let cancel_flag = self.fs.upload_tracker.arm_cancel(&log_path);
         let abort_path = log_path.clone();
         let new_fid = self.file.fid.clone();
-        // 名额在收正文前已经拿到。传完字节就丢掉，等列表不再占槽。
-        let upload_slot = self.upload_slot.take();
         let handle = tokio::spawn(async move {
-            // 路径锁留到任务结束（含等列表），挡住同路径的第二次 OSS。
-            // 上传槽和快车道只包住真正传字节的那段，等列表不能把并发名额占住。
+            // 路径锁留到任务结束（含等列表），挡住同路径的第二次 OSS，避免再写一份大文件。
+            // 上传槽只包住真正传字节的那段。收正文和等列表都不占槽，大文件才不会堵住队列。
             let mut inflight_guard = inflight_guard;
             let temp_path = upload_state.temp_file_path.clone();
             let result = {
-                let _upload_slot = upload_slot;
+                let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
                 // 大文件 FIFO 快车道：队首全速，其余限速慢传且不可插队。
                 let smart = crate::upload_schedule::join(size).await;
                 let _path_bind = smart.bind_path(&progress_path);
@@ -2106,12 +2092,12 @@ impl QuarkDavFile {
 
             let cancelled = cancel_flag.load(std::sync::atomic::Ordering::Acquire);
             let client_result = if cancelled {
-                // request_cancel 已写入 cancelled；此处只做清理。
+                // 控制台取消：夸克上没有这份新文件，WebDAV 必须失败，群晖才会再传。
                 fs.remove_uploading_file(&parent_path, &file_name);
                 fs.oplog
                     .log_upload(&log_path, log_size, log_mode, "cancelled")
                     .await;
-                Ok(())
+                Err(FsError::GeneralFailure)
             } else {
                 match result {
                     Ok(_) => {
@@ -2162,42 +2148,8 @@ impl QuarkDavFile {
             .upload_tracker
             .bind_abort(&abort_path, handle.abort_handle());
 
-        // Wait for upload to complete, but return early if upload_wait_timeout is reached
-        // to avoid client timeout. The spawned task continues uploading in the background.
-        let upload_wait_timeout = self.fs.upload_wait_timeout;
-        if upload_wait_timeout > 0 {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(upload_wait_timeout),
-                handle,
-            ).await {
-                Ok(result) => match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Err(err),
-                    Err(join_err) if join_err.is_cancelled() => {}
-                    Err(err) => {
-                        error!(file_name = %self.file.file_name, error = %err, "upload task join failed");
-                        return Err(FsError::GeneralFailure);
-                    }
-                },
-                Err(_) => {
-                    // Timeout reached, upload continues in background；占位仍在 uploading。
-                    info!(file_name = %self.file.file_name, timeout_secs = upload_wait_timeout,
-                          "upload still in progress, returning early to avoid client timeout");
-                }
-            }
-        } else {
-            // Wait indefinitely；控制台取消会 abort，按成功收尾避免误报失败。
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(err),
-                Err(join_err) if join_err.is_cancelled() => {}
-                Err(err) => {
-                    error!(file_name = %self.file.file_name, error = %err, "upload task join failed");
-                    return Err(FsError::GeneralFailure);
-                }
-            }
-        }
-
+        // 夸克上传任务返回成功之后才结束 flush。取消和中途失败都回错误。
+        await_upload_task(&self.file.file_name, handle).await?;
         self.upload_state.is_finished = true;
         self.upload_state = UploadState::default();
         Ok(())
@@ -2278,15 +2230,13 @@ impl QuarkDavFile {
         let cancel_flag = self.fs.upload_tracker.arm_cancel(&log_path);
         let abort_path = log_path.clone();
         let old_fid = old_fid.to_string();
-        // 名额在收正文前已经拿到。传完字节就丢掉，等列表不再占槽。
-        let upload_slot = self.upload_slot.take();
 
         let handle = tokio::spawn(async move {
-            // 同路径锁一直握到等列表结束，避免 CloudSync 超时重 PUT 再开一条 OSS。
-            // 并发槽和快车道在字节传完就放开：等列表最多 90 秒，不能把后面的任务堵住。
+            // 同路径锁握到等列表结束，重试 PUT 不再另写一份大文件。
+            // 并发槽在字节传完就放开：等列表不能把后面的大文件堵住。
             let mut inflight_guard = inflight_guard;
             let result = {
-                let _upload_slot = upload_slot;
+                let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
                 let smart = crate::upload_schedule::join(size).await;
                 let _path_bind = smart.bind_path(&progress_path);
                 tracker.set_lane(&progress_path, smart.lane().as_str());
@@ -2315,11 +2265,12 @@ impl QuarkDavFile {
             }
             let cancelled = cancel_flag.load(std::sync::atomic::Ordering::Acquire);
             let client_result = if cancelled {
+                // 控制台取消：不能让 WebDAV 回成功，否则群晖不再补传。
                 fs.remove_uploading_file(&parent_path, &file_name);
                 fs.oplog
                     .log_upload(&log_path, size, log_mode, "cancelled")
                     .await;
-                Ok(())
+                Err(FsError::GeneralFailure)
             } else {
                 match result {
                     Ok(()) => {
@@ -2363,40 +2314,8 @@ impl QuarkDavFile {
             .upload_tracker
             .bind_abort(&abort_path, handle.abort_handle());
 
-        let upload_wait_timeout = self.fs.upload_wait_timeout;
-        if upload_wait_timeout > 0 {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(upload_wait_timeout),
-                handle,
-            )
-            .await
-            {
-                Ok(result) => match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Err(err),
-                    Err(join_err) if join_err.is_cancelled() => {}
-                    Err(err) => {
-                        error!(file_name = %self.file.file_name, error = %err, "open upload task join failed");
-                        return Err(FsError::GeneralFailure);
-                    }
-                },
-                Err(_) => {
-                    info!(file_name = %self.file.file_name, timeout_secs = upload_wait_timeout,
-                          "open upload still in progress, returning early to avoid client timeout");
-                }
-            }
-        } else {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(err),
-                Err(join_err) if join_err.is_cancelled() => {}
-                Err(err) => {
-                    error!(file_name = %self.file.file_name, error = %err, "open upload task join failed");
-                    return Err(FsError::GeneralFailure);
-                }
-            }
-        }
-
+        // 夸克 finish 成功（任务返回 Ok）之后才结束 flush。
+        await_upload_task(&self.file.file_name, handle).await?;
         self.upload_state.is_finished = true;
         self.upload_state = UploadState::default();
         Ok(())
@@ -3011,6 +2930,26 @@ struct UploadMemoryGuard {
 impl Drop for UploadMemoryGuard {
     fn drop(&mut self) {
         self.pool.release(self.reserved);
+    }
+}
+
+/// 等到后台上传结束。只有任务自己返回成功，WebDAV 才回成功。
+/// 取消、panic 都是失败：群晖会再 PUT，不会把没传完的文件记成已同步。
+async fn await_upload_task(
+    file_name: &str,
+    handle: tokio::task::JoinHandle<Result<(), FsError>>,
+) -> Result<(), FsError> {
+    match handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(join_err) if join_err.is_cancelled() => {
+            info!(file_name, "upload cancelled; client gets failure");
+            Err(FsError::GeneralFailure)
+        }
+        Err(err) => {
+            error!(file_name, error = %err, "upload task join failed");
+            Err(FsError::GeneralFailure)
+        }
     }
 }
 
