@@ -1447,6 +1447,8 @@ struct QuarkDavFile {
     sha1_ctx: Sha1,
     /// 本次 PUT 认领了同路径挂起删除的 fid，跳过上传必须靠 hash 证明。
     from_deferred_same_path: bool,
+    /// 占着上传并发名额。正文开始前拿到，交给后台任务，传完字节就释放。
+    upload_slot: Option<crate::upload_limit::UploadPermit>,
 }
 
 impl Debug for QuarkDavFile {
@@ -1486,6 +1488,7 @@ impl QuarkDavFile {
             md5_ctx: Md5Context::new(),
             sha1_ctx: Sha1::default(),
             from_deferred_same_path: false,
+            upload_slot: None,
         }
     }
 
@@ -1515,6 +1518,11 @@ impl QuarkDavFile {
                 format!("/tmp/{}_{}", timestamp, sanitize_temp_name(&self.file.file_name));
             // 内存池可用则先走内存；limit=0 或预留失败时仍可稍后在写入时落盘。
             self.upload_state.use_memory = self.fs.upload_memory.limit() > 0;
+            // 群晖会并行开几百个 PUT。先占上传名额再记进度，否则每个连接都显示「等待上传」。
+            // 名额满时堵在读正文之前，客户端自己排队，面板里只留真正占槽的文件。
+            if self.upload_slot.is_none() {
+                self.upload_slot = Some(crate::upload_limit::acquire_upload_slot().await);
+            }
             self.fs
                 .upload_tracker
                 .start_receiving(&self.upload_log_path(), self.upload_state.size);
@@ -1964,13 +1972,15 @@ impl QuarkDavFile {
         let cancel_flag = self.fs.upload_tracker.arm_cancel(&log_path);
         let abort_path = log_path.clone();
         let new_fid = self.file.fid.clone();
+        // 名额在收正文前已经拿到。传完字节就丢掉，等列表不再占槽。
+        let upload_slot = self.upload_slot.take();
         let handle = tokio::spawn(async move {
             // 路径锁留到任务结束（含等列表），挡住同路径的第二次 OSS。
             // 上传槽和快车道只包住真正传字节的那段，等列表不能把并发名额占住。
             let mut inflight_guard = inflight_guard;
             let temp_path = upload_state.temp_file_path.clone();
             let result = {
-                let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
+                let _upload_slot = upload_slot;
                 // 大文件 FIFO 快车道：队首全速，其余限速慢传且不可插队。
                 let smart = crate::upload_schedule::join(size).await;
                 let _path_bind = smart.bind_path(&progress_path);
@@ -2268,13 +2278,15 @@ impl QuarkDavFile {
         let cancel_flag = self.fs.upload_tracker.arm_cancel(&log_path);
         let abort_path = log_path.clone();
         let old_fid = old_fid.to_string();
+        // 名额在收正文前已经拿到。传完字节就丢掉，等列表不再占槽。
+        let upload_slot = self.upload_slot.take();
 
         let handle = tokio::spawn(async move {
             // 同路径锁一直握到等列表结束，避免 CloudSync 超时重 PUT 再开一条 OSS。
             // 并发槽和快车道在字节传完就放开：等列表最多 90 秒，不能把后面的任务堵住。
             let mut inflight_guard = inflight_guard;
             let result = {
-                let _upload_slot = crate::upload_limit::acquire_upload_slot().await;
+                let _upload_slot = upload_slot;
                 let smart = crate::upload_schedule::join(size).await;
                 let _path_bind = smart.bind_path(&progress_path);
                 tracker.set_lane(&progress_path, smart.lane().as_str());

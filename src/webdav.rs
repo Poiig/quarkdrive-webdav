@@ -1156,7 +1156,7 @@ fn console_float_html() -> &'static str {
     const barCls=unknown?"qd-bar indeterminate":"qd-bar";
     let speed="—";
     if(it.status==="uploading") speed=fmt(it.speed_bps)+"/s";
-    else if(it.status==="receiving") speed="等待上传";
+    else if(it.status==="receiving") speed="接收中";
     else if(it.avg_speed_bps) speed="均 "+fmt(it.avg_speed_bps)+"/s";
     else if(it.from_history) speed=it.time||"";
     const name=it.name||String(it.path||"").split("/").filter(Boolean).pop()||it.path;
