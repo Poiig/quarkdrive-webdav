@@ -78,7 +78,7 @@ Token 会写入 `QUARK_TOKEN_FILE`，重启可复用。挂载的 `/data` 目录�
 | `UPLOAD_MAX_CONCURRENT` | 同时后台上传数上限 | `4` |
 | `UPLOAD_LARGE_THRESHOLD` | 智能调度大文件阈值（FIFO 快车道） | `32MB` |
 | `UPLOAD_SLOW_BPS` | 非快车道大文件慢传速率 | `512KB` |
-| `UPLOAD_WAIT_TIMEOUT` | 已忽略。WebDAV 一律等夸克上传成功后才返回成功，避免群晖把未传完的文件记成已同步 | 忽略 |
+| `UPLOAD_WAIT_TIMEOUT` | 已忽略。夸克上传成功后立即返回；目录列表在后台刷新，避免 PUT 空等被 524 掐断后整份重传 | 忽略 |
 | `RELOCATE_DEFER_MIN_SIZE` | CloudSync **先删后传**时，不小于此大小的删除才延迟进回收站；`0`=全部先挂起，等 PUT **比 hash 一致**再跳过或 relocate（不一致则照常重传，保证内容一致） | `0` |
 
 **Cloud Sync 加密**：群晖会在 WebDAV **当前路径的同级**创建 `@SynologyCloudSync` 并写入 `cloudsync_encrypt.info`。服务器地址请指向**可写的具体目录**（例如 `http://host:8080/备份目录`），不要填只读聚合根；Open 模式容量接口为空时已按「不限容量」回报，避免误判不可写。

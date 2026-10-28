@@ -521,9 +521,9 @@ impl QuarkDriveFileSystem {
         }
     }
 
-    /// 上传完成后等到父目录列表能看见该文件。
-    /// 返回是否已在远端列表中见到；无论是否见到都先保留 uploading 占位一段时间，
-    /// 因为 CloudSync 常在 PUT 一返回就 PROPFIND，夸克列表/编码偶发滞后时占位能兜住「未找到远程文件」。
+    /// 夸克上传已经成功。目录刷新放到后台：PUT 里空等列表容易把反代打成 524，
+    /// 群晖会整份重传，小文件队列和大文件都会变慢。
+    /// 占位先留着，紧接着的 PROPFIND 不会报「未找到远程文件」。
     async fn wait_until_remote_visible(
         &self,
         parent_dir: &Path,
@@ -531,47 +531,41 @@ impl QuarkDriveFileSystem {
         size: u64,
         parent_key: &str,
     ) -> bool {
+        self.schedule_dir_refresh_after_upload(parent_dir, file_name, size, parent_key, "");
+        true
+    }
+
+    /// 后台刷新父目录，并在新文件出现后删掉被替换的旧 fid。
+    fn schedule_dir_refresh_after_upload(
+        &self,
+        parent_dir: &Path,
+        file_name: &str,
+        size: u64,
+        parent_key: &str,
+        old_fid: &str,
+    ) {
         self.update_uploading_file(parent_key, file_name, size);
-        // 先靠占位满足 PROPFIND；稍后再开始刷列表，避免刚 finish 就打爆 Open API。
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-        self.dir_cache.invalidate(parent_dir).await;
-
-        // 60s 内温和轮询；间隔更长，减少 list 触发限流。
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut delay = std::time::Duration::from_secs(1);
-        let key = Self::parent_cache_key(parent_dir);
-        let mut visible = false;
-
-        loop {
-            if let Some(files) = self.dir_cache.get_or_insert(&key).await {
-                if files.iter().any(|f| file_names_equal(&f.file_name, file_name)) {
-                    debug!(
-                        parent = %parent_dir.display(),
-                        file_name = %file_name,
-                        "upload visible in remote listing"
-                    );
-                    visible = true;
-                    break;
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
+        let fs = self.clone();
+        let parent_dir = parent_dir.to_path_buf();
+        let file_name = file_name.to_string();
+        let parent_key = parent_key.to_string();
+        let old_fid = old_fid.to_string();
+        tokio::spawn(async move {
+            // 先作废缓存，下一次 PROPFIND / 后台轮询都会重新 list。
+            fs.dir_cache.invalidate(&parent_dir).await;
+            // 略等夸克把新文件放进列表，这段不占用 PUT 响应。
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            let visible = fs.poll_remote_visible(&parent_dir, &file_name).await;
+            if !visible {
                 warn!(
                     parent = %parent_dir.display(),
                     file_name = %file_name,
                     "remote listing still missing file after upload; keep uploading stub for PROPFIND"
                 );
-                break;
             }
-            self.dir_cache.invalidate(parent_dir).await;
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(std::time::Duration::from_secs(8));
-        }
-
-        // 延迟摘占位：给 CloudSync 紧接 PUT 的 PROPFIND 留窗口。
-        let fs = self.clone();
-        let parent_key = parent_key.to_string();
-        let file_name = file_name.to_string();
-        tokio::spawn(async move {
+            if !old_fid.is_empty() {
+                fs.delete_replaced_file(&old_fid, &parent_dir, &file_name).await;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(120)).await;
             fs.remove_uploading_file(&parent_key, &file_name);
             debug!(
@@ -580,7 +574,31 @@ impl QuarkDriveFileSystem {
                 "deferred remove uploading stub"
             );
         });
-        visible
+    }
+
+    /// 后台轮询父目录列表。不在 PUT 的响应路径上调用。
+    async fn poll_remote_visible(&self, parent_dir: &Path, file_name: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut delay = std::time::Duration::from_secs(1);
+        let key = Self::parent_cache_key(parent_dir);
+        loop {
+            if let Some(files) = self.dir_cache.get_or_insert(&key).await {
+                if files.iter().any(|f| file_names_equal(&f.file_name, file_name)) {
+                    debug!(
+                        parent = %parent_dir.display(),
+                        file_name = %file_name,
+                        "upload visible in remote listing"
+                    );
+                    return true;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            self.dir_cache.invalidate(parent_dir).await;
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(8));
+        }
     }
 
     /// 新文件已经出现在列表里之后再删旧 fid。
@@ -634,15 +652,11 @@ impl QuarkDriveFileSystem {
         log_mode: &str,
         old_fid: &str,
     ) {
-        self.delete_replaced_file(old_fid, parent_dir, file_name).await;
-        let visible = self
-            .wait_until_remote_visible(parent_dir, file_name, size, parent_key)
-            .await;
-        // finish 已成功才走到这里。列表滞后仍对客户端算成功，否则大文件会被整份重传。
-        // 占位继续挡住紧接着的 PROPFIND。
-        let result = if visible { "ok" } else { "ok:list_pending" };
-        tracker.finish(progress_path, "ok", result);
-        self.oplog.log_upload(log_path, size, log_mode, result).await;
+        // 字节已经进夸克。先回成功，目录刷新和删旧文件在后台做。
+        // 把 60 秒列表轮询留在 PUT 里，反代会 524，群晖把整份文件再传一遍。
+        tracker.finish(progress_path, "ok", "ok");
+        self.oplog.log_upload(log_path, size, log_mode, "ok").await;
+        self.schedule_dir_refresh_after_upload(parent_dir, file_name, size, parent_key, old_fid);
     }
 
     /// 失败：摘占位、作废目录缓存，让下一次 PUT 看到网盘真实状态而不是半截列表。
