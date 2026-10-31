@@ -126,9 +126,13 @@ pub struct QuarkDriveFileSystem {
     upload_tracker: UploadTracker,
     /// 正在向网盘上传的路径。重复 PUT 挂到同一个槽上，等原任务结束再回复，避免 CloudSync 提前看到成功。
     upload_inflight: Arc<DashMap<String, Arc<InflightSlot>>>,
-    /// 客户端 PUT 带来的文件 mtime（unix 毫秒）。PROPFIND 用它覆盖夸克的上传时间，
-    /// 否则 CloudSync 每次对账都认为远端时间不对，把同一个文件再传一遍。
-    client_mtimes: Arc<DashMap<String, u64>>,
+    /// 客户端 PUT 带来的文件 mtime（unix 毫秒）。
+    /// 只在上传成功后才对 PROPFIND 生效。传输过程中就改时间，群晖会报
+    /// 「在传输过程中修改了远程文件」，并写下 `.backup` 冲突副本。
+    client_mtimes: Arc<DashMap<String, ClientMtime>>,
+    /// PUT 未结束前，目录和 PROPFIND 继续报上传开始时的条目。
+    /// 夸克 `upload_pre` 会先落一个同名新文件，目录一刷新群晖就认为远端被改过。
+    upload_holds: Arc<DashMap<String, UploadHold>>,
     /// CloudSync「移动」常是先删再上传。删除可先挂起，同名再 PUT 时比对内容或改走网盘内移动。
     pending_relocate: Arc<DashMap<String, PendingRelocate>>,
     /// 不小于此大小的删除才延迟真删（0=全部延迟，恢复旧行为可设 32MB）。
@@ -146,6 +150,25 @@ struct DirRefreshItem {
     file_name: String,
     size: u64,
     old_fid: String,
+}
+
+/// 已提交给 PROPFIND 的 mtime，以及本次 PUT 尚未公布的 mtime。
+#[derive(Debug, Clone)]
+struct ClientMtime {
+    committed_ms: u64,
+    pending_ms: Option<u64>,
+}
+
+/// 一次 PUT 对外可见的元数据。
+/// `published == None` 时传输仍在进行：有 `frozen` 就原样展示，没有就先隐藏（新文件）。
+#[derive(Debug, Clone)]
+struct UploadHold {
+    parent_key: String,
+    file_name: String,
+    frozen: Option<QuarkFile>,
+    published: Option<QuarkFile>,
+    /// 上传开始时的 fid。新文件为空。同名新 fid 落地且旧 fid 消失后才撤掉公布条目。
+    origin_fid: String,
 }
 
 /// 被 CloudSync 先删、可能马上在别处再传的大文件。
@@ -203,6 +226,7 @@ impl QuarkDriveFileSystem {
             },
             upload_inflight: Arc::new(DashMap::new()),
             client_mtimes: Arc::new(DashMap::new()),
+            upload_holds: Arc::new(DashMap::new()),
             pending_relocate: Arc::new(DashMap::new()),
             // 0=CloudSync 先删后传时一律挂起，PUT 阶段再比 hash，避免小文件先进回收站又重传。
             relocate_defer_min_size: 0,
@@ -363,25 +387,321 @@ impl QuarkDriveFileSystem {
         None
     }
 
-    /// 记下 PUT 上的客户端 mtime，供列表和上传预创建使用。
+    /// 记下 PUT 上的客户端 mtime。先挂起，等这次上传成功再给 PROPFIND 看。
     pub fn note_client_mtime(&self, path: &str, unix_ms: u64) {
         if unix_ms == 0 || path.is_empty() {
             return;
         }
-        self.client_mtimes.insert(path.to_string(), unix_ms);
+        use dashmap::mapref::entry::Entry;
+        match self.client_mtimes.entry(path.to_string()) {
+            Entry::Occupied(mut e) => e.get_mut().pending_ms = Some(unix_ms),
+            Entry::Vacant(v) => {
+                v.insert(ClientMtime {
+                    committed_ms: 0,
+                    pending_ms: Some(unix_ms),
+                });
+            }
+        }
     }
 
+    /// 写进夸克的时间：优先本次 PUT 带来的值，这样列表最终能和本地对齐。
     fn client_mtime_ms(&self, path: &str) -> Option<u64> {
-        self.client_mtimes.get(path).map(|v| *v)
+        let entry = self.client_mtimes.get(path)?;
+        if let Some(ms) = entry.pending_ms {
+            if ms > 0 {
+                return Some(ms);
+            }
+        }
+        if entry.committed_ms > 0 {
+            Some(entry.committed_ms)
+        } else {
+            None
+        }
     }
 
-    /// 列表/PROPFIND 报客户端原始时间，而不是夸克记下的「上传完成时刻」。
+    /// 已经可以对外报的 mtime。传输中的 pending 不算。
+    fn display_mtime_ms(&self, path: &str) -> Option<u64> {
+        let entry = self.client_mtimes.get(path)?;
+        if entry.committed_ms > 0 {
+            Some(entry.committed_ms)
+        } else {
+            None
+        }
+    }
+
+    fn commit_client_mtime(&self, path: &str) {
+        let Some(mut entry) = self.client_mtimes.get_mut(path) else {
+            return;
+        };
+        if let Some(ms) = entry.pending_ms.take() {
+            if ms > 0 {
+                entry.committed_ms = ms;
+            }
+        }
+    }
+
+    fn discard_pending_mtime(&self, path: &str) {
+        let drop_entry = if let Some(mut entry) = self.client_mtimes.get_mut(path) {
+            entry.pending_ms = None;
+            entry.committed_ms == 0
+        } else {
+            false
+        };
+        if drop_entry {
+            self.client_mtimes.remove(path);
+        }
+    }
+
+    /// 列表/PROPFIND 报已经提交的客户端时间，而不是夸克记下的「上传完成时刻」。
     fn apply_client_mtime(&self, file: &mut QuarkFile) {
         let parent = file.parent_path.as_deref().unwrap_or("");
         let key = join_dav_path(parent, &file.file_name);
-        if let Some(ms) = self.client_mtimes.get(&key) {
-            file.updated_at = *ms;
+        if let Some(ms) = self.display_mtime_ms(&key) {
+            file.updated_at = ms;
         }
+    }
+
+    /// 传输开始时冻结当前可见条目。同路径重试不覆盖，避免把「传了一半的新文件」当成旧快照。
+    fn begin_upload_hold(
+        &self,
+        path: &str,
+        parent_key: &str,
+        file_name: &str,
+        frozen: Option<QuarkFile>,
+    ) {
+        use dashmap::mapref::entry::Entry;
+        if path.is_empty() {
+            return;
+        }
+        match self.upload_holds.entry(path.to_string()) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(v) => {
+                v.insert(UploadHold {
+                    parent_key: parent_key.to_string(),
+                    file_name: file_name.to_string(),
+                    origin_fid: frozen
+                        .as_ref()
+                        .map(|f| f.fid.clone())
+                        .unwrap_or_default(),
+                    frozen,
+                    published: None,
+                });
+            }
+        }
+    }
+
+    /// 上传已经成功。此后 PROPFIND 报最终大小和客户端 mtime，不再报传输前的旧值。
+    fn publish_upload(&self, path: &str, parent_key: &str, file_name: &str, size: u64) {
+        if path.is_empty() {
+            return;
+        }
+        self.commit_client_mtime(path);
+        let template = self
+            .upload_holds
+            .get(path)
+            .and_then(|h| h.published.clone().or_else(|| h.frozen.clone()));
+        let published = self.visible_upload_file(parent_key, file_name, size, template.as_ref());
+        use dashmap::mapref::entry::Entry;
+        match self.upload_holds.entry(path.to_string()) {
+            Entry::Occupied(mut e) => {
+                e.get_mut().published = Some(published.clone());
+                if e.get().parent_key.is_empty() {
+                    e.get_mut().parent_key = parent_key.to_string();
+                }
+                e.get_mut().file_name = file_name.to_string();
+            }
+            Entry::Vacant(v) => {
+                v.insert(UploadHold {
+                    parent_key: parent_key.to_string(),
+                    file_name: file_name.to_string(),
+                    origin_fid: String::new(),
+                    frozen: None,
+                    published: Some(published.clone()),
+                });
+            }
+        }
+        self.upsert_uploading_file(parent_key, &published);
+    }
+
+    /// 上传失败或客户端断开。已公布的成功结果留着；还在传输的冻结撤掉。
+    fn abort_upload_hold(&self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        self.discard_pending_mtime(path);
+        let stale = self
+            .upload_holds
+            .get(path)
+            .map(|h| h.published.is_none())
+            .unwrap_or(false);
+        if !stale {
+            return;
+        }
+        if let Some((_, hold)) = self.upload_holds.remove(path) {
+            self.remove_uploading_file(&hold.parent_key, &hold.file_name);
+        }
+    }
+
+    fn visible_upload_file(
+        &self,
+        parent_key: &str,
+        file_name: &str,
+        size: u64,
+        template: Option<&QuarkFile>,
+    ) -> QuarkFile {
+        let mut file = template.cloned().unwrap_or_else(|| {
+            let now = Self::now_ms();
+            QuarkFile {
+                fid: String::new(),
+                file_name: file_name.to_string(),
+                pdir_fid: String::new(),
+                size,
+                format_type: "application/octet-stream".to_string(),
+                status: 1,
+                dir: false,
+                file: true,
+                content_hash: None,
+                created_at: now,
+                updated_at: now,
+                download_url: None,
+                parent_path: Some(parent_key.to_string()),
+                thumbnail_url: None,
+            }
+        });
+        file.file_name = file_name.to_string();
+        file.parent_path = Some(parent_key.to_string());
+        file.size = size;
+        file.dir = false;
+        file.file = true;
+        let key = join_dav_path(parent_key, file_name);
+        if let Some(ms) = self.display_mtime_ms(&key) {
+            file.updated_at = ms;
+        }
+        file
+    }
+
+    fn upsert_uploading_file(&self, parent_file_path: &str, file: &QuarkFile) {
+        let mut files = self.uploading.entry(parent_file_path.to_string()).or_default();
+        if let Some(existing) = files
+            .iter_mut()
+            .find(|x| file_names_equal(&x.file_name, &file.file_name))
+        {
+            *existing = file.clone();
+        } else {
+            files.push(file.clone());
+        }
+    }
+
+    /// 目录列表里，用冻结/已公布条目替换同名文件，避免同名新文件中途露出来。
+    /// 返回仍处于冻结、不能套用新 mtime 的文件名。
+    fn apply_holds_to_dir(&self, parent_key: &str, files: &mut Vec<QuarkFile>) -> Vec<String> {
+        let keys: Vec<String> = self
+            .upload_holds
+            .iter()
+            .filter(|e| e.parent_key == parent_key)
+            .map(|e| e.key().clone())
+            .collect();
+        let mut frozen_names = Vec::new();
+        for key in keys {
+            let Some(hold) = self.upload_holds.get(&key) else {
+                continue;
+            };
+            let name = hold.file_name.clone();
+            if let Some(mut published) = hold.published.clone() {
+                let origin_fid = hold.origin_fid.clone();
+                drop(hold);
+                if let Some(mut kept) =
+                    self.replacement_visible(&name, published.size, &origin_fid, files)
+                {
+                    self.upload_holds.remove(&key);
+                    files.retain(|f| !file_names_equal(&f.file_name, &name));
+                    self.apply_client_mtime(&mut kept);
+                    files.push(kept);
+                    continue;
+                }
+                self.apply_client_mtime(&mut published);
+                files.retain(|f| !file_names_equal(&f.file_name, &name));
+                files.push(published);
+                continue;
+            }
+            let frozen = hold.frozen.clone();
+            drop(hold);
+            files.retain(|f| !file_names_equal(&f.file_name, &name));
+            if let Some(frozen) = frozen {
+                frozen_names.push(name);
+                files.push(frozen);
+            }
+        }
+        frozen_names
+    }
+
+    /// `None`：没有冻结。`Some(None)`：新文件传输中，先当不存在。`Some(Some)`：对外展示这条。
+    async fn hold_view(&self, key: &str) -> Option<Option<QuarkFile>> {
+        let hold = self.upload_holds.get(key)?;
+        if let Some(mut published) = hold.published.clone() {
+            let parent_key = hold.parent_key.clone();
+            let name = hold.file_name.clone();
+            let size = published.size;
+            let origin_fid = hold.origin_fid.clone();
+            drop(hold);
+            if let Some(cached) = self.dir_cache.get_cached(&parent_key).await {
+                if let Some(mut kept) =
+                    self.replacement_visible(&name, size, &origin_fid, &cached)
+                {
+                    self.upload_holds.remove(key);
+                    self.apply_client_mtime(&mut kept);
+                    return Some(Some(kept));
+                }
+            }
+            self.apply_client_mtime(&mut published);
+            return Some(Some(published));
+        }
+        Some(hold.frozen.clone())
+    }
+
+    /// 缓存已经能单独代表上传结果时，返回应展示的那条。否则继续用公布条目挡住同名双份。
+    fn replacement_visible(
+        &self,
+        name: &str,
+        published_size: u64,
+        origin_fid: &str,
+        files: &[QuarkFile],
+    ) -> Option<QuarkFile> {
+        let same: Vec<&QuarkFile> = files
+            .iter()
+            .filter(|f| {
+                file_names_equal(&f.file_name, name)
+                    && !f.fid.is_empty()
+                    && !self.is_pending_relocate_fid(&f.fid)
+            })
+            .collect();
+        if same.is_empty() {
+            return None;
+        }
+        if origin_fid.is_empty() {
+            return same
+                .into_iter()
+                .find(|f| f.size == published_size)
+                .cloned();
+        }
+        let origin_alive = same.iter().any(|f| f.fid == origin_fid);
+        let replacement = same
+            .iter()
+            .find(|f| f.fid != origin_fid && f.size == published_size);
+        if let Some(rep) = replacement {
+            if origin_alive {
+                // 旧文件还在列表里。先只报一份新结果，等后台删掉旧 fid 再交回缓存。
+                return None;
+            }
+            return Some((*rep).clone());
+        }
+        if origin_alive {
+            return same
+                .into_iter()
+                .find(|f| f.fid == origin_fid && f.size == published_size)
+                .cloned();
+        }
+        None
     }
 
     /// 尝试登记「此路径正在上传」。已有则返回 None，调用方应等待原任务，而不是再开一条 OSS。
@@ -434,6 +754,7 @@ impl QuarkDriveFileSystem {
         ) {
             self.remove_uploading_file(&parent, name);
         }
+        self.abort_upload_hold(path);
         true
     }
 
@@ -522,16 +843,16 @@ impl QuarkDriveFileSystem {
         }
     }
 
-    /// CloudSync 等客户端 PUT 后立刻 PROPFIND：上传过程中必须能查到条目与正确 size。
+    /// 占位大小跟最终内容走。mtime 只用已提交的客户端时间，不能写成「现在」，
+    /// 否则传输中的 PROPFIND 会把群晖吓成「远端被修改」。
     fn update_uploading_file(&self, parent_file_path: &str, file_name: &str, size: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         if let Some(mut files) = self.uploading.get_mut(parent_file_path) {
-            if let Some(f) = files.iter_mut().find(|x| x.file_name == file_name) {
+            if let Some(f) = files.iter_mut().find(|x| file_names_equal(&x.file_name, file_name)) {
                 f.size = size;
-                f.updated_at = now;
+                let key = join_dav_path(parent_file_path, file_name);
+                if let Some(ms) = self.display_mtime_ms(&key) {
+                    f.updated_at = ms;
+                }
             }
         }
     }
@@ -757,6 +1078,8 @@ impl QuarkDriveFileSystem {
         // 把 60 秒列表轮询留在 PUT 里，反代会 524，群晖把整份文件再传一遍。
         tracker.finish(progress_path, "ok", "ok");
         self.oplog.log_upload(log_path, size, log_mode, "ok").await;
+        // 先公布最终大小和时间，再刷目录。PUT 返回前群晖若再 PROPFIND，看到的是这份新内容。
+        self.publish_upload(log_path, parent_key, file_name, size);
         self.schedule_dir_refresh_after_upload(parent_dir, file_name, size, parent_key, old_fid);
     }
 
@@ -775,6 +1098,7 @@ impl QuarkDriveFileSystem {
     ) {
         let detail = flatten_error(detail);
         tracker.finish(progress_path, "error", &detail);
+        self.abort_upload_hold(log_path);
         self.remove_uploading_file(parent_key, file_name);
         self.dir_cache.invalidate(parent_dir).await;
         let result = if detail.is_empty() {
@@ -818,6 +1142,10 @@ impl QuarkDriveFileSystem {
     }
 
     async fn get_file(&self, path: PathBuf) -> Result<Option<QuarkFile>, FsError> {
+        let key = path_display_key(&path);
+        if let Some(view) = self.hold_view(&key).await {
+            return Ok(view);
+        }
         if let Some(file) = self.find_in_cache(&path).await? {
             if self.is_pending_relocate_fid(&file.fid) {
                 return Ok(None);
@@ -983,6 +1311,12 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 if options.write && self.read_only {
                     return Err(FsError::Forbidden);
                 }
+                if options.write {
+                    let parent_key = Self::parent_cache_key(parent_path);
+                    let dav_key = join_dav_path(&parent_key, &file.file_name);
+                    // 冻结上传前的大小和时间。PUT 没返回前，PROPFIND 必须还是这一份。
+                    self.begin_upload_hold(&dav_key, &parent_key, &file.file_name, Some(file.clone()));
+                }
                 QuarkDavFile::new(
                     self.clone(),
                     file,
@@ -1008,7 +1342,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     .unwrap()
                     .as_millis();
 
-                let mut file = QuarkFile {
+                let file = QuarkFile {
                     fid: "".to_string(),
                     file_name: name,
                     pdir_fid: parent_file.fid.clone(),
@@ -1024,12 +1358,10 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     parent_path: Some(parent_path.to_string_lossy().into_owned()),
                     thumbnail_url: None,
                 };
-                // 占位期间 PROPFIND 也要报客户端 mtime，避免 PUT 还没返回群晖就觉得时间不对。
-                self.apply_client_mtime(&mut file);
-
                 let parent_key = Self::parent_cache_key(parent_path);
-                let mut uploading = self.uploading.entry(parent_key).or_default();
-                uploading.push(file.clone());
+                let dav_key = join_dav_path(&parent_key, &file.file_name);
+                // 新文件在 PUT 成功前不要出现在列表里。中途冒出来再改大小，群晖会当成远端被改。
+                self.begin_upload_hold(&dav_key, &parent_key, &file.file_name, None);
                 QuarkDavFile::new(
                     self.clone(),
                     file,
@@ -1074,6 +1406,8 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     files.push(up);
                 }
             }
+            // 传输未完成的同名文件仍报旧元数据；新文件先不出现。
+            let frozen_names = self.apply_holds_to_dir(&key, &mut files);
 
             let mut v: Vec<Result<Box<dyn DavDirEntry>, FsError>> =
                 Vec::with_capacity(files.len());
@@ -1081,7 +1415,12 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 if self.is_pending_relocate_fid(&file.fid) {
                     continue;
                 }
-                self.apply_client_mtime(&mut file);
+                let frozen = frozen_names
+                    .iter()
+                    .any(|n| file_names_equal(n, &file.file_name));
+                if !frozen {
+                    self.apply_client_mtime(&mut file);
+                }
                 v.push(Ok(Box::new(file)));
             }
 
@@ -2002,7 +2341,7 @@ impl QuarkDavFile {
 
         // 须在 up_pre 之前占坑：超时提前返回后客户端重 PUT 不得再开一条 multipart。
         let log_path = self.upload_log_path();
-        let Some(inflight_guard) = self.fs.try_begin_upload(&log_path) else {
+        let Some(mut inflight_guard) = self.fs.try_begin_upload(&log_path) else {
             info!(
                 path = %log_path,
                 file_name = %self.file.file_name,
@@ -2027,6 +2366,7 @@ impl QuarkDavFile {
             self.upload_state.is_finished = true;
             self.log_upload_result(size, "ok:rapid").await;
             self.after_flush(true).await?;
+            inflight_guard.settle(true);
             return Ok(());
         }
         self.upload_state.auth_info = res.data.auth_info;
@@ -2070,6 +2410,7 @@ impl QuarkDavFile {
             self.upload_state.is_finished = true;
             self.log_upload_result(size, "ok:rapid").await;
             self.after_flush(true).await?;
+            inflight_guard.settle(true);
             return Ok(());
         }
         // Spawn upload task so it won't be cancelled if client disconnects.
@@ -2231,6 +2572,7 @@ impl QuarkDavFile {
             let cancelled = cancel_flag.load(std::sync::atomic::Ordering::Acquire);
             let client_result = if cancelled {
                 // 控制台取消：夸克上没有这份新文件，WebDAV 必须失败，群晖才会再传。
+                fs.abort_upload_hold(&log_path);
                 fs.remove_uploading_file(&parent_path, &file_name);
                 fs.oplog
                     .log_upload(&log_path, log_size, log_mode, "cancelled")
@@ -2404,6 +2746,7 @@ impl QuarkDavFile {
             let cancelled = cancel_flag.load(std::sync::atomic::Ordering::Acquire);
             let client_result = if cancelled {
                 // 控制台取消：不能让 WebDAV 回成功，否则群晖不再补传。
+                fs.abort_upload_hold(&log_path);
                 fs.remove_uploading_file(&parent_path, &file_name);
                 fs.oplog
                     .log_upload(&log_path, size, log_mode, "cancelled")
@@ -2755,12 +3098,16 @@ impl QuarkDavFile {
         if self.upload_state.handed_off {
             return Ok(());
         }
+        let dav_key = self.upload_log_path();
         if ok {
             let size = if self.upload_state.size > 0 {
                 self.upload_state.size
             } else {
                 self.file.size
             };
+            // 秒传、跳过、搬家不走后台任务，这里公布最终元数据，PUT 返回后对得上。
+            self.fs
+                .publish_upload(&dav_key, &parent_path, &self.file.file_name, size);
             self.fs
                 .wait_until_remote_visible(
                     self.parent_dir.as_path(),
@@ -2769,7 +3116,8 @@ impl QuarkDavFile {
                     &parent_path,
                 )
                 .await;
-        } else {
+        } else if !self.upload_state.discard_duplicate {
+            self.fs.abort_upload_hold(&dav_key);
             self.fs
                 .remove_uploading_file(&parent_path, &self.file.file_name);
             self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
@@ -3039,6 +3387,11 @@ impl Drop for QuarkDavFile {
         if !self.upload_state.handed_off {
             self.release_upload_memory();
         }
+        // 正文没收完就断开：冻结不能留着，否则这个路径会一直报旧元数据。
+        if !self.upload_state.handed_off && !self.upload_state.is_finished {
+            let path = self.upload_log_path();
+            self.fs.abort_upload_hold(&path);
+        }
         if self.upload_state.is_uploading
             && !self.upload_state.is_finished
             && !self.upload_state.handed_off
@@ -3088,6 +3441,15 @@ async fn await_upload_task(
             error!(file_name, error = %err, "upload task join failed");
             Err(FsError::GeneralFailure)
         }
+    }
+}
+
+fn path_display_key(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if s.is_empty() {
+        "/".to_string()
+    } else {
+        s.into_owned()
     }
 }
 
@@ -3530,5 +3892,136 @@ mod tests {
         assert_eq!(join_dav_path("/", "a.MOV"), "/a.MOV");
         assert_eq!(join_dav_path("", "a.MOV"), "/a.MOV");
         assert_eq!(join_dav_path("/我的备份", "a.MOV"), "/我的备份/a.MOV");
+    }
+
+    fn test_fs() -> QuarkDriveFileSystem {
+        let cookie = Arc::new(DashMap::new());
+        let config = crate::drive::DriveConfig {
+            api_base_url: "https://drive.quark.cn".to_string(),
+            cookie,
+            open: None,
+            alert: crate::alert::Alert::new(None),
+        };
+        let drive = QuarkDrive::new(config).unwrap();
+        QuarkDriveFileSystem::new(drive, "/".to_string(), 8, 1024 * 1024, 60).unwrap()
+    }
+
+    fn sample_file(name: &str, parent: &str, size: u64, mtime: u64, fid: &str) -> QuarkFile {
+        QuarkFile {
+            fid: fid.to_string(),
+            file_name: name.to_string(),
+            pdir_fid: "parent".to_string(),
+            size,
+            format_type: "application/xml".to_string(),
+            status: 1,
+            created_at: mtime,
+            updated_at: mtime,
+            dir: false,
+            file: true,
+            download_url: None,
+            content_hash: None,
+            parent_path: Some(parent.to_string()),
+            thumbnail_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_mtime_stays_hidden_until_upload_publishes() {
+        let fs = test_fs();
+        let parent = "/home/运维部署/mRemoteNG与Xshell配置文件";
+        let name = "confCons.xml";
+        let path = join_dav_path(parent, name);
+        let old_mtime = 1_700_000_000_000;
+        let new_mtime = 1_761_000_000_000;
+        let old = sample_file(name, parent, 100, old_mtime, "old-fid");
+        fs.begin_upload_hold(&path, parent, name, Some(old));
+        fs.note_client_mtime(&path, new_mtime);
+
+        // 传输中：群晖再 PROPFIND，大小和时间都还是上传前的。
+        let shown = fs.get_file(PathBuf::from(&path)).await.unwrap().unwrap();
+        assert_eq!(shown.size, 100);
+        assert_eq!(shown.updated_at, old_mtime);
+        assert_eq!(shown.fid, "old-fid");
+        // 写给夸克的时间仍然是客户端这次带来的。
+        assert_eq!(fs.client_mtime_ms(&path), Some(new_mtime));
+
+        fs.publish_upload(&path, parent, name, 180);
+        let shown = fs.get_file(PathBuf::from(&path)).await.unwrap().unwrap();
+        assert_eq!(shown.size, 180);
+        assert_eq!(shown.updated_at, new_mtime);
+        assert_eq!(fs.display_mtime_ms(&path), Some(new_mtime));
+    }
+
+    #[tokio::test]
+    async fn new_file_is_hidden_until_publish_and_abort_clears_it() {
+        let fs = test_fs();
+        let parent = "/home/cfg";
+        let name = "confCons.xml.20261030-1546432886.backup";
+        let path = join_dav_path(parent, name);
+        fs.begin_upload_hold(&path, parent, name, None);
+        fs.note_client_mtime(&path, 1_761_111_000_000);
+        assert!(fs.get_file(PathBuf::from(&path)).await.unwrap().is_none());
+
+        fs.abort_upload_hold(&path);
+        assert!(fs.client_mtime_ms(&path).is_none());
+        assert!(!fs.upload_holds.contains_key(&path));
+    }
+
+    #[test]
+    fn listing_hides_precreated_same_name_until_upload_finishes() {
+        let fs = test_fs();
+        let parent = "/home/cfg";
+        let name = "confCons.xml";
+        let path = join_dav_path(parent, name);
+        let old_mtime = 1_700_000_000_000;
+        let old = sample_file(name, parent, 100, old_mtime, "old-fid");
+        fs.begin_upload_hold(&path, parent, name, Some(old.clone()));
+        fs.note_client_mtime(&path, 1_761_000_000_000);
+
+        // upload_pre 已落下同名新文件，目录刷新会把它和旧文件一起带回来。
+        let mut files = vec![
+            old.clone(),
+            sample_file(name, parent, 180, 1_761_000_000_000, "new-fid"),
+        ];
+        let frozen = fs.apply_holds_to_dir(parent, &mut files);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].fid, "old-fid");
+        assert_eq!(files[0].size, 100);
+        assert_eq!(files[0].updated_at, old_mtime);
+        assert_eq!(frozen, vec![name.to_string()]);
+
+        fs.publish_upload(&path, parent, name, 180);
+        let mut files = vec![
+            old.clone(),
+            sample_file(name, parent, 180, 1_761_000_000_000, "new-fid"),
+        ];
+        let frozen = fs.apply_holds_to_dir(parent, &mut files);
+        // 旧 fid 还在时只露出一份新结果，避免群晖看到两个同名文件。
+        assert!(frozen.is_empty());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].size, 180);
+        assert_eq!(files[0].updated_at, 1_761_000_000_000);
+        assert!(fs.upload_holds.contains_key(&path));
+
+        let mut files = vec![sample_file(name, parent, 180, 1_761_000_000_000, "new-fid")];
+        fs.apply_holds_to_dir(parent, &mut files);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].fid, "new-fid");
+        assert!(!fs.upload_holds.contains_key(&path));
+    }
+
+    #[test]
+    fn retry_does_not_replace_frozen_snapshot() {
+        let fs = test_fs();
+        let parent = "/home/cfg";
+        let name = "confCons.xml";
+        let path = join_dav_path(parent, name);
+        let old = sample_file(name, parent, 100, 10, "old-fid");
+        fs.begin_upload_hold(&path, parent, name, Some(old));
+        let newer = sample_file(name, parent, 180, 99, "new-fid");
+        fs.begin_upload_hold(&path, parent, name, Some(newer));
+        let hold = fs.upload_holds.get(&path).unwrap();
+        assert_eq!(hold.frozen.as_ref().unwrap().fid, "old-fid");
+        assert_eq!(hold.frozen.as_ref().unwrap().size, 100);
     }
 }
